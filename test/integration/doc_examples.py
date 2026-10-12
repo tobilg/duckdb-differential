@@ -4,8 +4,8 @@ the disposable MinIO bucket initialized by minio.py (network access for httpfs).
 
 Each ```sql block is one session (one CLI process) on the host named by its first line
 ("-- main", "-- host A", "-- reader", ...), in document order; every host has its own repository.
-Blocks whose first line starts with "-- not run" or "-- every host" (installation and credentials,
-which the runner provides) are skipped. "-- expect error: <text>" as the second line means the
+Blocks without such a line are syntax or signatures; blocks whose first line starts with "-- not
+run" or "-- every host" (installation and credentials, which the runner provides) are skipped. "-- expect error: <text>" as the second line means the
 block must fail with that text; "-- expect output: <text>" lines must appear in its JSON output. Substitutions: s3://my-bucket/lake/ becomes a fresh MinIO prefix
 per document, '/absolute/repository' the host's repository and /data/ a scratch directory."""
 import json
@@ -50,7 +50,9 @@ for document in ('docs/sql-reference.md', 'docs/shared-databases.md'):
     for number, block in enumerate(blocks, 1):
         lines = block.splitlines()
         label = lines[0][3:].strip() if lines and lines[0].startswith('-- ') else ''
-        if not label or label.startswith('not run') or label.startswith('every host'):
+        if not label:
+            continue  # a syntax or signature block, not an example
+        if label.startswith('not run') or label.startswith('every host'):
             skipped += 1
             continue
         expect = lines[1][len('-- expect error:'):].strip() if len(lines) > 1 and \

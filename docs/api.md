@@ -103,6 +103,9 @@ stay valid after a name is reused.
 
 ## Management functions
 
+Every parameter (type, default, description) and result column of each function, with an
+example, is in the [SQL reference](sql-reference.md#conventions).
+
 Every function whose first argument is `database` accepts a database name or UUID, or the
 alias of an attached differential database (`'sales'` after `ATTACH … AS sales`). Branch
 and snapshot attachments resolve to their database.

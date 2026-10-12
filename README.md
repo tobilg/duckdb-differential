@@ -25,16 +25,30 @@ other platforms are untested. The
 [37-criterion checklist](docs/implementation-status.md) records what is implemented, tested
 and open.
 
+## Documentation
+
+| Guide | Covers |
+| --- | --- |
+| [Lifecycle guide](docs/lifecycle.md) | One database from creation to cleanup, S3 export included, with runnable SQL |
+| [Shared databases](docs/shared-databases.md) | Several hosts writing one database through S3: joining, publishing, conflicts and recovery strategies, failure playbook |
+| [SQL reference](docs/sql-reference.md) | Every statement, ATTACH option, setting and function: parameters, defaults, result columns and an example each |
+| [SQL API](docs/api.md) | Semantics and rules: ATTACH, time travel, S3 profile, caching, secrets, shared databases, limits and errors |
+| [Deployment](docs/deployment.md) | Processes, users and hosts; local storage vs S3; branch heads |
+| [Concurrency and multitenancy](docs/concurrency-and-multitenancy.md) | What runs concurrently, guarded heads, shared databases, tenant isolation |
+| [Durability and recovery](docs/durability-and-recovery.md) | The durable write path and the evidence for crash recovery |
+| [Storage formats](docs/storage-format.md) | Repository layout, metadata schema, hashes, journal, S3 layout and formats |
+| [Architecture](docs/architecture.md) | How the extension sits below DuckDB's native storage |
+| [Compatibility](docs/compatibility.md) · [Benchmarks](docs/benchmarks.md) · [Feasibility evidence](docs/feasibility.md) | Verified DuckDB build, dependencies and platforms; measurements; evidence that stock DuckDB supports the design |
+| [Implementation status](docs/implementation-status.md) | What is implemented, tested and open |
+| [Changelog](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) | |
+
 ## Contents
 
 - [SQL capabilities](#sql-capabilities): settings, ATTACH, S3 and secrets, time travel, functions
-- [Usage lifecycle](#usage-lifecycle): from creation to cleanup ([full guide](docs/lifecycle.md);
-  several writers through S3: [shared databases](docs/shared-databases.md))
-- [SQL reference](docs/sql-reference.md): every statement, option, setting and function, with examples
+- [Usage lifecycle](#usage-lifecycle): from creation to cleanup
 - [Installation](#installation)
 - [Durability and storage](#durability-and-storage)
-- [Processes, users and hosts](#processes-users-and-hosts): what can be shared ([details](docs/deployment.md),
-  [concurrency and multitenancy](docs/concurrency-and-multitenancy.md))
+- [Processes, users and hosts](#processes-users-and-hosts): what can be shared
 - [Development](#development): building from source, tests, CI and releases
 
 ## Installation
@@ -301,10 +315,3 @@ override with `DIFFERENTIAL_BUILD_DIR`, `DIFFERENTIAL_EXTENSION`, `DUCKDB_BINARY
 reported version, the SQL test and the community descriptor draft in `community/`). See
 [docs/UPDATING.md](docs/UPDATING.md) for moving to a new DuckDB release, and
 [CHANGELOG.md](CHANGELOG.md).
-
-[SQL API](docs/api.md) · [Lifecycle guide](docs/lifecycle.md) · [Deployment](docs/deployment.md) ·
-[Concurrency and multitenancy](docs/concurrency-and-multitenancy.md) · [Storage formats](docs/storage-format.md) · [Architecture](docs/architecture.md) ·
-[Recovery](docs/durability-and-recovery.md) · [Compatibility](docs/compatibility.md) ·
-[Feasibility evidence](docs/feasibility.md) ·
-[Benchmarks](docs/benchmarks.md) · [Changelog](CHANGELOG.md) · [License](LICENSE) ·
-[Third-party notices](THIRD_PARTY_NOTICES.md)

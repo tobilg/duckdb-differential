@@ -110,8 +110,8 @@ unchanged.
 
 The SQL in `README.md` and `docs/lifecycle.md` was executed as documented against the release
 loadable (S3 sections against MinIO, with credentials from `TYPE s3` secrets only). The SQL blocks of `docs/sql-reference.md` and `docs/shared-databases.md` are executed as written
-by `test/integration/doc_examples.py` (part of `make test_minio`): 16 and 22 blocks, plus expected
-errors and expected outputs (`in_sync`, `diverged`, `main-conflict-6`, `published_as_branch`). Six
+by `test/integration/doc_examples.py` (part of `make test_minio`): 35 and 22 blocks, plus expected
+errors and expected outputs (`in_sync`, `diverged`, `main-conflict-6`, `published_as_branch`). Five
 blocks are marked "not run": installation and credentials, placeholders for export locators and
 UUIDs, and a refusal that needs a concurrent writer. User documentation is written as if `differential` were a
 published community extension; **it has not been submitted or published**.
