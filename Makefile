@@ -1,0 +1,47 @@
+PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
+# Configuration of extension
+EXT_NAME=differential
+EXT_CONFIG=${PROJ_DIR}extension_config.cmake
+
+# Dependencies come from vcpkg at this commit (also set in CI and the community descriptor).
+VCPKG_COMMIT ?= cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+
+# Include the Makefile from extension-ci-tools
+include extension-ci-tools/makefiles/duckdb_extension.Makefile
+
+# ---------------------------------------------------------------------------------------
+# Integration build: test hooks compiled in, and the extension NOT linked into the CLI or
+# libduckdb, so the Python suites exercise the loadable artifact exactly as users load it.
+# Release artifacts (`make release`) never contain the hooks.
+.PHONY: integration test_integration test_minio vcpkg bump-version
+
+bump-version:
+	@test -n "$(V)" || { echo "Usage: make bump-version V=X.Y.Z" >&2; exit 2; }
+	@python3 "$(PROJ_DIR)scripts/bump_version.py" "$(V)"
+
+INTEGRATION_FLAGS=$(BUILD_FLAGS) -DDUCKDB_EXTENSION_CONFIGS='${PROJ_DIR}extension_config_integration.cmake' \
+	-DDIFFERENTIAL_TEST_HOOKS=ON -DBUILD_UNITTESTS=0
+
+integration:
+	mkdir -p build/integration
+	cmake $(GENERATOR) $(INTEGRATION_FLAGS) $(VCPKG_MANIFEST_FLAGS) -DCMAKE_BUILD_TYPE=Release -S $(DUCKDB_SRCDIR) -B build/integration
+	cmake --build build/integration --config Release
+
+# C++ unit tests and the stock-host Python suites (no network, no containers).
+test_integration:
+	ctest --test-dir build/integration/extension/differential --output-on-failure
+	python3 scripts/run_integration.py
+
+# S3 suites against a disposable, pinned MinIO container plus the HTTP fault harness.
+test_minio:
+	python3 test/integration/s3_faults.py
+	python3 test/integration/minio.py
+
+# A vcpkg checkout at VCPKG_COMMIT for local builds:
+#   make vcpkg && VCPKG_TOOLCHAIN_PATH=$PWD/build/vcpkg/scripts/buildsystems/vcpkg.cmake GEN=ninja make release
+vcpkg:
+	test -d build/vcpkg/.git || git clone --filter=blob:none https://github.com/microsoft/vcpkg build/vcpkg
+	git -C build/vcpkg fetch --filter=blob:none origin $(VCPKG_COMMIT)
+	git -C build/vcpkg checkout -q $(VCPKG_COMMIT)
+	test -x build/vcpkg/vcpkg || build/vcpkg/bootstrap-vcpkg.sh -disableMetrics

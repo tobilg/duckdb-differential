@@ -1,0 +1,126 @@
+# name: test/sql/time_travel.test
+# description: AT (VERSION/TIMESTAMP) and catalog-scoped functions
+# group: [differential]
+
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/differential_time_travel'
+
+statement ok
+ATTACH 'differential:sales' AS sales
+
+statement ok
+CREATE TABLE sales.t AS SELECT 1 AS v
+
+statement ok
+CREATE VIEW sales.tv AS SELECT v * 10 AS w FROM t
+
+statement ok
+CALL differential_create_snapshot('sales', name => 'one')
+
+statement ok
+ALTER TABLE sales.t ADD COLUMN extra INTEGER DEFAULT 7
+
+statement ok
+UPDATE sales.t SET v = 2
+
+statement ok
+CALL differential_create_snapshot('sales')
+
+statement ok
+UPDATE sales.t SET v = 3
+
+query II
+SELECT snapshot_id, snapshot_name FROM sales.snapshots() ORDER BY snapshot_id
+----
+1	one
+2	NULL
+
+query I
+FROM sales.current_snapshot()
+----
+2
+
+query I
+SELECT branch_name FROM sales.branches()
+----
+main
+
+# Each version has its own schema and data; views resolve inside the snapshot
+query I
+SELECT * FROM sales.t AT (VERSION => 1)
+----
+1
+
+query II
+SELECT * FROM sales.t AT (VERSION => 2)
+----
+2	7
+
+query I
+SELECT w FROM sales.tv AT (VERSION => 1)
+----
+10
+
+query I
+SELECT v FROM sales.t AT (TIMESTAMP => now())
+----
+2
+
+query III
+SELECT (SELECT v FROM sales.t), (SELECT v FROM sales.t AT (VERSION => 1)), (SELECT v FROM sales.t AT (VERSION => 2))
+----
+3	1	2
+
+statement ok
+USE sales
+
+query I
+SELECT v FROM t AT (VERSION => 1)
+----
+1
+
+query I
+SELECT count(*) FROM snapshots()
+----
+2
+
+statement ok
+USE memory
+
+# A snapshot attachment reports its own snapshot and can travel to others
+statement ok
+ATTACH 'differential:sales' AS old (SNAPSHOT_VERSION 1)
+
+query I
+FROM old.current_snapshot()
+----
+1
+
+query I
+SELECT v FROM old.t AT (VERSION => 2)
+----
+2
+
+statement error
+SELECT * FROM sales.t AT (VERSION => 99)
+----
+not_found
+
+statement error
+SELECT * FROM sales.t AT (TIMESTAMP => TIMESTAMP '1970-01-02')
+----
+not_found
+
+# AT is read-only
+statement error
+INSERT INTO sales.t AT (VERSION => 1) VALUES (1, 1)
+----
+syntax error
+
+statement ok
+DETACH old
+
+statement ok
+DETACH sales

@@ -1,0 +1,74 @@
+# name: test/sql/maintenance.test
+# description: collection, orphan cleanup, compaction, request replay and execution rules
+# group: [differential]
+
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/differential_maintenance'
+
+statement ok
+ATTACH 'differential:m' AS m
+
+statement ok
+CREATE TABLE m.t AS SELECT range AS i FROM range(100000)
+
+statement ok
+CALL differential_create_snapshot('m', request_id => 'snap-1')
+
+# Replaying a request returns the original result; changing its arguments fails
+query I
+SELECT snapshot_id FROM differential_create_snapshot('m', request_id => 'snap-1')
+----
+1
+
+statement error
+CALL differential_create_snapshot('m', name => 'other', request_id => 'snap-1')
+----
+Request ID reused with different payload
+
+statement ok
+UPDATE m.t SET i = i + 1
+
+statement ok
+CALL differential_create_snapshot('m')
+
+statement ok
+CALL differential_expire_snapshots('m', versions => [1])
+
+query I
+SELECT sum(deleted_objects) > 0 FROM differential_cleanup_old_files(cleanup_all => true)
+----
+true
+
+query I
+SELECT candidate_objects FROM differential_cleanup_old_files(dry_run => true)
+----
+0
+
+query I
+SELECT orphaned_files FROM differential_delete_orphaned_files(dry_run => true)
+----
+0
+
+query I
+SELECT roots_unchanged FROM differential_compact()
+----
+true
+
+# Management functions run only in autocommit mode
+statement ok
+BEGIN
+
+statement error
+CALL differential_create_snapshot('m')
+----
+autocommit
+
+statement ok
+ROLLBACK
+
+statement error
+CALL differential_create_snapshot('m', no_such_parameter => 1)
+----
+no_such_parameter

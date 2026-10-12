@@ -1,0 +1,69 @@
+#
+# Integration suites: C++ unit tests, crash/fault/race suites against the loadable extension
+# (test hooks compiled in), and the S3 suites against a disposable pinned MinIO container.
+#
+name: Integration
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GEN: ninja
+  VCPKG_INSTALL_OPTIONS: --clean-after-build
+
+jobs:
+  integration:
+    name: Integration (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux_amd64
+            runner: ubuntu-24.04
+            triplet: x64-linux-release
+            minio: true
+          - name: osx_arm64
+            runner: macos-14
+            triplet: arm64-osx-release
+            minio: false
+    env:
+      VCPKG_TARGET_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_HOST_TRIPLET: ${{ matrix.triplet }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config zip unzip tar curl
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config
+
+      - name: Set up vcpkg
+        run: |
+          make vcpkg
+          echo "VCPKG_TOOLCHAIN_PATH=$PWD/build/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+
+      - name: Build (integration)
+        run: make integration
+
+      - name: Unit and integration suites
+        run: make test_integration
+
+      - name: S3 suites (MinIO)
+        if: matrix.minio
+        run: |
+          docker pull minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          make test_minio

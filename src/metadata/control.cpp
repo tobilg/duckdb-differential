@@ -1,0 +1,1679 @@
+#include "control_internal.hpp"
+#include "differential_metrics.hpp"
+#include "differential_local.hpp"
+#include <openssl/rand.h>
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+namespace differential {
+namespace control {
+std::string UUID() {
+    unsigned char bytes[16];
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1)
+        throw std::runtime_error("Cannot allocate secure identity");
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    const char *hex = "0123456789abcdef";
+    std::string result;
+    for (size_t i = 0; i < sizeof(bytes); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10)
+            result += '-';
+        result += hex[bytes[i] >> 4];
+        result += hex[bytes[i] & 15];
+    }
+    return result;
+}
+bool IsUUID(const std::string &s) {
+    return s.size() == 36 && s.find_first_not_of("0123456789abcdef-") == std::string::npos;
+}
+void ValidateName(const std::string &name, bool optional) {
+    if (optional && name.empty())
+        return;
+    if (name.empty() || name.size() > 128 ||
+        name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
+            std::string::npos)
+        throw std::runtime_error("Invalid name: use 1..128 letters, digits, underscore or hyphen");
+}
+std::string Payload(std::initializer_list<std::string> parts) {
+    std::string result;
+    for (const auto &part : parts)
+        result += std::to_string(part.size()) + ":" + part;
+    return result;
+}
+std::vector<std::string> DecodePayload(const std::string &payload) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < payload.size()) {
+        auto colon = payload.find(':', pos);
+        if (colon == std::string::npos)
+            throw std::runtime_error("[differential:corrupt_data] Corrupt operation payload");
+        auto n = std::stoull(payload.substr(pos, colon - pos));
+        parts.push_back(payload.substr(colon + 1, n));
+        pos = colon + 1 + n;
+    }
+    return parts;
+}
+Operation ReadOperation(Query &q) {
+    Operation o;
+    o.id = q.Text(0);
+    o.request = q.Text(1);
+    o.kind = q.Text(2);
+    o.payload = q.Text(3);
+    o.state = q.Text(4);
+    o.database = q.Text(5);
+    o.branch = q.Text(6);
+    o.snapshot = q.Int(7);
+    o.preservation = q.Int(8);
+    return o;
+}
+Branch ReadBranch(Query &q) {
+    Branch b;
+    b.database = q.Text(0);
+    b.database_name = q.Text(1);
+    b.id = q.Text(2);
+    b.name = q.Text(3);
+    b.state = q.Text(4);
+    b.root = q.Text(5);
+    b.epoch = q.Int(6);
+    b.head = q.Int(7);
+    b.created_at = q.Int(8);
+    b.source_database = q.Text(9);
+    b.source_snapshot = q.Int(10);
+    return b;
+}
+Snapshot ReadSnapshot(Query &q) {
+    Snapshot s;
+    s.database = q.Text(0);
+    s.database_name = q.Text(1);
+    s.branch = q.Text(2);
+    s.id = q.Int(3);
+    s.name = q.Text(4);
+    s.root = q.Text(5);
+    s.published_at = q.Int(6);
+    s.captured_at = q.Int(7);
+    s.size = q.Int(8);
+    s.retired = q.Int(9) != 0;
+    s.source_database = q.Text(10);
+    s.source_snapshot = q.Int(11);
+    s.evicted = q.Int(12) != 0;
+    s.author = q.Text(13);
+    s.message = q.Text(14);
+    s.extra_info = q.Text(15);
+    return s;
+}
+} // namespace control
+using namespace control;
+
+int64_t Control::Now() {
+    auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    // Test builds: a host whose clock is off (DIFFERENTIAL_TEST_CLOCK_SKEW_MS, may be negative).
+    if (auto skew = Hook("DIFFERENTIAL_TEST_CLOCK_SKEW_MS"))
+        now += std::stoll(skew) * 1000;
+    return now;
+}
+BranchLock::~BranchLock() {
+    if (fd >= 0)
+        close(fd);
+    if (management_fd >= 0)
+        close(management_fd);
+}
+Control::Control(std::shared_ptr<Store> store, std::function<int64_t()> clock)
+    : store(std::move(store)), clock(std::move(clock)) {
+    std::lock_guard<std::recursive_mutex> guard(this->store->mutex);
+    auto db = this->store->db;
+    Transaction tx(db);
+    // One control format. A new repository gets the schema; any other version is refused.
+    Query existing(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_format'");
+    if (existing.Step()) {
+        Query v(db, "SELECT version FROM control_format");
+        if (!v.Step() || v.Int(0) != CONTROL_FORMAT)
+            throw std::runtime_error("[differential:incompatible_format] Unsupported differential control format");
+    } else {
+        Execute(db, R"SQL(
+CREATE TABLE control_format(version INTEGER NOT NULL, repository_id TEXT NOT NULL);
+CREATE TABLE databases(id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, last_snapshot INTEGER NOT NULL DEFAULT 0 CHECK(last_snapshot>=0), created_at INTEGER NOT NULL, writers TEXT NOT NULL DEFAULT 'single' CHECK(writers IN ('single','shared'))) WITHOUT ROWID;
+CREATE TABLE branches(id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','deleted')), root TEXT REFERENCES roots(hash), epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch>=0), head INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, source_database TEXT, source_snapshot INTEGER) WITHOUT ROWID;
+CREATE UNIQUE INDEX active_branch_names ON branches(database_id,name) WHERE state='active';
+CREATE TABLE snapshots(database_id TEXT NOT NULL REFERENCES databases(id), id INTEGER NOT NULL CHECK(id>0), branch_id TEXT NOT NULL REFERENCES branches(id), name TEXT, root TEXT NOT NULL REFERENCES roots(hash), published_at INTEGER NOT NULL, captured_at INTEGER NOT NULL, retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)), evicted INTEGER NOT NULL DEFAULT 0 CHECK(evicted IN (0,1)), author TEXT, commit_message TEXT, commit_extra_info TEXT, PRIMARY KEY(database_id,id), UNIQUE(database_id,name)) WITHOUT ROWID;
+CREATE TABLE history(sequence INTEGER PRIMARY KEY AUTOINCREMENT, branch_id TEXT NOT NULL REFERENCES branches(id), database_id TEXT NOT NULL, snapshot_id INTEGER NOT NULL, effective_at INTEGER NOT NULL, FOREIGN KEY(database_id,snapshot_id) REFERENCES snapshots(database_id,id));
+CREATE INDEX history_lookup ON history(branch_id,effective_at,sequence);
+CREATE TABLE operations(id TEXT PRIMARY KEY, request TEXT UNIQUE, kind TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','complete')), database_id TEXT, branch_id TEXT, snapshot_id INTEGER NOT NULL DEFAULT 0, preservation INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE export_roots(export_id TEXT PRIMARY KEY, root TEXT NOT NULL REFERENCES roots(hash), state TEXT NOT NULL CHECK(state IN ('pending','complete','abandoned'))) WITHOUT ROWID;
+CREATE TABLE providers(id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, bucket TEXT NOT NULL, prefix TEXT NOT NULL, region TEXT NOT NULL, endpoint TEXT NOT NULL, credential_profile TEXT NOT NULL, path_style INTEGER NOT NULL, development_http INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE provider_limits(provider_id TEXT PRIMARY KEY REFERENCES providers(id), max_requests INTEGER NOT NULL, retries INTEGER NOT NULL, connect_timeout_ms INTEGER NOT NULL, request_timeout_ms INTEGER NOT NULL, max_range_bytes INTEGER NOT NULL, multipart_threshold INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE database_profiles(database_id TEXT PRIMARY KEY REFERENCES databases(id), provider_id TEXT NOT NULL REFERENCES providers(id)) WITHOUT ROWID;
+CREATE TABLE database_local_profiles(database_id TEXT PRIMARY KEY REFERENCES databases(id), pool TEXT NOT NULL REFERENCES local_pools(id)) WITHOUT ROWID;
+CREATE TABLE exports(id TEXT PRIMARY KEY REFERENCES export_roots(export_id), provider_id TEXT NOT NULL REFERENCES providers(id), database_id TEXT NOT NULL, snapshot_id INTEGER NOT NULL, descriptor TEXT NOT NULL DEFAULT '', UNIQUE(database_id,snapshot_id), FOREIGN KEY(database_id,snapshot_id) REFERENCES snapshots(database_id,id)) WITHOUT ROWID;
+CREATE TABLE verified_remote_objects(provider_id TEXT NOT NULL REFERENCES providers(id), key TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(provider_id,key)) WITHOUT ROWID;
+CREATE TABLE collection_results(operation_id TEXT PRIMARY KEY REFERENCES operations(id), candidates INTEGER NOT NULL, bytes INTEGER NOT NULL, deleted INTEGER NOT NULL, live_pins INTEGER NOT NULL, stale_pins INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE compaction_details(operation_id TEXT PRIMARY KEY REFERENCES operations(id), roots INTEGER NOT NULL, payload_bytes INTEGER NOT NULL, export_retained_bytes INTEGER NOT NULL, page_size INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE compound_intents(operation_id TEXT PRIMARY KEY REFERENCES operations(id), branch_id TEXT NOT NULL UNIQUE REFERENCES branches(id), expected_head INTEGER NOT NULL, expected_epoch INTEGER NOT NULL, target_root TEXT REFERENCES roots(hash)) WITHOUT ROWID;
+CREATE INDEX snapshots_root ON snapshots(root);
+CREATE INDEX branches_root ON branches(root);
+CREATE INDEX compound_intents_target ON compound_intents(target_root);
+CREATE INDEX export_roots_root ON export_roots(root);
+CREATE TABLE remote_packs(provider_id TEXT NOT NULL REFERENCES providers(id), pool TEXT NOT NULL, pack TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(provider_id,pool,pack)) WITHOUT ROWID;
+CREATE TABLE remote_chunks(provider_id TEXT NOT NULL, hash TEXT NOT NULL, pool TEXT NOT NULL, pack TEXT NOT NULL, slot INTEGER NOT NULL CHECK(slot>=0), PRIMARY KEY(provider_id,hash), FOREIGN KEY(provider_id,pool,pack) REFERENCES remote_packs(provider_id,pool,pack)) WITHOUT ROWID;
+CREATE TABLE remote_commits(database_id TEXT NOT NULL REFERENCES databases(id), id INTEGER NOT NULL CHECK(id>0), parent INTEGER NOT NULL, branch_id TEXT NOT NULL, branch_name TEXT NOT NULL, published_at INTEGER NOT NULL, descriptor TEXT NOT NULL, name TEXT, author TEXT, commit_message TEXT, commit_extra_info TEXT, expired INTEGER NOT NULL DEFAULT 0 CHECK(expired IN (0,1)), PRIMARY KEY(database_id,id)) WITHOUT ROWID;
+CREATE TABLE branch_conflicts(branch_id TEXT PRIMARY KEY REFERENCES branches(id), snapshot INTEGER NOT NULL, remote_snapshot INTEGER NOT NULL, kept_branch TEXT NOT NULL DEFAULT '', detected_at INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE branch_head_writes(provider_id TEXT NOT NULL REFERENCES providers(id), key TEXT NOT NULL, etag TEXT NOT NULL, write_id TEXT NOT NULL, pending TEXT NOT NULL, snapshot INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider_id,key)) WITHOUT ROWID;
+CREATE TRIGGER gc_snapshot_release AFTER UPDATE OF retired,evicted ON snapshots BEGIN
+INSERT INTO gc_roots SELECT OLD.root WHERE NOT EXISTS(SELECT 1 FROM gc_roots WHERE hash=OLD.root); END;
+CREATE TRIGGER gc_branch_release AFTER UPDATE OF root,state ON branches WHEN OLD.root IS NOT NULL BEGIN
+INSERT INTO gc_roots SELECT OLD.root WHERE NOT EXISTS(SELECT 1 FROM gc_roots WHERE hash=OLD.root); END;
+CREATE TRIGGER gc_intent_release AFTER DELETE ON compound_intents WHEN OLD.target_root IS NOT NULL BEGIN
+INSERT INTO gc_roots SELECT OLD.target_root WHERE NOT EXISTS(SELECT 1 FROM gc_roots WHERE hash=OLD.target_root); END;
+CREATE TRIGGER gc_export_release AFTER UPDATE OF state ON export_roots BEGIN
+INSERT INTO gc_roots SELECT OLD.root WHERE NOT EXISTS(SELECT 1 FROM gc_roots WHERE hash=OLD.root); END;
+)SQL");
+        Query(db, "INSERT INTO control_format VALUES(?,?)").Int(1, CONTROL_FORMAT).Text(2, UUID()).Run();
+    }
+    tx.Commit();
+}
+std::string Control::RepositoryID() {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT repository_id FROM control_format");
+    if (!q.Step())
+        throw std::runtime_error("[differential:corrupt_data] Repository identity missing");
+    auto id = q.Text(0);
+    if (!IsUUID(id) || q.Step())
+        throw std::runtime_error("[differential:corrupt_data] Invalid repository identity");
+    return id;
+}
+std::string Control::DatabaseID(const std::string &name) {
+    Query q(store->db, "SELECT id FROM databases WHERE id=? OR name=? ORDER BY id=? DESC");
+    q.Text(1, name).Text(2, name).Text(3, name);
+    if (!q.Step())
+        throw std::runtime_error("[differential:not_found] Database not found");
+    return q.Text(0);
+}
+Operation Control::Begin(const std::string &kind, const std::string &payload, const std::string &request) {
+    if (request.size() > 256)
+        throw std::runtime_error("Request ID exceeds 256 bytes");
+    if (!request.empty()) {
+        Query q(store->db, (std::string(OP_COLUMNS) + " WHERE request=?").c_str());
+        q.Text(1, request);
+        if (q.Step()) {
+            auto o = ReadOperation(q);
+            if (o.kind != kind || o.payload != payload)
+                throw std::runtime_error("Request ID reused with different payload");
+            return o;
+        }
+    }
+    Operation o;
+    o.id = UUID();
+    o.request = request;
+    o.kind = kind;
+    o.payload = payload;
+    o.state = "pending";
+    Query(store->db, "INSERT INTO operations(id,request,kind,payload,state,created_at) "
+                     "VALUES(?,NULLIF(?,''),?,?,'pending',?)")
+        .Text(1, o.id)
+        .Text(2, request)
+        .Text(3, kind)
+        .Text(4, payload)
+        .Int(5, Timestamp())
+        .Run();
+    return o;
+}
+void Control::Complete(Operation &o) {
+    Query(store->db, "UPDATE operations SET "
+                     "state='complete',database_id=?,branch_id=?,snapshot_id=?,preservation=? WHERE id=?")
+        .Text(1, o.database)
+        .Text(2, o.branch)
+        .Int(3, o.snapshot)
+        .Int(4, o.preservation)
+        .Text(5, o.id)
+        .Run();
+    o.state = "complete";
+    Crash("reference_published");
+}
+Branch Control::NewBranch(const std::string &database, const std::string &name, const std::string &root,
+                          int64_t head, const std::string &source_db, int64_t source_snapshot) {
+    Branch b;
+    b.database = database;
+    b.id = UUID();
+    b.name = name;
+    b.state = "active";
+    b.root = root;
+    b.head = head;
+    b.created_at = Timestamp();
+    b.source_database = source_db;
+    b.source_snapshot = source_snapshot;
+    Query(store->db, "INSERT INTO "
+                     "branches(id,database_id,name,state,root,head,created_at,source_database,source_"
+                     "snapshot) VALUES(?,?,?,'active',NULLIF(?,''),?,?,NULLIF(?,''),?)")
+        .Text(1, b.id)
+        .Text(2, database)
+        .Text(3, name)
+        .Text(4, root)
+        .Int(5, head)
+        .Int(6, b.created_at)
+        .Text(7, source_db)
+        .Int(8, source_snapshot)
+        .Run();
+    if (!root.empty()) {
+        // Copy the map, never payload: a branch shares every unchanged immutable chunk.
+        auto file = store->CreateFileTx(b.FileName(), store->RootSizeTx(root), LocalDatabasePool(database));
+        store->InstallRootTx(file, root);
+    }
+    return b;
+}
+Operation Control::CreateDatabase(const std::string &name, const std::string &request,
+                                  const std::string &provider) {
+    ValidateName(name);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto o = Begin("create_database", Payload({name, provider}), request);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    o.database = UUID();
+    Query(store->db, "INSERT INTO databases(id,name,created_at) VALUES(?,?,?)")
+        .Text(1, o.database)
+        .Text(2, name)
+        .Int(3, Timestamp())
+        .Run();
+    AssignProvider(o.database, provider);
+    auto b = NewBranch(o.database, "main", "", 0, "", 0);
+    o.branch = b.id;
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+void Control::CreateSharedDatabase(const std::string &id, const std::string &name, const std::string &provider) {
+    ValidateName(name);
+    if (!IsUUID(id) || provider == "local" || !LocalProvider(provider).empty())
+        throw std::runtime_error("A shared database needs an S3 DATA_PATH");
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query existing(store->db, "SELECT id,writers FROM databases WHERE id=? OR name=?");
+    existing.Text(1, id).Text(2, name);
+    if (existing.Step()) {
+        if (existing.Text(0) != id || existing.Text(1) != "shared")
+            throw std::runtime_error("[differential:name_conflict] Database \"" + name + "\" already exists in this "
+                                     "repository and is not shared");
+        tx.Commit();
+        return;
+    }
+    Query(store->db, "INSERT INTO databases(id,name,created_at,writers) VALUES(?,?,?,'shared')")
+        .Text(1, id)
+        .Text(2, name)
+        .Int(3, Timestamp())
+        .Run();
+    AssignProvider(id, provider);
+    tx.Commit();
+}
+std::string Control::Writers(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT writers FROM databases WHERE id=?");
+    q.Text(1, DatabaseID(database));
+    return q.Step() ? q.Text(0) : "single";
+}
+Branch Control::CreateEmptyBranch(const std::string &database, const std::string &name) {
+    ValidateName(name);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    Query existing(store->db, "SELECT 1 FROM branches WHERE database_id=? AND name=? AND state='active'");
+    existing.Text(1, id).Text(2, name);
+    if (!existing.Step())
+        NewBranch(id, name, "", 0, "", 0);
+    tx.Commit();
+    return GetBranch(id, name);
+}
+void Control::UnlinkBranchFiles(const Branch &b) {
+    Query(store->db, "UPDATE files SET name=NULL WHERE name IN (?,?,?,?)")
+        .Text(1, b.FileName())
+        .Text(2, b.FileName() + ".wal")
+        .Text(3, b.FileName() + ".wal.checkpoint")
+        .Text(4, b.FileName() + ".wal.recovery")
+        .Run();
+}
+Branch Control::AdoptRemoteHead(const std::string &database, const std::string &provider, const RemoteHead &head,
+                                bool replace) {
+    ValidateName(head.branch_name);
+    if (!IsUUID(head.branch) || head.snapshot <= 0)
+        throw std::runtime_error("[differential:corrupt_data] Corrupt branch head");
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    if (!replace) {
+        Query adopted(store->db, "SELECT id FROM branches WHERE database_id=? AND name=? AND state='active'");
+        adopted.Text(1, id).Text(2, head.branch_name);
+        if (adopted.Step()) {
+            auto branch = adopted.Text(0);
+            tx.Commit();
+            return GetBranch(id, branch, true);
+        }
+    }
+    // The head's snapshot number: the same snapshot (adopted before), or a local unexported one that
+    // has to make room (another writer published that number first).
+    bool known = false;
+    Query existing(store->db, "SELECT s.root,coalesce(e.descriptor,''),coalesce(r.state,'') FROM snapshots s LEFT "
+                              "JOIN exports e ON e.database_id=s.database_id AND e.snapshot_id=s.id LEFT JOIN "
+                              "export_roots r ON r.export_id=e.id WHERE s.database_id=? AND s.id=?");
+    existing.Text(1, id).Int(2, head.snapshot);
+    if (existing.Step()) {
+        if (existing.Text(2) == "complete") {
+            if (existing.Text(0) != head.root || existing.Text(1) != head.descriptor)
+                throw std::runtime_error("[differential:corrupt_data] Local snapshot " + std::to_string(head.snapshot) +
+                                         " differs from the snapshot published in S3 under that number");
+            known = true;
+        } else
+            RenumberTx(id, head.snapshot, head.snapshot);
+    }
+    auto root = ImportMapTx(provider, head);
+    // The local branch: replaced by the published one (same identity: moved; another identity: the
+    // unpublished local branch is dropped, it had no changes).
+    Branch b;
+    Query local(store->db, (std::string(BRANCH_COLUMNS) + " WHERE b.database_id=? AND b.name=? AND b.state='active'").c_str());
+    local.Text(1, id).Text(2, head.branch_name);
+    if (local.Step()) {
+        auto current = ReadBranch(local);
+        UnlinkBranchFiles(current);
+        Query(store->db, "DELETE FROM branch_conflicts WHERE branch_id=?").Text(1, current.id).Run();
+        if (current.id != head.branch)
+            Query(store->db, "UPDATE branches SET state='deleted' WHERE id=?").Text(1, current.id).Run();
+    }
+    Query same(store->db, "SELECT state FROM branches WHERE id=?");
+    same.Text(1, head.branch);
+    if (same.Step()) {
+        if (same.Text(0) != "active")
+            throw std::runtime_error("[differential:retired] Branch " + head.branch_name + " was dropped in this "
+                                     "repository");
+        Query(store->db, "UPDATE branches SET root=?,head=?,epoch=epoch+1 WHERE id=?")
+            .Text(1, root)
+            .Int(2, head.snapshot)
+            .Text(3, head.branch)
+            .Run();
+    } else
+        Query(store->db, "INSERT INTO branches(id,database_id,name,state,root,head,created_at) "
+                         "VALUES(?,?,?,'active',?,?,?)")
+            .Text(1, head.branch)
+            .Text(2, id)
+            .Text(3, head.branch_name)
+            .Text(4, root)
+            .Int(5, head.snapshot)
+            .Int(6, Timestamp())
+            .Run();
+    b = GetBranch(id, head.branch, true);
+    auto file = store->CreateFileTx(b.FileName(), head.size, LocalDatabasePool(id));
+    store->InstallRootTx(file, root);
+    if (!known)
+        InsertRemoteSnapshotTx(id, provider, head, root, b.id);
+    Event(b, head.snapshot, Timestamp());
+    Query(store->db, "DELETE FROM branch_conflicts WHERE branch_id=?").Text(1, b.id).Run();
+    Query(store->db, "UPDATE databases SET last_snapshot=max(last_snapshot,?) WHERE id=?")
+        .Int(1, head.snapshot)
+        .Text(2, id)
+        .Run();
+    RecordHeadWrite(provider, head.key, HeadWrite{head.etag, head.write_id, "", head.snapshot});
+    Failpoint("DIFFERENTIAL_SHARED_CRASH", "head_adopted");
+    tx.Commit();
+    return b;
+}
+std::string Control::ImportMapTx(const std::string &provider, const RemoteHead &head) {
+    for (auto &location : head.locations) {
+        Query(store->db, "INSERT OR IGNORE INTO remote_packs VALUES(?,?,?,0)")
+            .Text(1, provider)
+            .Text(2, location.second.pool)
+            .Text(3, location.second.pack)
+            .Run();
+        Query(store->db, "INSERT OR IGNORE INTO remote_chunks VALUES(?,?,?,?,?)")
+            .Text(1, provider)
+            .Text(2, location.first)
+            .Text(3, location.second.pool)
+            .Text(4, location.second.pack)
+            .Int(5, int64_t(location.second.slot))
+            .Run();
+    }
+    auto root = store->ImportRootTx(head.size, head.chunks);
+    if (root != head.root)
+        throw std::runtime_error("[differential:corrupt_data] Imported map does not match the exported root");
+    return root;
+}
+void Control::InsertRemoteSnapshotTx(const std::string &id, const std::string &provider, const RemoteHead &head,
+                                     const std::string &root, const std::string &branch) {
+    // Its bytes are in S3 only: readers of the snapshot read the export (like an evicted one). Its name
+    // is kept unless a local snapshot already uses it.
+    Query(store->db, "INSERT INTO snapshots(database_id,id,branch_id,root,published_at,captured_at,evicted,name,author,"
+                     "commit_message,commit_extra_info) VALUES(?1,?2,?3,?4,?5,?5,1,CASE WHEN ?6='' OR EXISTS(SELECT 1 "
+                     "FROM snapshots WHERE database_id=?1 AND name=?6) THEN NULL ELSE ?6 END,NULLIF(?7,''),"
+                     "NULLIF(?8,''),NULLIF(?9,''))")
+        .Text(1, id)
+        .Int(2, head.snapshot)
+        .Text(3, branch)
+        .Text(4, root)
+        .Int(5, head.published_at)
+        .Text(6, head.info.name)
+        .Text(7, head.info.author)
+        .Text(8, head.info.message)
+        .Text(9, head.info.extra_info)
+        .Run();
+    auto export_id = UUID();
+    Query(store->db, "INSERT INTO export_roots VALUES(?,?,'complete')").Text(1, export_id).Text(2, root).Run();
+    Query(store->db, "INSERT INTO exports(id,provider_id,database_id,snapshot_id,descriptor) VALUES(?,?,?,?,?)")
+        .Text(1, export_id)
+        .Text(2, provider)
+        .Text(3, id)
+        .Int(4, head.snapshot)
+        .Text(5, head.descriptor)
+        .Run();
+}
+void Control::ImportRemoteSnapshot(const std::string &database, const std::string &provider, const RemoteHead &head,
+                                   const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    // A local snapshot with that number is the same one (exported), or unexported and moves up.
+    Query existing(store->db, "SELECT coalesce(r.state,'') FROM snapshots s LEFT JOIN exports e ON "
+                              "e.database_id=s.database_id AND e.snapshot_id=s.id LEFT JOIN export_roots r ON "
+                              "r.export_id=e.id WHERE s.database_id=? AND s.id=?");
+    existing.Text(1, id).Int(2, head.snapshot);
+    bool known = existing.Step();
+    if (known && existing.Text(0) != "complete") {
+        RenumberTx(id, head.snapshot, head.snapshot);
+        known = false;
+    }
+    if (!known)
+        InsertRemoteSnapshotTx(id, provider, head, ImportMapTx(provider, head), branch);
+    tx.Commit();
+}
+int64_t Control::RenumberTx(const std::string &id, int64_t from, int64_t taken) {
+    auto delta = taken + 1 - from;
+    if (delta <= 0)
+        return 0;
+    Query exported(store->db, "SELECT count(*) FROM exports e JOIN export_roots r ON r.export_id=e.id WHERE "
+                              "e.database_id=? AND e.snapshot_id>=? AND r.state='complete'");
+    exported.Text(1, id).Int(2, from);
+    exported.Step();
+    if (exported.Int(0))
+        throw std::runtime_error("[differential:corrupt_data] Cannot renumber snapshots that were already exported");
+    // Children follow at commit; highest first, so no moved number meets one not yet moved.
+    Execute(store->db, "PRAGMA defer_foreign_keys=ON");
+    std::vector<int64_t> moving;
+    {
+        Query q(store->db, "SELECT id FROM snapshots WHERE database_id=? AND id>=? ORDER BY id DESC");
+        q.Text(1, id).Int(2, from);
+        while (q.Step())
+            moving.push_back(q.Int(0));
+    }
+    for (auto n : moving) {
+        Query(store->db, "UPDATE snapshots SET id=? WHERE database_id=? AND id=?").Int(1, n + delta).Text(2, id).Int(3, n).Run();
+        Query(store->db, "UPDATE exports SET snapshot_id=? WHERE database_id=? AND snapshot_id=?")
+            .Int(1, n + delta)
+            .Text(2, id)
+            .Int(3, n)
+            .Run();
+    }
+    for (auto sql : {"UPDATE history SET snapshot_id=snapshot_id+?1 WHERE database_id=?2 AND snapshot_id>=?3",
+                     "UPDATE operations SET snapshot_id=snapshot_id+?1 WHERE database_id=?2 AND snapshot_id>=?3",
+                     "UPDATE operations SET preservation=preservation+?1 WHERE database_id=?2 AND preservation>=?3",
+                     "UPDATE branches SET head=head+?1 WHERE database_id=?2 AND head>=?3",
+                     "UPDATE branches SET source_snapshot=source_snapshot+?1 WHERE source_database=?2 AND "
+                     "source_snapshot>=?3",
+                     "UPDATE compound_intents SET expected_head=expected_head+?1 WHERE expected_head>=?3 AND branch_id "
+                     "IN (SELECT id FROM branches WHERE database_id=?2)",
+                     "UPDATE databases SET last_snapshot=CASE WHEN last_snapshot>=?3 THEN last_snapshot+?1 ELSE "
+                     "max(last_snapshot,?3+?1-1) END WHERE id=?2"})
+        Query(store->db, sql).Int(1, delta).Text(2, id).Int(3, from).Run();
+    return delta;
+}
+int64_t Control::RenumberSnapshots(const std::string &database, int64_t from, int64_t taken) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto delta = RenumberTx(DatabaseID(database), from, taken);
+    tx.Commit();
+    return delta;
+}
+void Control::RecordConflict(const BranchConflict &conflict) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query(store->db, "INSERT INTO branch_conflicts VALUES(?,?,?,?,?) ON CONFLICT(branch_id) DO UPDATE SET "
+                     "snapshot=excluded.snapshot,remote_snapshot=excluded.remote_snapshot,"
+                     "kept_branch=excluded.kept_branch,detected_at=excluded.detected_at")
+        .Text(1, conflict.branch)
+        .Int(2, conflict.snapshot)
+        .Int(3, conflict.remote_snapshot)
+        .Text(4, conflict.kept_branch)
+        .Int(5, conflict.detected_at ? conflict.detected_at : Timestamp())
+        .Run();
+}
+std::optional<BranchConflict> Control::Conflict(const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT snapshot,remote_snapshot,kept_branch,detected_at FROM branch_conflicts WHERE branch_id=?");
+    q.Text(1, branch);
+    if (!q.Step())
+        return std::nullopt;
+    return BranchConflict{branch, q.Text(2), q.Int(0), q.Int(1), q.Int(3)};
+}
+void Control::ClearConflict(const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query(store->db, "DELETE FROM branch_conflicts WHERE branch_id=?").Text(1, branch).Run();
+}
+Operation Control::BeginOperation(const std::string &kind, const std::vector<std::string> &payload,
+                                  const std::string &request) {
+    std::string encoded;
+    for (auto &part : payload)
+        encoded += std::to_string(part.size()) + ":" + part;
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto o = Begin(kind, encoded, request);
+    tx.Commit();
+    return o;
+}
+Operation Control::CompleteOperation(Operation o) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+std::set<int64_t> Control::CachedCommits(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    std::set<int64_t> result;
+    Query q(store->db, "SELECT id FROM remote_commits WHERE database_id=?");
+    q.Text(1, DatabaseID(database));
+    while (q.Step())
+        result.insert(q.Int(0));
+    return result;
+}
+void Control::CacheCommits(const std::string &database, const std::vector<RemoteCommit> &commits) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    for (auto &c : commits)
+        Query(store->db, "INSERT OR IGNORE INTO remote_commits VALUES(?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''),"
+                         "NULLIF(?,''),NULLIF(?,''),0)")
+            .Text(1, id)
+            .Int(2, c.snapshot)
+            .Int(3, c.parent)
+            .Text(4, c.branch)
+            .Text(5, c.branch_name)
+            .Int(6, c.published_at)
+            .Text(7, c.descriptor)
+            .Text(8, c.name)
+            .Text(9, c.author)
+            .Text(10, c.message)
+            .Text(11, c.extra_info)
+            .Run();
+    tx.Commit();
+}
+void Control::ExpireCommits(const std::string &database, const std::vector<int64_t> &snapshots) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    for (auto n : snapshots) {
+        Query(store->db, "UPDATE remote_commits SET expired=1 WHERE database_id=? AND id=?").Text(1, id).Int(2, n).Run();
+        Query(store->db, "UPDATE snapshots SET retired=1 WHERE database_id=? AND id=? AND retired=0")
+            .Text(1, id)
+            .Int(2, n)
+            .Run();
+    }
+    tx.Commit();
+}
+Snapshot Control::FindSnapshot(const std::string &database, int64_t snapshot, bool retained) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    auto id = DatabaseID(database);
+    Query local(store->db, "SELECT 1 FROM snapshots WHERE database_id=? AND id=?");
+    local.Text(1, id).Int(2, snapshot);
+    if (local.Step())
+        return GetSnapshot(id, snapshot, retained);
+    Query q(store->db, "SELECT c.parent,c.branch_id,c.published_at,c.descriptor,c.name,c.author,c.commit_message,"
+                       "c.commit_extra_info,c.expired,d.name FROM remote_commits c JOIN databases d ON "
+                       "d.id=c.database_id WHERE c.database_id=? AND c.id=?");
+    q.Text(1, id).Int(2, snapshot);
+    if (!q.Step())
+        throw std::runtime_error("[differential:not_found] Snapshot not found");
+    Snapshot s;
+    s.database = id;
+    s.database_name = q.Text(9);
+    s.id = snapshot;
+    s.parent = q.Int(0);
+    s.branch = q.Text(1);
+    s.published_at = s.captured_at = q.Int(2);
+    s.export_key = q.Text(3);
+    s.name = q.Text(4);
+    s.author = q.Text(5);
+    s.message = q.Text(6);
+    s.extra_info = q.Text(7);
+    s.retired = q.Int(8) != 0;
+    s.remote = s.evicted = true;
+    s.export_state = "complete";
+    s.export_provider = Profile(id);
+    if (retained && s.retired)
+        throw std::runtime_error("[differential:retired] Snapshot retired");
+    return s;
+}
+void Control::DropBranchLocally(const std::string &database, const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto b = GetBranch(database, branch, true);
+    UnlinkBranchFiles(b);
+    Query(store->db, "UPDATE branches SET state='deleted',epoch=epoch+1 WHERE id=?").Text(1, b.id).Run();
+    Query(store->db, "DELETE FROM branch_conflicts WHERE branch_id=?").Text(1, b.id).Run();
+    tx.Commit();
+}
+Operation Control::GetOperation(const std::string &id) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, (std::string(OP_COLUMNS) + " WHERE id=?").c_str());
+    q.Text(1, id);
+    if (!q.Step())
+        throw std::runtime_error("Operation missing");
+    return ReadOperation(q);
+}
+Branch Control::GetBranch(const std::string &database, const std::string &branch, bool stable) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    auto id = DatabaseID(database);
+    Query q(store->db, (std::string(BRANCH_COLUMNS) +
+                        (stable ? " WHERE b.database_id=? AND b.id=?"
+                                : " WHERE b.database_id=? AND b.name=? AND b.state='active'"))
+                           .c_str());
+    q.Text(1, id).Text(2, branch);
+    if (!q.Step())
+        throw std::runtime_error("[differential:not_found] Branch not found");
+    auto b = ReadBranch(q);
+    if (b.state != "active")
+        throw std::runtime_error("[differential:retired] Branch deleted");
+    return b;
+}
+Snapshot Control::GetSnapshot(const std::string &database, int64_t snapshot, bool retained) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    auto id = DatabaseID(database);
+    Query q(store->db, (std::string(SNAPSHOT_COLUMNS) + " WHERE s.database_id=? AND s.id=?").c_str());
+    q.Text(1, id).Int(2, snapshot);
+    if (!q.Step())
+        throw std::runtime_error("[differential:not_found] Snapshot not found");
+    auto s = ReadSnapshot(q);
+    auto e = Export(s.database, s.id);
+    if (!e.id.empty()) {
+        s.export_state = e.state;
+        s.export_key = e.descriptor;
+        s.export_provider = e.provider;
+    }
+    if (retained && s.retired)
+        throw std::runtime_error("[differential:retired] Snapshot retired");
+    return s;
+}
+void Control::Validate(const Branch &b) {
+    auto current = GetBranch(b.database, b.id, true);
+    if (current.epoch != b.epoch || current.head != b.head)
+        throw std::runtime_error("[differential:stale_epoch] Stale branch epoch or head");
+}
+std::shared_ptr<BranchLock> Control::Acquire(const Branch &b) {
+    auto result = std::make_shared<BranchLock>();
+    auto path = std::filesystem::path(store->directory) / "locks";
+    store->permissions.CreateDirectories(path);
+    result->fd = store->permissions.Open(path / ("branch-" + b.id), O_RDWR | O_CLOEXEC);
+    if (result->fd < 0 || flock(result->fd, LOCK_EX | LOCK_NB)) {
+        Count(Counter::WriterConflicts);
+        throw std::runtime_error(
+            "[differential:writer_busy] Writer busy: branch has a live attachment or management owner");
+    }
+    // A previous owner may have died with unsynced journaled writes: apply them before this
+    // writer reads or extends the branch.
+    store->ReplayJournals();
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query intent(store->db, "SELECT operation_id FROM compound_intents WHERE branch_id=?");
+    intent.Text(1, b.id);
+    if (intent.Step()) {
+        Count(Counter::WriterConflicts);
+        throw std::runtime_error(
+            "[differential:writer_busy] Branch has a pending compound operation; retry its request ID");
+    }
+    result->branch = GetBranch(b.database, b.id, true);
+    if (result->branch.epoch == std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("Writer epoch exhausted");
+    ++result->branch.epoch;
+    Query(store->db, "UPDATE branches SET epoch=? WHERE id=?").Int(1, result->branch.epoch).Text(2, b.id).Run();
+    tx.Commit();
+    return result;
+}
+Operation Control::BeginSnapshot(const Branch &b, const SnapshotInfo &info, const std::string &request) {
+    ValidateName(info.name, true);
+    if (info.author.size() > 1024 || info.message.size() > 65536 || info.extra_info.size() > 65536)
+        throw std::runtime_error("Snapshot author/message/extra_info exceed 1 KiB/64 KiB/64 KiB");
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto payload = Payload({b.database, b.id, info.name, info.author, info.message, info.extra_info});
+    auto o = Begin("snapshot", payload, request);
+    if (o.state != "complete") {
+        // Head may have advanced through another completed snapshot on this writer; epoch is the fence.
+        auto current = GetBranch(b.database, b.id, true);
+        if (current.epoch != b.epoch)
+            throw std::runtime_error("[differential:stale_epoch] Stale writer epoch");
+        o.database = b.database;
+        o.branch = b.id;
+        Query(store->db, "UPDATE operations SET database_id=?,branch_id=? WHERE id=?")
+            .Text(1, b.database)
+            .Text(2, b.id)
+            .Text(3, o.id)
+            .Run();
+    }
+    tx.Commit();
+    return o;
+}
+void Control::Event(const Branch &b, int64_t snapshot, int64_t timestamp) {
+    Query(store->db, "INSERT INTO history(branch_id,database_id,snapshot_id,effective_at) VALUES(?,?,?,?)")
+        .Text(1, b.id)
+        .Text(2, b.database)
+        .Int(3, snapshot)
+        .Int(4, timestamp)
+        .Run();
+}
+Snapshot Control::Publish(const Branch &b, const Root &root, const SnapshotInfo &info, int64_t captured_at) {
+    const auto &name = info.name;
+    Query count(store->db, "SELECT last_snapshot FROM databases WHERE id=?");
+    count.Text(1, b.database);
+    count.Step();
+    if (count.Int(0) == std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("Snapshot ID exhausted");
+    Snapshot s;
+    s.database = b.database;
+    s.branch = b.id;
+    s.id = count.Int(0) + 1;
+    s.name = name;
+    s.author = info.author;
+    s.message = info.message;
+    s.extra_info = info.extra_info;
+    s.root = root.id;
+    s.size = int64_t(root.size);
+    s.captured_at = captured_at;
+    s.published_at = Timestamp();
+    Query(store->db, "INSERT INTO snapshots(database_id,id,branch_id,name,root,published_at,captured_at,author,"
+                     "commit_message,commit_extra_info) VALUES(?,?,?,NULLIF(?,''),?,?,?,NULLIF(?,''),NULLIF(?,''),"
+                     "NULLIF(?,''))")
+        .Text(1, s.database)
+        .Int(2, s.id)
+        .Text(3, s.branch)
+        .Text(4, name)
+        .Text(5, s.root)
+        .Int(6, s.published_at)
+        .Int(7, captured_at)
+        .Text(8, info.author)
+        .Text(9, info.message)
+        .Text(10, info.extra_info)
+        .Run();
+    Query(store->db, "UPDATE databases SET last_snapshot=? WHERE id=?").Int(1, s.id).Text(2, s.database).Run();
+    Query(store->db, "UPDATE branches SET head=?,root=? WHERE id=?").Int(1, s.id).Text(2, s.root).Text(3, b.id).Run();
+    auto profile = Profile(b.database);
+    if (profile != "local") {
+        auto export_id = UUID();
+        Query(store->db, "INSERT INTO export_roots VALUES(?,?,'pending')").Text(1, export_id).Text(2, s.root).Run();
+        Query(store->db, "INSERT INTO exports(id,provider_id,database_id,snapshot_id) VALUES(?,?,?,?)")
+            .Text(1, export_id)
+            .Text(2, profile)
+            .Text(3, s.database)
+            .Int(4, s.id)
+            .Run();
+        s.export_state = "pending";
+    }
+    Event(b, s.id, s.published_at);
+    return s;
+}
+Operation Control::PublishSnapshot(const Operation &operation, const Branch &b, const Root &root,
+                                   int64_t captured_at) {
+    Timer timer(Metric::SnapshotPublish);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query q(store->db, (std::string(OP_COLUMNS) + " WHERE id=?").c_str());
+    q.Text(1, operation.id);
+    if (!q.Step())
+        throw std::runtime_error("Operation missing");
+    auto o = ReadOperation(q);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    auto current = GetBranch(b.database, b.id, true);
+    if (current.epoch != b.epoch || current.head != b.head)
+        throw std::runtime_error(
+            "[differential:stale_epoch] Stale branch epoch or head; retry the same request ID");
+    if (o.kind != "snapshot" || o.database != b.database || o.branch != b.id)
+        throw std::runtime_error("Operation identity mismatch");
+    // Decode the length-prefixed payload, keeping request identity independent of mutable aliases.
+    auto fields = DecodePayload(o.payload);
+    if (fields.size() != 6)
+        throw std::runtime_error("[differential:corrupt_data] Corrupt snapshot operation payload");
+    SnapshotInfo info;
+    info.name = fields[2];
+    info.author = fields[3];
+    info.message = fields[4];
+    info.extra_info = fields[5];
+    auto s = Publish(current, root, info, captured_at);
+    o.snapshot = s.id;
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+Operation Control::CreateBranch(const std::string &database, int64_t snapshot, const std::string &name,
+                                const std::string &request, bool clone) {
+    ValidateName(name);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto source = DatabaseID(database);
+    auto o = Begin(clone ? "clone" : "branch", Payload({source, std::to_string(snapshot), name}), request);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    auto s = GetSnapshot(source, snapshot);
+    o.database = source;
+    if (clone) {
+        o.database = UUID();
+        Query(store->db, "INSERT INTO databases(id,name,created_at) VALUES(?,?,?)")
+            .Text(1, o.database)
+            .Text(2, name)
+            .Int(3, Timestamp())
+            .Run();
+    }
+    if (clone && Profile(source) != "local")
+        Query(store->db, "INSERT INTO database_profiles VALUES(?,?)")
+            .Text(1, o.database)
+            .Text(2, Profile(source))
+            .Run();
+    auto local_pool = LocalDatabasePool(source);
+    if (clone && !local_pool.empty())
+        Query(store->db, "INSERT INTO database_local_profiles VALUES(?,?)")
+            .Text(1, o.database)
+            .Text(2, local_pool)
+            .Run();
+    auto b = NewBranch(o.database, clone ? "main" : name, s.root, clone ? 0 : s.id, source, s.id);
+    o.branch = b.id;
+    if (clone)
+        o.snapshot = Publish(b, {s.root, uint64_t(s.size)},
+                             {"", "", "clone of " + s.database_name + " snapshot " + std::to_string(s.id), ""},
+                             Timestamp())
+                         .id;
+    else {
+        o.snapshot = s.id;
+        Event(b, s.id, b.created_at);
+    }
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+Operation Control::Retire(const std::string &database, int64_t snapshot, const std::string &request) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    auto o = Begin("retire", Payload({id, std::to_string(snapshot)}), request);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    auto s = GetSnapshot(id, snapshot, false);
+    Query(store->db, "UPDATE snapshots SET retired=1 WHERE database_id=? AND id=?").Text(1, id).Int(2, snapshot).Run();
+    o.database = id;
+    o.branch = s.branch;
+    o.snapshot = s.id;
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+Operation Control::Evict(const std::string &database, int64_t snapshot, const std::string &request) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    auto o = Begin("evict", Payload({id, std::to_string(snapshot)}), request);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    auto s = GetSnapshot(id, snapshot, false);
+    if (s.export_state != "complete")
+        throw std::runtime_error("[differential:unsupported_provider_capability] Only a snapshot with a "
+                                 "completed S3 export can drop its local copy");
+    Query(store->db, "UPDATE snapshots SET evicted=1 WHERE database_id=? AND id=?").Text(1, id).Int(2, snapshot).Run();
+    o.database = id;
+    o.branch = s.branch;
+    o.snapshot = s.id;
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+Operation Control::RetryExport(const std::string &database, int64_t snapshot, const std::string &request) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    auto op = Begin("retry_export", Payload({id, std::to_string(snapshot)}), request);
+    if (op.state != "complete") {
+        auto source = GetSnapshot(id, snapshot, false);
+        if (Export(id, snapshot).id.empty())
+            throw std::runtime_error("[differential:unsupported_provider_capability] Snapshot has no S3 export");
+        op.database = id;
+        op.branch = source.branch;
+        op.snapshot = snapshot;
+        Complete(op);
+    }
+    tx.Commit();
+    return op;
+}
+std::pair<Operation, std::shared_ptr<BranchLock>>
+Control::PrepareCompound(const std::string &database, const std::string &branch, int64_t target,
+                         const std::string &request, bool restore) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto database_id = DatabaseID(database);
+    auto o = Begin(restore ? "restore" : "drop_branch", Payload({database_id, branch, std::to_string(target)}),
+                   request);
+    if (o.state == "complete") {
+        tx.Commit();
+        return {o, nullptr};
+    }
+    auto b = o.branch.empty() ? GetBranch(database_id, branch) : GetBranch(database_id, o.branch, true);
+    auto lock = std::make_shared<BranchLock>();
+    auto path = std::filesystem::path(store->directory) / "locks";
+    store->permissions.CreateDirectories(path);
+    lock->management_fd = store->permissions.Open(path / ("management-" + database_id), O_RDWR | O_CLOEXEC);
+    if (lock->management_fd < 0 || flock(lock->management_fd, LOCK_EX | LOCK_NB)) {
+        Count(Counter::WriterConflicts);
+        throw std::runtime_error("[differential:writer_busy] Database management busy");
+    }
+    lock->fd = store->permissions.Open(path / ("branch-" + b.id), O_RDWR | O_CLOEXEC);
+    if (lock->fd < 0 || flock(lock->fd, LOCK_EX | LOCK_NB)) {
+        Count(Counter::WriterConflicts);
+        throw std::runtime_error(
+            "[differential:active_attachment_or_transaction] Branch has an active attachment or writer");
+    }
+    if (!restore) {
+        // A durable pending deletion is already committed to removing its branch.
+        // Do not accept another deletion that would strand that operation as the
+        // last active (and fenced) branch after a crash releases management locks.
+        Query count(store->db, "SELECT count(*) FROM branches b WHERE database_id=? AND state='active' "
+                               "AND NOT EXISTS(SELECT 1 FROM compound_intents c JOIN operations o ON "
+                               "o.id=c.operation_id WHERE c.branch_id=b.id AND o.kind='drop_branch' AND o.id!=?)");
+        count.Text(1, database_id).Text(2, o.id);
+        count.Step();
+        if (count.Int(0) <= 1)
+            throw std::runtime_error("Cannot delete the last active branch");
+    }
+    Query pending(store->db, "SELECT operation_id,expected_head FROM compound_intents WHERE branch_id=?");
+    pending.Text(1, b.id);
+    if (pending.Step()) {
+        if (pending.Text(0) != o.id)
+            throw std::runtime_error("[differential:writer_busy] Branch has another pending compound operation");
+        if (pending.Int(1) != b.head)
+            throw std::runtime_error("[differential:stale_epoch] Stale compound operation head");
+    } else {
+        std::string target_root;
+        if (restore)
+            target_root = GetSnapshot(database_id, target).root;
+        Query(store->db, "INSERT INTO compound_intents VALUES(?,?,?,?,NULLIF(?,''))")
+            .Text(1, o.id)
+            .Text(2, b.id)
+            .Int(3, b.head)
+            .Int(4, b.epoch)
+            .Text(5, target_root)
+            .Run();
+    }
+    if (b.epoch == std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("Writer epoch exhausted");
+    ++b.epoch;
+    lock->branch = b;
+    o.database = database_id;
+    o.branch = b.id;
+    Query(store->db, "UPDATE branches SET epoch=? WHERE id=?").Int(1, b.epoch).Text(2, b.id).Run();
+    Query(store->db, "UPDATE compound_intents SET expected_epoch=? WHERE operation_id=?")
+        .Int(1, b.epoch)
+        .Text(2, o.id)
+        .Run();
+    Query(store->db, "UPDATE operations SET database_id=?,branch_id=? WHERE id=?")
+        .Text(1, database_id)
+        .Text(2, b.id)
+        .Text(3, o.id)
+        .Run();
+    tx.Commit();
+    Crash("compound_intent");
+    return {o, lock};
+}
+Operation Control::FinishCompound(const Operation &operation, const Branch &b, const Root &preserved,
+                                  bool restore) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query q(store->db, (std::string(OP_COLUMNS) + " WHERE id=?").c_str());
+    q.Text(1, operation.id);
+    if (!q.Step())
+        throw std::runtime_error("Operation missing");
+    auto o = ReadOperation(q);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    Validate(b);
+    Query intent(store->db, "SELECT expected_head,expected_epoch,target_root FROM compound_intents WHERE "
+                            "operation_id=? AND branch_id=?");
+    intent.Text(1, o.id).Text(2, b.id);
+    if (!intent.Step() || intent.Int(0) != b.head || intent.Int(1) != b.epoch)
+        throw std::runtime_error("[differential:stale_epoch] Stale compound intent");
+    auto target = intent.Text(2);
+    // Native recovery/checkpoint must have finished while exclusive ownership remains held.
+    Query wal(store->db, "SELECT count(*) FROM files WHERE name IN (?,?,?) AND size>0");
+    wal.Text(1, b.FileName() + ".wal").Text(2, b.FileName() + ".wal.checkpoint").Text(3, b.FileName() + ".wal.recovery");
+    wal.Step();
+    if (wal.Int(0))
+        throw std::runtime_error("Native recovery sidecars remain; refusing main-file-only replacement");
+    Query prior(store->db,
+                "SELECT id FROM snapshots WHERE database_id=? AND root=? AND retired=0 ORDER BY id DESC LIMIT 1");
+    prior.Text(1, b.database).Text(2, preserved.id);
+    if (prior.Step()) {
+        o.preservation = prior.Int(0);
+        Event(b, o.preservation, Timestamp());
+    } else
+        o.preservation =
+            Publish(b, preserved, {"", "", restore ? "preserved before restore" : "preserved before branch deletion", ""},
+                    Timestamp())
+                .id;
+    Crash("compound_preservation");
+    Query(store->db, "UPDATE files SET name=NULL WHERE name IN (?,?,?,?)")
+        .Text(1, b.FileName())
+        .Text(2, b.FileName() + ".wal")
+        .Text(3, b.FileName() + ".wal.checkpoint")
+        .Text(4, b.FileName() + ".wal.recovery")
+        .Run();
+    if (restore) {
+        auto size = store->RootSizeTx(target);
+        Query target_id(store->db, "SELECT id FROM snapshots WHERE database_id=? AND root=? ORDER BY id DESC LIMIT 1");
+        target_id.Text(1, b.database).Text(2, target);
+        auto label = target_id.Step() ? "restored to snapshot " + std::to_string(target_id.Int(0)) : "restored";
+        o.snapshot = Publish(b, {target, size}, {"", "", label, ""}, Timestamp()).id;
+        auto file = store->CreateFileTx(b.FileName(), size, LocalDatabasePool(b.database));
+        store->InstallRootTx(file, target);
+    } else {
+        Query(store->db, "UPDATE branches SET state='deleted' WHERE id=?").Text(1, b.id).Run();
+    }
+    if (b.epoch == std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("Writer epoch exhausted");
+    Query(store->db, "UPDATE branches SET epoch=epoch+1 WHERE id=?").Text(1, b.id).Run();
+    Query(store->db, "DELETE FROM compound_intents WHERE operation_id=?").Text(1, o.id).Run();
+    Complete(o);
+    Crash("compound_replaced");
+    tx.Commit();
+    Crash("compound_completed");
+    return o;
+}
+Snapshot Control::SnapshotAt(const std::string &database, const std::string &branch, int64_t timestamp,
+                             int64_t start) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto database_id = DatabaseID(database);
+    if (Writers(database_id) == "shared") {
+        auto current = start;
+        if (!current) {
+            Query head(store->db, "SELECT head FROM branches WHERE database_id=? AND (id=? OR (name=? AND "
+                                  "state='active')) ORDER BY id=? DESC LIMIT 1");
+            head.Text(1, database_id).Text(2, branch).Text(3, branch).Text(4, branch);
+            if (!head.Step())
+                throw std::runtime_error("[differential:not_found] Branch not found");
+            current = head.Int(0);
+        }
+        std::set<int64_t> seen;
+        while (current > 0 && seen.insert(current).second) {
+            Snapshot s;
+            try {
+                s = FindSnapshot(database_id, current, false);
+            } catch (const std::exception &) {
+                break; // history not known beyond this point
+            }
+            if (!s.retired && s.published_at <= timestamp) {
+                s.event_at = s.published_at;
+                tx.Commit();
+                return s;
+            }
+            Query parent(store->db, "SELECT parent FROM remote_commits WHERE database_id=? AND id=?");
+            parent.Text(1, database_id).Int(2, current);
+            current = parent.Step() ? parent.Int(0) : ParentSnapshot(database_id, current);
+        }
+        throw std::runtime_error("[differential:not_found] No retained snapshot at or before timestamp on this branch");
+    }
+    Query identity(store->db, "SELECT id FROM branches WHERE database_id=? AND (id=? OR (name=? AND "
+                              "state='active')) ORDER BY id=? DESC LIMIT 1");
+    identity.Text(1, database_id).Text(2, branch).Text(3, branch).Text(4, branch);
+    if (!identity.Step())
+        throw std::runtime_error("[differential:not_found] Branch not found");
+    auto branch_id = identity.Text(0);
+    Query q(store->db, "SELECT h.snapshot_id,h.effective_at FROM history h JOIN snapshots s ON "
+                       "s.database_id=h.database_id AND s.id=h.snapshot_id WHERE h.branch_id=? AND h.effective_at<=? "
+                       "AND s.retired=0 ORDER BY h.effective_at DESC,h.sequence DESC LIMIT 1");
+    q.Text(1, branch_id).Int(2, timestamp);
+    if (!q.Step())
+        throw std::runtime_error("[differential:not_found] No retained snapshot at or before timestamp on this branch");
+    auto s = GetSnapshot(database_id, q.Int(0));
+    s.event_at = q.Int(1);
+    tx.Commit();
+    return s;
+}
+std::vector<Snapshot> Control::Snapshots(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    std::vector<Snapshot> result;
+    Query q(store->db, (std::string(SNAPSHOT_COLUMNS) + " WHERE s.database_id=? ORDER BY s.id").c_str());
+    q.Text(1, DatabaseID(database));
+    while (q.Step()) {
+        auto snapshot = ReadSnapshot(q);
+        auto e = Export(snapshot.database, snapshot.id);
+        if (!e.id.empty()) {
+            snapshot.export_state = e.state;
+            snapshot.export_key = e.descriptor;
+            snapshot.export_provider = e.provider;
+        }
+        result.push_back(std::move(snapshot));
+    }
+    // Shared databases: snapshots other writers published, known from their commit records.
+    std::vector<int64_t> remote;
+    {
+        Query r(store->db, "SELECT c.id FROM remote_commits c WHERE c.database_id=? AND NOT EXISTS(SELECT 1 FROM "
+                           "snapshots s WHERE s.database_id=c.database_id AND s.id=c.id) ORDER BY c.id");
+        r.Text(1, DatabaseID(database));
+        while (r.Step())
+            remote.push_back(r.Int(0));
+    }
+    for (auto n : remote)
+        result.push_back(FindSnapshot(database, n, false));
+    std::sort(result.begin(), result.end(), [](const Snapshot &a, const Snapshot &b) { return a.id < b.id; });
+    return result;
+}
+std::vector<Branch> Control::Branches(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    std::vector<Branch> result;
+    Query q(store->db, (std::string(BRANCH_COLUMNS) + " WHERE b.database_id=? ORDER BY b.created_at,b.id").c_str());
+    q.Text(1, DatabaseID(database));
+    while (q.Step())
+        result.push_back(ReadBranch(q));
+    return result;
+}
+std::vector<Operation> Control::Operations() {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    std::vector<Operation> result;
+    Query q(store->db, (std::string(OP_COLUMNS) + " ORDER BY created_at,id").c_str());
+    while (q.Step()) {
+        auto o = ReadOperation(q);
+        if (o.state == "complete" && (o.snapshot || o.preservation) && o.kind != "retire" && o.kind != "evict") {
+            for (auto id : {o.snapshot, o.preservation})
+                if (id && Export(o.database, id).state == "pending")
+                    o.state = "local_complete_export_pending";
+        }
+        result.push_back(std::move(o));
+    }
+    return result;
+}
+std::vector<DatabaseRecord> Control::Databases() {
+    std::vector<DatabaseRecord> result;
+    auto cursor = List("databases");
+    std::vector<MetadataCell> row;
+    while (cursor->Next(row))
+        result.push_back({row[0].text, row[1].text, row[2].text, row[3].number, row[4].number, row[5].text});
+    return result;
+}
+std::vector<ProviderRecord> Control::Providers() {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    std::vector<ProviderRecord> result;
+    Query q(store->db, "SELECT id FROM providers ORDER BY name");
+    while (q.Step())
+        result.push_back(Provider(q.Text(0)));
+    return result;
+}
+std::string Control::Profile(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT provider_id FROM database_profiles WHERE database_id=?");
+    q.Text(1, DatabaseID(database));
+    return q.Step() ? q.Text(0) : "local";
+}
+std::string Control::LocalProvider(const std::string &name) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT id FROM local_pools WHERE id=? OR name=? ORDER BY id=? DESC");
+    q.Text(1, name).Text(2, name).Text(3, name);
+    return q.Step() ? q.Text(0) : "";
+}
+std::string Control::LocalDatabasePool(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT pool FROM database_local_profiles WHERE database_id=?");
+    q.Text(1, DatabaseID(database));
+    return q.Step() ? q.Text(0) : "";
+}
+void Control::AssignProvider(const std::string &database, const std::string &provider) {
+    if (provider == "local")
+        return;
+    auto pool = LocalProvider(provider);
+    if (!pool.empty())
+        Query(store->db, "INSERT INTO database_local_profiles VALUES(?,?)").Text(1, database).Text(2, pool).Run();
+    else
+        Query(store->db, "INSERT INTO database_profiles VALUES(?,?)")
+            .Text(1, database)
+            .Text(2, Provider(provider).id)
+            .Run();
+}
+std::string Control::FindDatabase(const std::string &name) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT id FROM databases WHERE id=? OR name=? ORDER BY id=? DESC");
+    q.Text(1, name).Text(2, name).Text(3, name);
+    return q.Step() ? q.Text(0) : "";
+}
+std::string Control::EnsureS3Provider(const S3Config &config, const std::vector<std::string> &explicit_options) {
+    if (config.prefix.empty())
+        throw std::runtime_error("S3 DATA_PATH needs an owned prefix: s3://bucket/prefix/");
+    auto location = config.Identity();
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query existing(store->db, "SELECT id FROM providers WHERE name=?");
+    existing.Text(1, location);
+    if (existing.Step()) {
+        auto id = existing.Text(0);
+        auto stored = Provider(id).config;
+        // Provider configuration is immutable: options given again must agree with it.
+        auto differs = [&](const std::string &option) {
+            if (option == "region")
+                return stored.region != config.region;
+            if (option == "endpoint")
+                return stored.endpoint != config.endpoint;
+            if (option == "credential_profile")
+                return stored.credential_profile != config.credential_profile;
+            if (option == "path_style")
+                return stored.path_style != config.path_style;
+            if (option == "allow_http")
+                return stored.development_http != config.development_http;
+            if (option == "max_requests")
+                return stored.max_requests != config.max_requests;
+            if (option == "retries")
+                return stored.retries != config.retries;
+            if (option == "connect_timeout_ms")
+                return stored.connect_timeout_ms != config.connect_timeout_ms;
+            if (option == "request_timeout_ms")
+                return stored.request_timeout_ms != config.request_timeout_ms;
+            if (option == "max_range_bytes")
+                return stored.max_range_bytes != config.max_range_bytes;
+            if (option == "multipart_threshold")
+                return stored.multipart_threshold != config.multipart_threshold;
+            return false;
+        };
+        for (auto &option : explicit_options)
+            if (differs(option))
+                throw std::runtime_error("[differential:name_conflict] " + location + " is already registered with a "
+                                         "different " + option);
+        tx.Commit();
+        return id;
+    }
+    auto id = UUID();
+    Query(store->db, "INSERT INTO providers VALUES(?,?,?,?,?,?,?,?,?)")
+        .Text(1, id)
+        .Text(2, location)
+        .Text(3, config.bucket)
+        .Text(4, config.prefix)
+        .Text(5, config.region)
+        .Text(6, config.endpoint)
+        .Text(7, config.credential_profile)
+        .Int(8, config.path_style)
+        .Int(9, config.development_http)
+        .Run();
+    Query(store->db, "INSERT INTO provider_limits VALUES(?,?,?,?,?,?,?)")
+        .Text(1, id)
+        .Int(2, config.max_requests)
+        .Int(3, config.retries)
+        .Int(4, config.connect_timeout_ms)
+        .Int(5, config.request_timeout_ms)
+        .Int(6, int64_t(config.max_range_bytes))
+        .Int(7, int64_t(config.multipart_threshold))
+        .Run();
+    tx.Commit();
+    return id;
+}
+std::string Control::EnsureLocalPool(const std::string &path) {
+    auto canonical = LocalPool::Canonical(path);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query existing(store->db, "SELECT id FROM local_pools WHERE path=? ORDER BY id LIMIT 1");
+    existing.Text(1, canonical);
+    if (existing.Step()) {
+        auto id = existing.Text(0);
+        tx.Commit();
+        return id;
+    }
+    auto id = UUID();
+    Query(store->db, "INSERT INTO local_pools(id,name,path,repository_id) VALUES(?,?,?,?)")
+        .Text(1, id)
+        .Text(2, canonical)
+        .Text(3, canonical)
+        .Text(4, RepositoryID())
+        .Run();
+    tx.Commit();
+    return id;
+}
+std::string Control::DataPath(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    auto id = DatabaseID(database);
+    Query s3(store->db, "SELECT p.bucket,p.prefix FROM database_profiles f JOIN providers p ON p.id=f.provider_id "
+                        "WHERE f.database_id=?");
+    s3.Text(1, id);
+    if (s3.Step())
+        return "s3://" + s3.Text(0) + "/" + s3.Text(1);
+    Query local(store->db, "SELECT l.path FROM database_local_profiles f JOIN local_pools l ON l.id=f.pool WHERE "
+                           "f.database_id=?");
+    local.Text(1, id);
+    return local.Step() ? local.Text(0) : "";
+}
+std::vector<Snapshot> Control::SelectSnapshots(const std::string &database, const std::vector<int64_t> &versions,
+                                               std::optional<int64_t> older_than, bool for_eviction) {
+    if (versions.empty() && !older_than)
+        throw std::runtime_error("Select snapshots with versions => [...] and/or older_than => <timestamp>");
+    std::vector<Snapshot> result;
+    // Explicit versions are always selected (repeating a request replays its result); only
+    // the age criterion skips snapshots that were already expired or evicted.
+    for (auto version : versions)
+        result.push_back(FindSnapshot(database, version, false));
+    if (older_than)
+        for (auto &s : Snapshots(database)) {
+            bool listed = std::any_of(result.begin(), result.end(), [&](const Snapshot &r) { return r.id == s.id; });
+            bool eligible = !s.retired && (!for_eviction || (!s.evicted && s.export_state == "complete"));
+            if (!listed && eligible && s.published_at < *older_than)
+                result.push_back(s);
+        }
+    std::sort(result.begin(), result.end(), [](const Snapshot &a, const Snapshot &b) { return a.id < b.id; });
+    return result;
+}
+int64_t Control::CurrentSnapshot(const std::string &database, const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    if (!branch.empty())
+        return GetBranch(database, branch, true).head;
+    Query q(store->db, "SELECT last_snapshot FROM databases WHERE id=?");
+    q.Text(1, DatabaseID(database));
+    return q.Step() ? q.Int(0) : 0;
+}
+Operation Control::CheckpointSnapshot(const Branch &lease, const Root &root) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Operation o;
+    auto current = GetBranch(lease.database, lease.id, true);
+    Query intent(store->db, "SELECT 1 FROM compound_intents WHERE branch_id=?");
+    intent.Text(1, lease.id);
+    // A newer owner or a pending compound operation owns the branch history; an unchanged
+    // image needs no new snapshot.
+    if (current.epoch != lease.epoch || intent.Step() || current.root == root.id) {
+        tx.Commit();
+        return o;
+    }
+    o = Begin("snapshot", Payload({current.database, current.id, "", "", "checkpoint", ""}), "");
+    o.database = current.database;
+    o.branch = current.id;
+    o.snapshot = Publish(current, root, {"", "", "checkpoint", ""}, Timestamp()).id;
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+std::vector<int64_t> Control::PendingExports(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    std::vector<int64_t> result;
+    Query q(store->db, "SELECT e.snapshot_id FROM exports e JOIN export_roots r ON r.export_id=e.id WHERE "
+                       "e.database_id=? AND r.state='pending' ORDER BY e.snapshot_id");
+    q.Text(1, DatabaseID(database));
+    while (q.Step())
+        result.push_back(q.Int(0));
+    return result;
+}
+std::vector<ProviderRecord> Control::S3Providers() {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::recursive_mutex> guard(store->mutex);
+        Query q(store->db, "SELECT id FROM providers ORDER BY id");
+        while (q.Step())
+            ids.push_back(q.Text(0));
+    }
+    std::vector<ProviderRecord> providers;
+    for (auto &id : ids)
+        providers.push_back(Provider(id));
+    return providers;
+}
+ProviderRecord Control::Provider(const std::string &name) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT id,name,bucket,prefix,region,endpoint,credential_profile,path_style,development_http "
+                       "FROM providers WHERE id=? OR name=? ORDER BY id=? DESC");
+    q.Text(1, name).Text(2, name).Text(3, name);
+    if (!q.Step())
+        throw std::runtime_error("[differential:not_found] Provider not found");
+    ProviderRecord p;
+    p.id = q.Text(0);
+    p.name = q.Text(1);
+    p.config.bucket = q.Text(2);
+    p.config.prefix = q.Text(3);
+    p.config.region = q.Text(4);
+    p.config.endpoint = q.Text(5);
+    p.config.credential_profile = q.Text(6);
+    p.config.path_style = q.Int(7) != 0;
+    p.config.development_http = q.Int(8) != 0;
+    Query limits(store->db, "SELECT max_requests,retries,connect_timeout_ms,request_timeout_ms,max_range_bytes,"
+                            "multipart_threshold FROM provider_limits WHERE provider_id=?");
+    limits.Text(1, p.id);
+    if (limits.Step()) {
+        p.config.max_requests = unsigned(limits.Int(0));
+        p.config.retries = unsigned(limits.Int(1));
+        p.config.connect_timeout_ms = unsigned(limits.Int(2));
+        p.config.request_timeout_ms = unsigned(limits.Int(3));
+        p.config.max_range_bytes = uint64_t(limits.Int(4));
+        p.config.multipart_threshold = uint64_t(limits.Int(5));
+    }
+    return p;
+}
+std::optional<HeadWrite> Control::HeadWriteFor(const std::string &provider, const std::string &key) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT etag,write_id,pending,snapshot FROM branch_head_writes WHERE provider_id=? AND key=?");
+    q.Text(1, provider).Text(2, key);
+    if (!q.Step())
+        return std::nullopt;
+    return HeadWrite{q.Text(0), q.Text(1), q.Text(2), q.Int(3)};
+}
+void Control::RecordHeadWrite(const std::string &provider, const std::string &key, const HeadWrite &write) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query(store->db, "INSERT INTO branch_head_writes VALUES(?,?,?,?,?,?) ON CONFLICT(provider_id,key) DO UPDATE SET "
+                     "etag=excluded.etag,write_id=excluded.write_id,pending=excluded.pending,snapshot=excluded.snapshot")
+        .Text(1, provider)
+        .Text(2, key)
+        .Text(3, write.etag)
+        .Text(4, write.write_id)
+        .Text(5, write.pending)
+        .Int(6, write.snapshot)
+        .Run();
+}
+std::vector<BranchHead> Control::ExportedHeads(const std::string &database, std::string &provider) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    auto id = DatabaseID(database);
+    provider = Profile(id);
+    std::vector<BranchHead> heads;
+    if (provider == "local") {
+        provider.clear();
+        return heads;
+    }
+    Query q(store->db, "SELECT b.id,b.name,d.name,h.snapshot_id,s.published_at,e.descriptor FROM branches b "
+                       "JOIN databases d ON d.id=b.database_id JOIN history h ON h.branch_id=b.id "
+                       "JOIN snapshots s ON s.database_id=h.database_id AND s.id=h.snapshot_id AND s.retired=0 "
+                       "JOIN exports e ON e.database_id=s.database_id AND e.snapshot_id=s.id AND e.provider_id=? "
+                       "AND e.descriptor!='' JOIN export_roots r ON r.export_id=e.id AND r.state='complete' "
+                       "WHERE b.database_id=? AND b.state='active' ORDER BY b.id,h.sequence DESC");
+    q.Text(1, provider).Text(2, id);
+    while (q.Step()) {
+        if (!heads.empty() && heads.back().branch == q.Text(0))
+            continue;
+        BranchHead head;
+        head.database = id;
+        head.branch = q.Text(0);
+        head.branch_name = q.Text(1);
+        head.database_name = q.Text(2);
+        head.snapshot = q.Int(3);
+        head.published_at = q.Int(4);
+        head.descriptor = q.Text(5);
+        heads.push_back(head);
+    }
+    return heads;
+}
+ExportRecord Control::Export(const std::string &database, int64_t snapshot) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT e.id,e.provider_id,e.database_id,e.snapshot_id,r.root,r.state,e.descriptor FROM exports "
+                       "e JOIN export_roots r ON r.export_id=e.id WHERE e.database_id=? AND e.snapshot_id=?");
+    q.Text(1, database).Int(2, snapshot);
+    ExportRecord e;
+    if (!q.Step())
+        return e;
+    e.id = q.Text(0);
+    e.provider = q.Text(1);
+    e.database = q.Text(2);
+    e.snapshot = q.Int(3);
+    e.root = q.Text(4);
+    e.state = q.Text(5);
+    e.descriptor = q.Text(6);
+    return e;
+}
+Operation Control::BeginImport(const std::string &name, const std::string &source, const std::string &request,
+                               const std::string &provider, const std::string &kind) {
+    ValidateName(name);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto o = Begin(kind, Payload({name, source, provider}), request);
+    tx.Commit();
+    return o;
+}
+Operation Control::CompleteImport(const Operation &operation, const Root &root, const std::string &source_database,
+                                  int64_t source_snapshot, const std::string &provider) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query q(store->db, (std::string(OP_COLUMNS) + " WHERE id=?").c_str());
+    q.Text(1, operation.id);
+    if (!q.Step())
+        throw std::runtime_error("Import intent missing");
+    auto o = ReadOperation(q);
+    if (o.state == "complete") {
+        tx.Commit();
+        return o;
+    }
+    if (o.kind != "recover_export" && o.kind != "import_native")
+        throw std::runtime_error("Operation kind mismatch");
+    auto colon = o.payload.find(':');
+    auto length = std::stoull(o.payload.substr(0, colon));
+    auto name = o.payload.substr(colon + 1, length);
+    o.database = UUID();
+    Query(store->db, "INSERT INTO databases(id,name,created_at) VALUES(?,?,?)")
+        .Text(1, o.database)
+        .Text(2, name)
+        .Int(3, Timestamp())
+        .Run();
+    AssignProvider(o.database, provider);
+    auto b = NewBranch(o.database, "main", root.id, 0, source_database, source_snapshot);
+    o.branch = b.id;
+    o.snapshot =
+        Publish(b, root, {"", "", o.kind == "import_native" ? "imported native file" : "recovered from export", ""},
+                Timestamp())
+            .id;
+    Query(store->db, "UPDATE files SET name=NULL WHERE name=?").Text(1, "imports/" + o.id).Run();
+    Complete(o);
+    tx.Commit();
+    return o;
+}
+bool Control::RemoteVerified(const std::string &provider, const std::string &key, const std::string &hash,
+                             uint64_t size) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT hash,size FROM verified_remote_objects WHERE provider_id=? AND key=?");
+    q.Text(1, provider).Text(2, key);
+    return q.Step() && q.Text(0) == hash && uint64_t(q.Int(1)) == size;
+}
+void Control::RecordRemoteVerified(const std::string &provider, const std::string &key, const std::string &hash,
+                                   uint64_t size) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query(store->db, "INSERT INTO verified_remote_objects VALUES(?,?,?,?) ON CONFLICT(provider_id,key) DO "
+                     "UPDATE SET hash=excluded.hash,size=excluded.size")
+        .Text(1, provider)
+        .Text(2, key)
+        .Text(3, hash)
+        .Int(4, int64_t(size))
+        .Run();
+    tx.Commit();
+}
+std::map<std::string, RemoteChunk> Control::FindRemoteChunks(const std::string &provider,
+                                                             const std::vector<std::string> &hashes) {
+    std::map<std::string, RemoteChunk> result;
+    store->WithReader([&](Reader &reader) {
+        for (auto &hash : hashes) {
+            if (result.count(hash))
+                continue;
+            Query q(reader.db,
+                    reader.Statement("SELECT pack,pool,slot FROM remote_chunks WHERE provider_id=? AND hash=?"));
+            q.Text(1, provider).Text(2, hash);
+            if (q.Step())
+                result.emplace(hash, RemoteChunk{q.Text(0), q.Text(1), uint64_t(q.Int(2))});
+        }
+    });
+    return result;
+}
+void Control::RecordPack(const std::string &provider, const std::string &pool, const std::string &pack,
+                         uint64_t size, const std::vector<std::string> &chunks) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query(store->db, "INSERT OR IGNORE INTO remote_packs VALUES(?,?,?,?)")
+        .Text(1, provider)
+        .Text(2, pool)
+        .Text(3, pack)
+        .Int(4, int64_t(size))
+        .Run();
+    for (size_t slot = 0; slot < chunks.size(); ++slot)
+        Query(store->db, "INSERT OR IGNORE INTO remote_chunks VALUES(?,?,?,?,?)")
+            .Text(1, provider)
+            .Text(2, chunks[slot])
+            .Text(3, pool)
+            .Text(4, pack)
+            .Int(5, int64_t(slot))
+            .Run();
+    tx.Commit();
+}
+bool Control::AbandonExport(const std::string &database, int64_t snapshot) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    // Releases the pending retention root (gc_export_release); the snapshot itself stays local.
+    Query(store->db, "UPDATE export_roots SET state='abandoned' WHERE state='pending' AND export_id=(SELECT id FROM "
+                     "exports WHERE database_id=? AND snapshot_id=?)")
+        .Text(1, DatabaseID(database))
+        .Int(2, snapshot)
+        .Run();
+    return sqlite3_changes(store->db) > 0;
+}
+void Control::AdvanceSnapshotNumbers(const std::string &database, int64_t taken) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query(store->db, "UPDATE databases SET last_snapshot=max(last_snapshot,?) WHERE id=?")
+        .Int(1, taken)
+        .Text(2, DatabaseID(database))
+        .Run();
+}
+std::string Control::BranchName(const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT name FROM branches WHERE id=?");
+    q.Text(1, branch);
+    return q.Step() ? q.Text(0) : "";
+}
+int64_t Control::ParentSnapshot(const std::string &database, int64_t snapshot) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    // The first time the snapshot entered its publishing branch's history; the entry before it.
+    Query q(store->db, "SELECT p.snapshot_id FROM snapshots s JOIN history h ON h.branch_id=s.branch_id AND "
+                       "h.database_id=s.database_id AND h.snapshot_id=s.id JOIN history p ON p.branch_id=h.branch_id "
+                       "AND p.sequence<h.sequence WHERE s.database_id=? AND s.id=? ORDER BY h.sequence ASC, "
+                       "p.sequence DESC LIMIT 1");
+    q.Text(1, DatabaseID(database)).Int(2, snapshot);
+    return q.Step() ? q.Int(0) : 0;
+}
+void Control::ExportComplete(const std::string &id, const std::string &descriptor) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query q(store->db, "SELECT descriptor FROM exports WHERE id=?");
+    q.Text(1, id);
+    if (!q.Step())
+        throw std::runtime_error("Export intent missing");
+    if (!q.Text(0).empty() && q.Text(0) != descriptor)
+        throw std::runtime_error("[differential:corrupt_data] Immutable export identity conflict");
+    Query(store->db, "UPDATE exports SET descriptor=? WHERE id=?").Text(1, descriptor).Text(2, id).Run();
+    Query(store->db, "UPDATE export_roots SET state='complete' WHERE export_id=?").Text(1, id).Run();
+    tx.Commit();
+}
+} // namespace differential

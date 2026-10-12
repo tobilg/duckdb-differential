@@ -1,0 +1,132 @@
+# name: test/sql/lifecycle.test
+# description: branches, clones, restore, branch deletion and snapshot expiry
+# group: [differential]
+
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/differential_lifecycle'
+
+statement ok
+ATTACH 'differential:sales' AS sales
+
+statement ok
+CREATE TABLE sales.orders (id INTEGER PRIMARY KEY, amount DECIMAL(10, 2))
+
+statement ok
+INSERT INTO sales.orders VALUES (1, 10.00), (2, 20.00)
+
+statement ok
+CALL differential_create_snapshot('sales', name => 'v1')
+
+statement ok
+INSERT INTO sales.orders VALUES (3, 30.00)
+
+statement ok
+CALL differential_create_snapshot('sales')
+
+# Branch from main's latest snapshot; writes stay isolated
+query I
+SELECT snapshot_id FROM differential_create_branch('sales', 'dev')
+----
+2
+
+statement ok
+ATTACH 'differential:sales' AS dev (BRANCH 'dev')
+
+statement ok
+DELETE FROM dev.orders WHERE id = 1
+
+statement ok
+CALL differential_create_snapshot('dev')
+
+query II
+SELECT (SELECT count(*) FROM sales.orders), (SELECT count(*) FROM dev.orders)
+----
+3	2
+
+query II
+SELECT branch_name, head_snapshot_id FROM sales.branches() ORDER BY branch_name
+----
+dev	3
+main	2
+
+# A clone is an independent database
+statement ok
+CALL differential_clone_database('sales', 'sales_copy', snapshot => 1)
+
+statement ok
+ATTACH 'differential:sales_copy' AS sales_copy
+
+query I
+SELECT count(*) FROM sales_copy.orders
+----
+2
+
+statement ok
+DETACH sales_copy
+
+# Restore and branch deletion require the branch to be detached
+statement error
+CALL differential_restore('sales', 1)
+----
+active_attachment_or_transaction
+
+statement ok
+DETACH sales
+
+query II
+SELECT preservation_snapshot_id, snapshot_id FROM differential_restore('sales', 1)
+----
+2	4
+
+statement ok
+ATTACH 'differential:sales' AS sales
+
+query I
+SELECT count(*) FROM sales.orders
+----
+2
+
+statement ok
+DETACH dev
+
+query I
+SELECT preservation_snapshot_id FROM differential_drop_branch('sales', 'dev')
+----
+3
+
+statement error
+CALL differential_drop_branch('sales_copy', 'main')
+----
+last
+
+# Expiry: dry run first, then retire; retired snapshots cannot be attached
+query II
+SELECT snapshot_id, dry_run FROM differential_expire_snapshots('sales', versions => [2, 3], dry_run => true) ORDER BY 1
+----
+2	true
+3	true
+
+query I
+SELECT snapshot_id FROM differential_expire_snapshots('sales', versions => [2, 3]) ORDER BY 1
+----
+2
+3
+
+query I
+SELECT snapshot_id FROM differential_snapshots('sales') WHERE retired ORDER BY 1
+----
+2
+3
+
+statement error
+ATTACH 'differential:sales' AS gone (SNAPSHOT_VERSION 2)
+----
+retired
+
+# Snapshot names stay reserved after expiry
+statement error
+CALL differential_create_snapshot('sales', name => 'v1')
+----
+name_conflict

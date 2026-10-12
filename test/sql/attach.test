@@ -1,0 +1,152 @@
+# name: test/sql/attach.test
+# description: ATTACH 'differential:<db>' creates databases and selects branches and snapshots
+# group: [differential]
+
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/differential_attach'
+
+statement error
+ATTACH 'differential:absent' AS a (CREATE_IF_NOT_EXISTS false)
+----
+not_found
+
+statement ok
+ATTACH 'differential:sales' AS sales
+
+statement ok
+CREATE TABLE sales.t AS SELECT 1 AS v
+
+query II
+SELECT database_name, writers FROM differential_databases()
+----
+sales	single
+
+# Several writers per database (WRITERS 'shared') need an S3 data path; the mode is fixed at creation
+statement error
+ATTACH 'differential:team' AS team (WRITERS 'many')
+----
+WRITERS must be 'single' or 'shared'
+
+statement error
+ATTACH 'differential:team' AS team (WRITERS 'shared')
+----
+needs an S3 DATA_PATH
+
+statement error
+ATTACH 'differential:team' AS team (WRITERS 'shared', DATA_PATH '__TEST_DIR__/differential_attach_pool')
+----
+needs an S3 DATA_PATH
+
+statement error
+ATTACH 'differential:sales' AS again (WRITERS 'shared')
+----
+uses WRITERS 'single'
+
+statement error
+ATTACH 'differential:team' AS team (ON_CONFLICT 'merge')
+----
+ON_CONFLICT must be 'fail' or 'branch'
+
+statement error
+ATTACH 'differential:other' AS other (ON_CONFLICT 'branch')
+----
+apply to writable attachments of shared databases
+
+statement error
+ATTACH 'differential:other' AS other (PUBLISH_ON_DETACH true)
+----
+apply to writable attachments of shared databases
+
+statement error
+ATTACH 'differential:other' AS other (ON_BUSY 'wait')
+----
+ON_BUSY must be 'warn', 'error' or 'ignore'
+
+statement error
+ATTACH 'differential:other' AS other (ON_BUSY 'error')
+----
+apply to writable attachments of shared databases
+
+query I
+SELECT count(*) FROM differential_writers('sales')
+----
+0
+
+statement error
+SELECT * FROM differential_resolve_conflict('sales', keep => 'remote')
+----
+is not shared
+
+statement error
+SELECT * FROM differential_resolve_conflict('sales', keep => 'both')
+----
+keep must be 'branch' or 'remote'
+
+query III
+SELECT remote_state, remote_snapshot_id, kept_branch FROM differential_branches('sales')
+----
+NULL	NULL	NULL
+
+statement ok
+CALL differential_create_snapshot('sales', name => 'v1', author => 'ada', message => 'first load', extra_info => '{"rows": 1}')
+
+statement ok
+UPDATE sales.t SET v = 2
+
+query I
+SELECT snapshot_id FROM differential_create_snapshot('sales')
+----
+2
+
+statement ok
+UPDATE sales.t SET v = 3
+
+query IIII
+SELECT snapshot_id, snapshot_name, author, commit_message FROM differential_snapshots('sales') ORDER BY snapshot_id
+----
+1	v1	ada	first load
+2	NULL	NULL	NULL
+
+statement ok
+ATTACH 'differential:sales' AS s1 (SNAPSHOT_VERSION 1)
+
+statement ok
+ATTACH 'differential:sales' AS sn (SNAPSHOT_NAME 'v1')
+
+statement ok
+ATTACH 'differential:sales' AS st (SNAPSHOT_TIME '2100-01-01')
+
+statement ok
+ATTACH 'differential:sales' AS latest (READ_ONLY)
+
+query IIIII
+SELECT (SELECT v FROM sales.t), (SELECT v FROM s1.t), (SELECT v FROM sn.t), (SELECT v FROM st.t), (SELECT v FROM latest.t)
+----
+3	1	1	2	2
+
+statement error
+INSERT INTO s1.t VALUES (9)
+----
+read-only
+
+statement error
+ATTACH 'differential:sales' AS bad (SNAPSHOT_VERSION 1, SNAPSHOT_NAME 'v1')
+----
+Use only one of
+
+statement error
+ATTACH 'differential:sales' AS bad (BRANCH 'missing')
+----
+not_found
+
+statement error
+ATTACH 'differential:sales' AS bad (NO_SUCH_OPTION 1)
+----
+no_such_option
+
+statement error
+ATTACH 'differential:a/b' AS bad
+----
+Invalid differential URI

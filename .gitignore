@@ -66,3 +66,19 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+plans/
+adrs/
+
+# Raw benchmark results (machine-specific; docs/benchmarks.md is the published report)
+benchmarks/*-results*.json
+
+# Project-authored build entry point and Python test artifacts
+!/Makefile
+__pycache__/
+*.pyc
+
+# DuckDB extension template
+duckdb_unittest_tempdir/
+testext
+.idea
