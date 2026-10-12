@@ -75,7 +75,7 @@ Product decisions in force (repository owner):
 | S3 | 8 MiB packs, paged indexes, parallel verified uploads without per-object HEAD; parallel coalesced remote reads with in-flight dedupe and read-ahead; descriptors record the writer's DuckDB version, any version accepted | `s3_product.py`, `s3_publication_faults.py`, `s3_resources.py`, `s3_tiering.py` (`duckdb-v9.9.9` export attaches and recovers), MinIO benchmark |
 | Tiering | Completed exports stop pinning local payload; `differential_evict_snapshots`; S3 read-through; rehydration for branch/clone/restore; deferred export | `s3_tiering.py` |
 | Capture | Generations sealed at the sync after a native header write; snapshots seal after a native checkpoint; optional snapshot on every checkpoint | `snapshot_concurrency.py`, `checkpoint_boundaries.py`, `sql_surface.py` |
-| SQL surface | `ATTACH 'differential:<db>'` options, `SET differential_*`, database-first functions with named options, commit metadata, bulk expiry/eviction | `test/sql/*.test`, `sql_surface.py`, `lifecycle.py` |
+| SQL surface | `ATTACH 'differential:<db>'` options, `SET differential_*`, database-first functions with named options, commit metadata, bulk expiry/eviction; every function described in `duckdb_functions()` (description, example, categories, parameter names per overload) | `test/sql/*.test`, `sql_surface.py`, `lifecycle.py` |
 | Catalog | `DifferentialCatalog`: `<catalog>.snapshots()/current_snapshot()/branches()` in memory; `AT (VERSION/TIMESTAMP)` through hidden read-only attachments (LRU 8, released on DETACH, prepared statements rebind) | `time_travel.py`, `test/sql/time_travel.test` |
 | Build and CI | Template layout, `make release`/`make test` (community CI), `make integration` (hooks, extension-free host), `MainDistributionPipeline.yml`, `Integration.yml` | local builds; workflows not yet run |
 | Sharing | `differential_repository_shared` creates a group-writable repository (setgid `02770` / `0660`), recorded at creation and applied to journal, locks, pins, staging and pools; private (`0700`/`0600`) by default | `shared_repository.py` (umask 000/077, joining, refusals); second OS account untested |
@@ -93,7 +93,7 @@ Verification run on the current code (macOS arm64, 2026-10-12; all passed):
 make vcpkg
 export CCACHE_DISABLE=1 VCPKG_TOOLCHAIN_PATH=$PWD/build/vcpkg/scripts/buildsystems/vcpkg.cmake \
   VCPKG_TARGET_TRIPLET=arm64-osx-release VCPKG_HOST_TRIPLET=arm64-osx-release GEN=ninja
-make release && make test                   # All tests passed (181 assertions in 6 test cases)
+make release && make test                   # All tests passed (184 assertions in 6 test cases)
 make integration && make test_integration   # 6/6 CTest; 27 suites, 122 PASS lines
 make test_minio                             # 102 PASS lines: SDK faults, product, publication faults,
                                             # resources, tiering, branch heads, S3 layout, shared

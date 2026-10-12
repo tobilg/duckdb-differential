@@ -15,6 +15,29 @@ SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'differ
 ----
 v0.1.0
 
+# Every function is discoverable through duckdb_functions(): a description, an example, categories
+# and real parameter names (never col0), one per parameter type
+query I
+SELECT count(DISTINCT function_name) FROM duckdb_functions()
+WHERE function_name LIKE 'differential\_%' ESCAPE '\' AND function_name <> 'differential_probe_checkpoint'
+----
+26
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name LIKE 'differential\_%' ESCAPE '\' AND function_name <> 'differential_probe_checkpoint'
+  AND (description IS NULL OR len(examples) = 0 OR len(categories) = 0
+       OR len(list_filter(parameters, p -> p LIKE 'col%')) > 0 OR len(parameters) <> len(parameter_types))
+----
+0
+
+# Named parameters are listed in hash order: compare name/type pairs, sorted
+query I
+SELECT list_sort(list_transform(range(len(parameters)), i -> parameters[i + 1] || ' ' || parameter_types[i + 1]))
+FROM duckdb_functions() WHERE function_name = 'differential_restore'
+----
+[branch VARCHAR, database VARCHAR, export_mode VARCHAR, request_id VARCHAR, snapshot_id BIGINT]
+
 # Release builds never contain fault-injection hooks
 query I
 SELECT status FROM differential_status() WHERE capability = 'test_hooks'

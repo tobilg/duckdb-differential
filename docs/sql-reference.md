@@ -246,6 +246,9 @@ SELECT count(*) AS heads FROM differential_remote_heads('s3://my-bucket/lake/', 
   Bulk functions derive per-item IDs (`<request_id>/<snapshot id>`).
 - **Autocommit.** Mutations run only in autocommit mode. Binding, `PREPARE` and `EXPLAIN` change
   nothing.
+- **Discoverable from SQL.** `duckdb_functions()` lists every function with a description, an
+  example, categories and its parameter names and types:
+  `SELECT function_name, description, parameters, parameter_types, examples FROM duckdb_functions() WHERE function_name LIKE 'differential%';`
 
 ### S3 option parameters
 

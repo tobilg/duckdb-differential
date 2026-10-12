@@ -20,6 +20,8 @@
 #include "secrets.hpp"
 #include "remote_cache.hpp"
 #include "differential_catalog.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include <openssl/evp.h>
@@ -403,7 +405,8 @@ differential::Operation ImportNative(ClientContext &context, differential::Contr
         query("ATTACH " + Quote(path) + " AS " + alias + " (READ_ONLY)");
         attached = true;
         no_wal();
-        handle = local->OpenFile(path, FileFlags::FILE_FLAGS_READ);
+        // Not FileFlags::FILE_FLAGS_READ: see differential_extension.cpp (duplicate definition on GNU ld).
+        handle = local->OpenFile(path, FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ));
         auto size = local->GetFileSize(*handle);
         auto modified = local->GetLastModifiedTime(*handle);
         if (size < 0 || uint64_t(size) > (uint64_t(1) << 40))
@@ -1010,6 +1013,173 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
     output.SetCardinality(n);
 }
 } // namespace
+
+// ---------------------------------------------------------------------------------------
+// Documentation in duckdb_functions(): a description, one runnable example, categories, and the
+// names of the positional arguments (named parameters keep their own names). Attached to the
+// registered catalog entries, so the parameter names follow each overload's own parameter order.
+namespace {
+struct FunctionDoc {
+    const char *name;
+    const char *description;
+    const char *example;
+    vector<string> positional;
+    vector<string> categories;
+};
+const vector<FunctionDoc> &FunctionDocs() {
+    static const vector<FunctionDoc> docs = {
+        {"differential_snapshots",
+         "Lists every snapshot of a differential database (for a shared database also other writers' snapshots, "
+         "read from S3) with commit metadata, publication and S3 export state.",
+         "SELECT snapshot_id, snapshot_name, export_state FROM differential_snapshots('sales');",
+         {"database"}, {"differential", "introspection"}},
+        {"differential_current_snapshot",
+         "Returns the snapshot an attachment reads, or the latest snapshot of the attached branch or database.",
+         "SELECT id FROM differential_current_snapshot('sales');", {"database"}, {"differential", "introspection"}},
+        {"differential_branches",
+         "Lists the branches of a differential database with their head snapshot and, for shared databases, their "
+         "state relative to the S3 branch head.",
+         "SELECT branch_name, head_snapshot_id, remote_state FROM differential_branches('sales');", {"database"},
+         {"differential", "introspection"}},
+        {"differential_databases", "Lists the databases of the differential repository with their data path and writer mode.",
+         "SELECT database_name, data_path, writers FROM differential_databases();", {}, {"differential", "introspection"}},
+        {"differential_operations",
+         "Lists the durable operation records of the repository, used to replay requests by request_id.",
+         "SELECT kind, state, snapshot_id FROM differential_operations();", {}, {"differential", "introspection"}},
+        {"differential_providers",
+         "Lists the repository's storage locations (metadata store, local pools, S3 locations) with their S3 "
+         "configuration and credential source, never credentials.",
+         "SELECT data_path, credential_source FROM differential_providers();", {}, {"differential", "introspection"}},
+        {"differential_retention_roots", "Lists why each stored database image is retained (snapshots, branches, pins, exports).",
+         "SELECT reason, identity FROM differential_retention_roots();", {}, {"differential", "introspection"}},
+        {"differential_storage_stats",
+         "Returns storage, S3, cache and timing counters of the repository and process as metric/value rows.",
+         "SELECT metric, value FROM differential_storage_stats() WHERE metric = 'local_payload_bytes';", {},
+         {"differential", "introspection"}},
+        {"differential_status", "Reports the extension's capabilities, durability profiles, limits and last background "
+                                "publication error as capability/status rows.",
+         "SELECT capability, status FROM differential_status();", {}, {"differential", "introspection"}},
+        {"differential_remote_heads",
+         "Lists the branch heads exported to an S3 location, each with the path to ATTACH its latest snapshot.",
+         "SELECT database_name, branch_name, head FROM differential_remote_heads('s3://my-bucket/lake/');",
+         {"location"}, {"differential", "s3", "introspection"}},
+        {"differential_writers",
+         "Lists the advisory 'being written' markers of a shared database in S3: which hosts are writing which "
+         "branches.",
+         "SELECT branch_name, host, live FROM differential_writers('team');", {"database"},
+         {"differential", "shared", "introspection"}},
+        {"differential_create_snapshot",
+         "Checkpoints an attached writable branch and publishes it as an immutable snapshot with optional commit "
+         "metadata; exports it to S3 and, for shared databases, moves the S3 branch head.",
+         "SELECT snapshot_id, export_state FROM differential_create_snapshot('sales', name => 'v1', message => 'first "
+         "load');",
+         {"database"}, {"differential", "lifecycle"}},
+        {"differential_create_branch", "Creates a writable branch from a snapshot, sharing all data with it.",
+         "SELECT branch_id FROM differential_create_branch('sales', 'dev', snapshot => 1);", {"database", "name"},
+         {"differential", "lifecycle"}},
+        {"differential_clone_database",
+         "Creates an independent database from a snapshot of another one, on the same data path and sharing its "
+         "data.",
+         "SELECT database_id FROM differential_clone_database('sales', 'sales_copy');", {"database", "name"},
+         {"differential", "lifecycle"}},
+        {"differential_restore",
+         "Resets a detached branch to a snapshot after preserving its current contents as a snapshot.",
+         "SELECT snapshot_id, preservation_snapshot_id FROM differential_restore('sales', 1, branch => 'dev');",
+         {"database", "snapshot_id"}, {"differential", "lifecycle"}},
+        {"differential_drop_branch",
+         "Preserves a detached branch's contents as a snapshot and drops the branch (in a shared database, for "
+         "every writer).",
+         "SELECT preservation_snapshot_id FROM differential_drop_branch('sales', 'dev');", {"database", "branch"},
+         {"differential", "lifecycle"}},
+        {"differential_expire_snapshots",
+         "Retires snapshots selected by version list and/or age so their local data can be collected; S3 exports "
+         "remain.",
+         "SELECT snapshot_id FROM differential_expire_snapshots('sales', versions => [1], dry_run => true);",
+         {"database"}, {"differential", "lifecycle"}},
+        {"differential_evict_snapshots",
+         "Drops the local copy of snapshots whose S3 export completed; they are then read through S3.",
+         "SELECT snapshot_id FROM differential_evict_snapshots('sales', versions => [1], dry_run => true);",
+         {"database"}, {"differential", "s3"}},
+        {"differential_retry_export",
+         "Finishes pending S3 exports of a database (all, or one snapshot) and republishes its branch heads.",
+         "SELECT snapshot_id, export_state FROM differential_retry_export('sales');", {"database", "snapshot_id"},
+         {"differential", "s3"}},
+        {"differential_claim_branch_heads",
+         "Takes a single-writer database's S3 branch heads over after a copy of the repository wrote them.",
+         "SELECT branch_name, snapshot_id FROM differential_claim_branch_heads('sales');", {"database"},
+         {"differential", "s3"}},
+        {"differential_resolve_conflict",
+         "Reconciles a diverged branch of a shared database with its S3 head, keeping local work as a new branch "
+         "or as a local snapshot.",
+         "SELECT kept_snapshot_id, kept_branch FROM differential_resolve_conflict('team', keep => 'branch');",
+         {"database"}, {"differential", "shared"}},
+        {"differential_import_database",
+         "Copies an offline native DuckDB file into a new differential database and publishes it as snapshot 1.",
+         "SELECT database_id FROM differential_import_database('/data/native.duckdb', 'imported');",
+         {"source_path", "name"}, {"differential", "import"}},
+        {"differential_recover_export",
+         "Copies an exported snapshot from S3 into a new writable differential database, verifying every chunk.",
+         "SELECT database_id FROM differential_recover_export('s3://my-bucket/lake/descriptors/<sha256>', "
+         "'restored');",
+         {"location", "name"}, {"differential", "s3", "import"}},
+        {"differential_cleanup_old_files",
+         "Collects local data that no snapshot, branch, pin or pending export references any more.",
+         "SELECT deleted_objects FROM differential_cleanup_old_files(cleanup_all => true);", {},
+         {"differential", "maintenance"}},
+        {"differential_delete_orphaned_files",
+         "Removes files in local pools that no mapping references, left behind by crashes.",
+         "SELECT orphaned_files FROM differential_delete_orphaned_files(dry_run => true);", {},
+         {"differential", "maintenance"}},
+        {"differential_compact", "Returns free pages of the repository's metadata store to the file system.",
+         "SELECT pages_reclaimed FROM differential_compact(max_pages => 1000);", {}, {"differential", "maintenance"}},
+    };
+    return docs;
+}
+// Descriptions of the catalog-scoped functions (<catalog>.snapshots() and friends).
+FunctionDescription ScopedDescription(const string &name) {
+    FunctionDescription description;
+    description.categories = {"differential", "introspection"};
+    if (name == "snapshots") {
+        description.description = "Lists every snapshot of this differential attachment's database.";
+        description.examples = {"SELECT snapshot_id, snapshot_name FROM sales.snapshots();"};
+    } else if (name == "current_snapshot") {
+        description.description = "Returns the snapshot this attachment reads, or its branch's latest snapshot.";
+        description.examples = {"SELECT id FROM sales.current_snapshot();"};
+    } else {
+        description.description = "Lists the branches of this differential attachment's database.";
+        description.examples = {"SELECT branch_name, head_snapshot_id FROM sales.branches();"};
+    }
+    return description;
+}
+} // namespace
+void DescribeFunctions(DatabaseInstance &db) {
+    auto &catalog = Catalog::GetSystemCatalog(db);
+    auto transaction = CatalogTransaction::GetSystemTransaction(db);
+    auto &schema = catalog.GetSchema(transaction, DEFAULT_SCHEMA);
+    for (auto &doc : FunctionDocs()) {
+        auto found = schema.GetEntry(transaction, CatalogType::TABLE_FUNCTION_ENTRY, doc.name);
+        if (!found)
+            continue; // not registered in this build
+        auto &entry = found->Cast<TableFunctionCatalogEntry>();
+        entry.descriptions.clear();
+        // One description per overload, matched by its positional types; names in the order
+        // duckdb_functions() lists the parameters: positional, then named.
+        for (idx_t i = 0; i < entry.functions.Size(); i++) {
+            auto function = entry.functions.GetFunctionByOffset(i);
+            FunctionDescription description;
+            description.parameter_types = function.arguments;
+            for (idx_t argument = 0; argument < function.arguments.size(); argument++)
+                description.parameter_names.push_back(argument < doc.positional.size() ? doc.positional[argument]
+                                                                                       : "col" + to_string(argument));
+            for (auto &parameter : function.named_parameters)
+                description.parameter_names.push_back(parameter.first);
+            description.description = doc.description;
+            description.examples = {doc.example};
+            description.categories = doc.categories;
+            entry.descriptions.push_back(std::move(description));
+        }
+    }
+}
 const vector<string> &ScopedFunctionNames() {
     static const vector<string> names = {"snapshots", "current_snapshot", "branches"};
     return names;
@@ -1030,6 +1200,7 @@ unique_ptr<CatalogEntry> CreateScopedFunction(std::shared_ptr<differential::Repo
     info->catalog = &catalog;
     function.function_info = std::move(info);
     CreateTableFunctionInfo create(function);
+    create.descriptions.push_back(ScopedDescription(name));
     create.internal = true;
     auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, schema, create);
     entry->internal = true;

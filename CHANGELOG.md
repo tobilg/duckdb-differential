@@ -11,6 +11,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Versioned native DuckDB databases over a durable, content-addressed differential store:
   snapshots with commit metadata, branches, clones, restore, branch deletion and snapshot expiry.
+- Every function is discoverable from SQL: `duckdb_functions()` returns its description, an
+  example, categories and real parameter names (also for `<catalog>.snapshots()`,
+  `current_snapshot()` and `branches()`).
 - DuckLake-aligned SQL: `ATTACH 'differential:<db>'` options (`BRANCH`, `SNAPSHOT_VERSION`,
   `SNAPSHOT_TIME`, `SNAPSHOT_NAME`, `READ_ONLY`, `CREATE_IF_NOT_EXISTS`, `DATA_PATH`),
   `AT (VERSION|TIMESTAMP)` time travel, `<catalog>.snapshots()`, `current_snapshot()` and

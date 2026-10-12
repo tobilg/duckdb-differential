@@ -30,6 +30,7 @@
 namespace duckdb {
 void RegisterProbeFileSystem(ExtensionLoader &loader);
 void RegisterControlFunctions(ExtensionLoader &, std::shared_ptr<differential::Repository>);
+void DescribeFunctions(DatabaseInstance &);
 std::shared_ptr<differential::Repository> RegisterDurableFileSystem(ExtensionLoader &loader);
 void ProbeTrace(const char *op, const string &path) {
     auto trace = differential::Hook("DIFFERENTIAL_PROBE_TRACE");
@@ -426,10 +427,15 @@ void ExecuteProbe(ClientContext &context, TableFunctionInput &input, DataChunk &
         } else {
             auto root = differential::Hook("DIFFERENTIAL_PROBE_ROOT");
             auto local = FileSystem::CreateLocal();
-            auto source = local->OpenFile(string(root) + "/" + path.substr(7), FileFlags::FILE_FLAGS_READ);
+            // Flags from FileOpenFlags' integer constants: FileFlags' FileOpenFlags constants are
+            // defined in DuckDB's (C++11) library, and referencing them from this C++17 code makes GNU
+            // ld report a second definition.
+            auto source = local->OpenFile(string(root) + "/" + path.substr(7),
+                                          FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ));
             auto dest = local->OpenFile(string(root) + "/captured.snapshot",
-                                        FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE |
-                                            FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE);
+                                        FileOpenFlags(FileOpenFlags::FILE_FLAGS_WRITE |
+                                                      FileOpenFlags::FILE_FLAGS_FILE_CREATE |
+                                                      FileOpenFlags::FILE_FLAGS_EXCLUSIVE_CREATE));
             char buffer[65536];
             int64_t n;
             while ((n = source->Read(buffer, sizeof(buffer))) != 0)
@@ -567,6 +573,8 @@ static void LoadInternal(ExtensionLoader &loader) {
                                  duckdb::InitProbe);
     status.function_info = duckdb::make_shared_ptr<duckdb::StatusInfo>(store);
     loader.RegisterFunction(status);
+    // Descriptions, examples and parameter names for duckdb_functions().
+    duckdb::DescribeFunctions(loader.GetDatabaseInstance());
     if (differential::test_hooks) {
         duckdb::TableFunction probe("differential_probe_checkpoint", {duckdb::LogicalType::VARCHAR},
                                     duckdb::ExecuteProbe, duckdb::BindProbe, duckdb::InitProbe);

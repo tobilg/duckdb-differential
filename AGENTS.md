@@ -115,7 +115,9 @@ and function with an example, and must stay complete; its examples and those of
 - **Secrets.** `CREATE SECRET (TYPE differential, DATA_PATH …, <S3 options>)`; `TYPE s3` secrets
   (httpfs) are read for credentials and connection settings.
 - **Functions.** `differential_*` table functions take the database or alias first, plus named
-  options. Mutations accept `request_id`.
+  options. Mutations accept `request_id`. Every function needs an entry in `FunctionDocs()`
+  (`control_functions.cpp`): description, example, positional parameter names and categories for
+  `duckdb_functions()`; `test/sql/differential.test` fails otherwise.
 - **Per-catalog.** `<catalog>.snapshots()/current_snapshot()/branches()` and
   `FROM t AT (VERSION|TIMESTAMP => …)`.
 - **Internal paths.** `diff://db/<uuid>/…` stays internal and is attachable with
