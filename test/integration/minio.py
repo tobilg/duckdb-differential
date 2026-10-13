@@ -15,7 +15,9 @@ import sys as _sys
 _sys.path.insert(0,str(ROOT/'test/integration'))
 from paths import DUCKDB_CLI, EXTENSION, DUCKDB_LIBRARY, BUILD_DIR, TEST_BINARIES
 
-IMAGE='minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e'
+# Upstream RELEASE.2025-10-15T17-29-55Z, built by https://github.com/coollabsio/minio.
+# Pin the multi-platform index (linux/amd64 + linux/arm64); keep Integration.yml in sync.
+IMAGE='ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9'
 
 def docker(*args):
     return subprocess.run(['docker',*args],check=True,text=True,capture_output=True).stdout.strip()

@@ -7,10 +7,11 @@
 | Dependencies | vcpkg `cd61e1e26a03`: AWS SDK for C++ 1.11.820 (`s3`), SQLite 3.53.2, OpenSSL 3.6.3, statically linked; the artifact exports only `differential_duckdb_cpp_init` |
 | macOS arm64 | macOS 26.7, Apple clang 21, CMake 4.1.2, Ninja. `make release`, `make test` (SQL logic tests), `make integration`, `make test_integration`, `make test_minio`: all pass |
 | macOS amd64 | Built by CI only (`osx_amd64`); not run locally |
-| Linux amd64 / arm64 | NOT YET BUILT. All non-AWS sources pass a syntax-only g++ 13 compile (Ubuntu 24.04) against DuckDB 1.5.6 headers; the first full build and test runs are the CI workflows |
+| Linux amd64 | Integration build, 6 C++ tests and 27 local integration suites passed in [CI run 38291321428](https://github.com/tobilg/duckdb-differential/actions/runs/38291321428/job/114951862323) (Ubuntu 24.04); MinIO image pull failed before S3 tests, which remain unverified on Linux |
+| Linux arm64 | Not yet verified. All non-AWS sources pass a syntax-only g++ 13 compile (Ubuntu 24.04) against DuckDB 1.5.6 headers |
 | Windows, wasm | Not supported (POSIX file locking, `fsync`, `mmap`); excluded from all builds |
 | Official DuckDB extensions in the same process | `aws`, `httpfs` and `sqlite` (each bundling its own SDK/OpenSSL/SQLite) loaded before and after `differential`; S3 used through both SDK copies (`coexistence.py`, macOS arm64) |
-| MinIO | RELEASE.2025-09-07T16-13-09Z, image digest `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`; SDK transport, end-to-end export/read/recovery and branch-head tests pass |
+| MinIO | RELEASE.2025-10-15T17-29-55Z, upstream source built by [coollabsio/minio](https://github.com/coollabsio/minio), image `ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9` (linux/amd64 and linux/arm64). Anonymous manifest lookup, pull and full `make test_minio` pass (macOS arm64, 2026-10-13; 102 PASS lines); hosted CI with this image remains unrun |
 | DuckDB secrets | `TYPE s3` secrets from the official `httpfs` (config keys and `credential_chain`, with and without `REFRESH`, via the official `aws`) and `TYPE differential` secrets, temporary and persistent; MinIO only (`s3_secrets.py`) |
 | Shared repositories (several local users) | File and directory modes verified under umask `000`/`077` on macOS (`shared_repository.py`); access by a second OS account and Linux untested |
 | AWS S3 | Owner-run on us-east-1 (2026-10-11) from macOS arm64 over the internet with a named profile: exports, cold attach and full scans (`benchmarks/s3_throughput.py`, no SDK retries), branch-head attach and listing. Not run on AWS: the capability check (`existing_provider.py`), fault behaviour, `TYPE s3` secrets, caching |

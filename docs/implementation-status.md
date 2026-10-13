@@ -3,7 +3,7 @@
 **Full v1 acceptance is not complete.** The extension implements the local and S3
 snapshot profiles on DuckDB 1.5.6 (macOS arm64 verified). Real AWS has been exercised by the
 owner (exports, cold reads, branch heads), but the AWS capability, fault and secrets suites, Linux
-builds and release qualification remain open. `differential_status()` reports `v1_complete = false`.
+S3 tests, remaining platform builds and release qualification remain open. `differential_status()` reports `v1_complete = false`.
 A PASS below means the listed executable evidence passed on this platform; it does
 not certify every failure schedule, filesystem or provider.
 
@@ -11,8 +11,8 @@ At a glance:
 
 | | State |
 | --- | --- |
-| Built and tested | macOS arm64: SQL logic tests, C++ unit tests, crash/fault/race suites, MinIO S3 suites |
-| Built by CI, not yet run | Linux amd64/arm64, macOS amd64 (all sources pass a GCC 13 syntax check) |
+| Built and tested | macOS arm64: SQL logic tests, C++ unit tests, crash/fault/race suites, MinIO S3 suites. Linux amd64: integration build, 6 C++ tests and 27 local integration suites passed in CI; MinIO pull failed before S3 tests |
+| Remaining platform qualification | Linux arm64, macOS amd64 (all sources pass a GCC 13 syntax check) |
 | Not supported | Windows, wasm |
 | Real AWS | Exercised by the owner: exports, cold reads, branch heads, throughput (us-east-1, eu-central-1). The SDK capability and fault suites have not run on AWS |
 | Untested | Power loss, a second OS user on a shared repository, a second physical host |
@@ -38,7 +38,8 @@ current defaults.
   AC-23–30, 36–37. AC-24 real AWS: product paths exercised by the owner; the capability suite is unrun.
 - [ ] Phase 5 — Community-extension build (C++ extension template, vcpkg pins, CI workflows),
   fault suites, diagnostics, examples and benchmarks implemented. AC-01, 32–34 and all release
-  gates. Hosted CI runs, Linux, the AWS capability suite and broader host/volume qualification are unrun.
+  gates. Linux amd64 local integration passed in CI; Linux S3 tests, remaining platform
+  qualification, the AWS capability suite and broader host/volume qualification remain open.
 
 This page describes the current state.
 
@@ -77,7 +78,7 @@ Product decisions in force (repository owner):
 | Capture | Generations sealed at the sync after a native header write; snapshots seal after a native checkpoint; optional snapshot on every checkpoint | `snapshot_concurrency.py`, `checkpoint_boundaries.py`, `sql_surface.py` |
 | SQL surface | `ATTACH 'differential:<db>'` options, `SET differential_*`, database-first functions with named options, commit metadata, bulk expiry/eviction; every function described in `duckdb_functions()` (description, example, categories, parameter names per overload) | `test/sql/*.test`, `sql_surface.py`, `lifecycle.py` |
 | Catalog | `DifferentialCatalog`: `<catalog>.snapshots()/current_snapshot()/branches()` in memory; `AT (VERSION/TIMESTAMP)` through hidden read-only attachments (LRU 8, released on DETACH, prepared statements rebind) | `time_travel.py`, `test/sql/time_travel.test` |
-| Build and CI | Template layout, `make release`/`make test` (community CI), `make integration` (hooks, extension-free host), `MainDistributionPipeline.yml`, `Integration.yml` | local builds; workflows not yet run |
+| Build and CI | Template layout, `make release`/`make test` (community CI), `make integration` (hooks, extension-free host), `MainDistributionPipeline.yml`, `Integration.yml` | local builds; Linux amd64 integration build, 6 C++ tests and 27 local suites passed in run `38291321428`; MinIO image pull failed before S3 tests |
 | Sharing | `differential_repository_shared` creates a group-writable repository (setgid `02770` / `0660`), recorded at creation and applied to journal, locks, pins, staging and pools; private (`0700`/`0600`) by default | `shared_repository.py` (umask 000/077, joining, refusals); second OS account untested |
 | S3 layout | Per database `dbs/<uuid>/`: branch heads, commit records (`snapshots/<9999999999 - n>`, newest first, parent links), data pool (`packs/`, `indexes/`); `names/<name>/<uuid>`; index pages reference packs in any database's pool. A commit-record collision (split brain) is `head_conflict`; claiming abandons such exports and renumbers | `s3_layout.py` (keys, newest-first order, record contents, clone export reusing its source's packs and reading across pools), `s3_heads.py` (copied repository incl. abandoned export and renumbering) |
 | Branch heads | `dbs/<uuid>/branches/<branch>` per active branch, republished after exports, branch creation, expiry and `retry_export`; `ATTACH 'differential:s3://…/heads/…'`; `differential_remote_heads` | `s3_heads.py` (MinIO): publication, branches, deferred/out-of-order exports, restore, expiry, same-named databases, listing, errors; guarded by S3 conditional writes (`head_conflict` for heads this repository did not write last; `differential_claim_branch_heads`): copied-repository scenario in `s3_heads.py`, lost head response with an SDK retry in `s3_publication_faults.py` (fails without the fix) |
@@ -100,6 +101,31 @@ make test_minio                             # 102 PASS lines: SDK faults, produc
                                             # databases and their faults, documentation examples,
                                             # secrets, caching, coexistence, example, capability
 ```
+
+MinIO registry replacement (2026-10-13):
+
+- `gh run view 38291321428 --job 114951862323 --log-failed` confirmed the Linux amd64
+  integration build, 6/6 C++ tests and all 27 local integration suites passed on 2026-10-12.
+  The job then failed pulling `minio/minio` from Docker Hub with `pull access denied`,
+  before running any S3 suites.
+- `docker manifest inspect quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
+  and the equivalent `:RELEASE.2025-09-07T16-13-09Z` lookup both failed with `no such manifest`.
+- Switched CI and the disposable test runner to upstream RELEASE.2025-10-15T17-29-55Z,
+  [built from source by coollabsio/minio](https://github.com/coollabsio/minio), pinned to
+  `ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9`.
+  `docker pull` of that exact reference passed. `docker manifest inspect` of it with a
+  temporary empty `--config` directory passed anonymously and confirmed linux/amd64 and
+  linux/arm64 images. This is a different upstream release and image build, not a mirror
+  of the old digest.
+- `make test_minio` passed on macOS arm64 with the new image (102 PASS lines), including
+  protocol faults, SDK capabilities, publication/recovery, shared databases and their faults,
+  documentation examples, secrets, caching and coexistence. Python syntax and matching
+  image pins were checked; `git diff --check` passed. No C++ rebuild was needed.
+- Evidence: `build/evidence/minio-ci-failure-2026-10-13.log`,
+  `build/evidence/minio-ghcr-manifest-2026-10-13.json`,
+  `build/evidence/minio-ghcr-2026-10-13.log` and `build/evidence/minio-sdk-results.json`.
+  The replacement has not yet run in hosted CI; Linux S3 and real-AWS qualification
+  remain open. Registry availability is verified as of this check, not guaranteed indefinitely.
 
 Format identifiers were checked on the output: `engine.sqlite` has `user_version` 1 and
 `control_format` 1, descriptors start with `differential-export-v1`, and index pages with `DIX1`.
@@ -339,8 +365,9 @@ The remaining gates are not a local-only implementation milestone:
    ENOSPC, device power loss, torn sectors and recovery after actual host loss were not
    tested. The local profile relies on SQLite and durable local volumes honoring sync.
    This host accepts file and directory `F_FULLFSYNC`; unsupported sync fails closed.
-3. **Release qualification:** only macOS arm64 and pinned MinIO are verified. Linux
-   (amd64/arm64) and macOS amd64 builds, hosted CI runs (both workflows), an actual second
+3. **Release qualification:** macOS arm64 and pinned MinIO are verified; Linux amd64's
+   integration build, C++ tests and local integration suites passed in CI. Linux S3 tests,
+   Linux arm64 and macOS amd64 qualification, a successful complete hosted CI run, an actual second
    physical reader host and an independent security audit are unrun. Windows and wasm are
    unsupported. No release was published, the community descriptor was not submitted, and no
    billed cloud infrastructure was provisioned.

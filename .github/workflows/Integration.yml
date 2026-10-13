@@ -78,5 +78,5 @@ jobs:
       - name: S3 suites (MinIO)
         if: matrix.minio
         run: |
-          docker pull minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          docker pull ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9
           make test_minio

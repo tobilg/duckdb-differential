@@ -281,6 +281,7 @@ instead of `LOAD differential;`.
 ```sh
 make integration                 # build/integration: test hooks on, extension NOT linked into the CLI
 make test_integration            # C++ unit tests + crash/fault/race/lifecycle suites (Python)
+docker pull ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9
 make test_minio                  # S3 suites against a disposable pinned MinIO container (Docker)
 ```
 
