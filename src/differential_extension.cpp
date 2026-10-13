@@ -11,6 +11,8 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/planner_extension.hpp"
 #include <cstdlib>
 #include <optional>
 #include <cstdio>
@@ -97,6 +99,23 @@ struct DifferentialStorageInfo : StorageExtensionInfo {
     explicit DifferentialStorageInfo(std::shared_ptr<differential::Repository> repository)
         : repository(std::move(repository)) {}
 };
+// PhysicalAttach normally strips "differential:" before DatabaseManager checks for remote
+// paths. That exposes "s3://" to DuckDB's httpfs autoloader before our storage callback runs.
+// Keep the prefix and supply TYPE explicitly so only our AWS SDK reader handles this path.
+// This hook changes the plan only: repository access and S3 work remain in ATTACH execution.
+void PreserveS3AttachPrefix(PlannerExtensionInput &, BoundStatement &statement) {
+    if (!statement.plan || statement.plan->type != LogicalOperatorType::LOGICAL_ATTACH)
+        return;
+    auto &info = statement.plan->Cast<LogicalSimple>().info->Cast<AttachInfo>();
+    auto type = info.options.find("type");
+    bool prefixed = StringUtil::CIEquals(info.path.substr(0, 13), "differential:") &&
+                    differential::S3Location::Is(info.path.substr(13));
+    if (prefixed && (type == info.options.end() || type->second.ToString().empty()))
+        info.options["type"] = Value("differential");
+    else if (type != info.options.end() && StringUtil::CIEquals(type->second.ToString(), "differential") &&
+             differential::S3Location::Is(info.path))
+        info.path = "differential:" + info.path;
+}
 // ATTACH 'differential:<database>' [AS alias] (BRANCH, SNAPSHOT_VERSION | SNAPSHOT_TIME | SNAPSHOT_NAME,
 // READ_ONLY, CREATE_IF_NOT_EXISTS, DATA_PATH, S3 options), or 'differential:s3://…/descriptors/<sha256>'.
 // The callback runs while ATTACH executes, before DuckDB opens the file: it resolves (or creates)
@@ -105,6 +124,9 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
                                        AttachedDatabase &db, const string &, AttachInfo &info, AttachOptions &options) {
     differential::Timer timer(differential::Metric::AttachResolve);
     auto target = info.path;
+    if (StringUtil::CIEquals(target.substr(0, 13), "differential:") &&
+        differential::S3Location::Is(target.substr(13)))
+        target = target.substr(13);
     auto storage = storage_info ? &static_cast<DifferentialStorageInfo &>(*storage_info) : nullptr;
     auto repository = storage ? storage->repository : nullptr;
     auto catalog = [&](bool time_travel_snapshot = false) -> unique_ptr<Catalog> {
@@ -569,6 +591,9 @@ static void LoadInternal(ExtensionLoader &loader) {
                                   "Publish every completed native checkpoint of a writable branch as a public snapshot",
                                   duckdb::LogicalType::BOOLEAN, duckdb::Value::BOOLEAN(false));
     duckdb::StorageExtension::Register(config, "differential", duckdb::make_shared_ptr<duckdb::DifferentialStorage>(store));
+    duckdb::PlannerExtension planner;
+    planner.post_bind_function = duckdb::PreserveS3AttachPrefix;
+    duckdb::PlannerExtension::Register(config, std::move(planner));
     duckdb::TableFunction status("differential_status", {}, duckdb::ExecuteStatus, duckdb::BindStatus,
                                  duckdb::InitProbe);
     status.function_info = duckdb::make_shared_ptr<duckdb::StatusInfo>(store);

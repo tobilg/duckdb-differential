@@ -70,6 +70,9 @@ Testing/
 plans/
 adrs/
 
+# Private implementation notes
+/docs/implementation-status.md
+
 # Raw benchmark results (machine-specific; docs/benchmarks.md is the published report)
 benchmarks/*-results*.json
 

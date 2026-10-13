@@ -21,9 +21,7 @@ FROM sales.snapshots();
 
 **Status: experimental.** Full v1 acceptance is not complete. Only macOS arm64 and a MinIO S3
 endpoint are fully tested; real AWS was exercised manually (exports, reads, branch heads), and
-other platforms are untested. The
-[37-criterion checklist](docs/implementation-status.md) records what is implemented, tested
-and open.
+other platforms are untested.
 
 ## Documentation
 
@@ -39,7 +37,6 @@ and open.
 | [Storage formats](docs/storage-format.md) | Repository layout, metadata schema, hashes, journal, S3 layout and formats |
 | [Architecture](docs/architecture.md) | How the extension sits below DuckDB's native storage |
 | [Compatibility](docs/compatibility.md) · [Benchmarks](docs/benchmarks.md) · [Feasibility evidence](docs/feasibility.md) | Verified DuckDB build, dependencies and platforms; measurements; evidence that stock DuckDB supports the design |
-| [Implementation status](docs/implementation-status.md) | What is implemented, tested and open |
 | [Changelog](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) | |
 
 ## Contents

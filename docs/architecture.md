@@ -172,8 +172,7 @@ without a lock authority. Each keeps its own local metadata store and publishes 
   and a moved head is a `branch_conflict`;
 - a joining repository adopts a head's chunk map without its bytes; those objects are
   remote-only (`remote_objects`), and the byte store reads them from S3 on demand through a
-  fetch hook the S3 layer installs. See the status checklist for the tested failure matrix and the
-remaining provider/platform/release verification.
+  fetch hook the S3 layer installs.
 
 ## Additional local pools
 

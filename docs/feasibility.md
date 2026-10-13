@@ -60,7 +60,7 @@ independent live read-only attachments are rejected by `uri_status.py`.
 
 Subsequent phases implement snapshot publication, native historical reads, lifecycle,
 retention, cancellation and remote recovery. The full local and MinIO suites now
-exercise them; `docs/implementation-status.md` maps current evidence to the contract.
+exercise them.
 No stock-symbol blocker or need for a core patch has been found. Linux/Windows,
 real AWS, a separate physical reader host and physical power-loss tests remain unrun.
 

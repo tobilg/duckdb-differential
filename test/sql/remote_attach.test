@@ -1,0 +1,60 @@
+# name: test/sql/remote_attach.test
+# description: Differential S3 ATTACH reaches its own reader without installing or loading httpfs
+# group: [differential]
+
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/differential_remote_attach'
+
+# A cached httpfs masks the bug even when autoload_known_extensions is false.
+statement ok
+SET extension_directory = '__TEST_DIR__/differential_remote_attach_extensions'
+
+statement ok
+SET autoinstall_known_extensions = false
+
+statement ok
+SET autoload_known_extensions = false
+
+query I
+SELECT status FROM differential_status() WHERE capability = 'repository_open'
+----
+false
+
+# Invalid locators/options reach Differential's validation without network access.
+statement error
+ATTACH 'differential:s3://unused/descriptors/invalid' AS remote
+----
+Expected an export descriptor location
+
+statement error
+ATTACH 'DiFfErEnTiAl:s3://unused/descriptors/invalid' AS remote
+----
+Expected an export descriptor location
+
+statement error
+ATTACH 's3://unused/descriptors/invalid' AS remote (TYPE differential)
+----
+Expected an export descriptor location
+
+statement error
+ATTACH 'differential:s3://unused/descriptors/invalid' AS remote (TYPE differential)
+----
+Expected an export descriptor location
+
+statement error
+ATTACH 'differential:s3://unused/heads/sales' AS remote (BRANCH 'other')
+----
+An export attachment takes only S3 provider options
+
+# Ordinary S3 attaches retain DuckDB's extension requirement.
+statement error
+ATTACH 's3://unused/native.duckdb' AS native
+----
+requires the extension httpfs
+
+query I
+SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'httpfs'
+----
+false

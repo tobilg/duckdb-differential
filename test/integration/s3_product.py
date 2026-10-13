@@ -26,7 +26,8 @@ s3_params=f"endpoint:='{endpoint}',path_style:=true,allow_http:=true"
 attach="ATTACH 'differential:sales' AS d;"
 def run(sql,directory=writer,extra=None,expected=0):
     env=dict(os.environ,DIFFERENTIAL_STORE_ROOT=str(directory));env.update(extra or {})
-    r=subprocess.run([CLI,'-init','/dev/null','-unsigned','-batch','-bail','-csv'],input=f"LOAD '{EXT}';"+sql,text=True,capture_output=True,env=env,timeout=120)
+    setup=f"LOAD '{EXT}'; SET extension_directory='{base/'empty-extensions'}'; SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;"
+    r=subprocess.run([CLI,'-init','/dev/null','-unsigned','-batch','-bail','-csv'],input=setup+sql,text=True,capture_output=True,env=env,timeout=120)
     assert r.returncode==expected,(sql,r.returncode,r.stdout,r.stderr)
     return r.stdout
 def rows(sql,directory=writer):return list(csv.DictReader(io.StringIO(run(sql,directory))))
@@ -71,6 +72,11 @@ shutil.rmtree(writer)
 remote=f"ATTACH 'differential:{LOCATION}{locator}' AS old ({S3});"
 actual=rows(remote+"SELECT count(*) AS n,sum(id) AS total,count(*) FILTER(WHERE payload!=sha256(id::VARCHAR)) AS corrupt FROM old.t;",reader)
 assert actual==[{'n':'10000','total':'49995000','corrupt':'0'}],actual
+assert rows(remote+"SELECT loaded FROM duckdb_extensions() WHERE extension_name='httpfs';",reader)==[{'loaded':'false'}]
+# Explicit TYPE takes the same path, and the export remains read-only even if requested writable.
+typed=f"ATTACH '{LOCATION}{locator}' AS old (TYPE differential, READ_WRITE, {S3});"
+assert rows(typed+"SELECT count(*) AS n FROM old.t;",reader)==[{'n':'10000'}]
+run(typed+"INSERT INTO old.t VALUES(1,'x');",reader,expected=1)
 catalog=rows(remote+"SELECT id,label,note,old.analytics.twice(21) AS answer FROM old.analytics.summary;",reader)
 assert catalog==[{'id':'7','label':'ready','note':'original','answer':'42'}],catalog
 assert rows(remote+"SELECT count(*) AS n FROM information_schema.columns WHERE table_catalog='old' AND table_schema='analytics' AND table_name='meta';",reader)==[{'n':'3'}]

@@ -2,6 +2,7 @@
 """DuckLake-aligned SQL surface: settings, ATTACH options, catalog-first functions,
 commit metadata, bulk expiry and snapshot-on-checkpoint. Disposable repositories only."""
 import csv
+import ctypes as C
 import io
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from evidence import evidence_path
+from stock_capi import Host
 ROOT=Path(__file__).resolve().parents[2]
 import sys as _sys
 _sys.path.insert(0,str(ROOT/'test/integration'))
@@ -39,6 +41,28 @@ with tempfile.TemporaryDirectory(prefix='differential-sql-surface-') as tmp:
     assert rows("SELECT current_setting('differential_repository') AS r;")==[{'r':str(repo)}]
     assert not repo.exists() and not unused.exists()
     passed('SET differential_repository selects the root without creating it')
+    # The C API can prepare ATTACH without executing it (SQL PREPARE/EXPLAIN cannot).
+    # The S3 path rewrite must not resolve an export, register a provider or open a repository.
+    host=Host()
+    try:
+        conn=host.connect()
+        host.query(conn,f"LOAD '{EXT}'; SET differential_repository='{repo}';")
+        host.lib.duckdb_prepare.argtypes=[C.c_void_p,C.c_char_p,C.POINTER(C.c_void_p)]
+        host.lib.duckdb_prepare.restype=C.c_int
+        host.lib.duckdb_prepare_error.argtypes=[C.c_void_p]
+        host.lib.duckdb_prepare_error.restype=C.c_char_p
+        host.lib.duckdb_destroy_prepare.argtypes=[C.POINTER(C.c_void_p)]
+        host.lib.duckdb_destroy_prepare.restype=None
+        for sql in ["ATTACH 'differential:s3://unused/heads/sales' AS remote;",
+                    "ATTACH 's3://unused/descriptors/invalid' AS remote (TYPE differential);"]:
+            prepared=C.c_void_p()
+            try:
+                assert host.lib.duckdb_prepare(conn,sql.encode(),C.byref(prepared))==0,host.lib.duckdb_prepare_error(prepared)
+                assert host.query(conn,"SELECT status='false' FROM differential_status() WHERE capability='repository_open';")==1
+                assert not repo.exists() and not unused.exists()
+            finally:host.lib.duckdb_destroy_prepare(C.byref(prepared))
+    finally:host.close()
+    passed('preparing S3 descriptor/head ATTACH creates no repository and performs no remote resolution')
     # ATTACH creates on first use; options select branches and snapshots.
     sales="ATTACH 'differential:sales' AS sales;"
     run(sales+"CREATE TABLE sales.t AS SELECT 1 AS v;")

@@ -27,8 +27,10 @@ def passed(name):
 
 
 def run(repository, sql, expected=0):
+    setup = (f"LOAD '{EXTENSION}'; SET extension_directory='{base / 'empty-extensions'}';"
+             "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;")
     r = subprocess.run([DUCKDB_CLI, '-init', '/dev/null', '-unsigned', '-batch', '-bail', '-json'],
-                       input=f"LOAD '{EXTENSION}';" + sql, text=True, capture_output=True,
+                       input=setup + sql, text=True, capture_output=True,
                        env=dict(os.environ, DIFFERENTIAL_STORE_ROOT=str(repository)), timeout=180)
     assert r.returncode == expected, (sql, r.stdout, r.stderr)
     if expected:
@@ -58,6 +60,8 @@ def heads():
 
 run(writer, W + "CREATE TABLE sales.t AS SELECT 1 AS v; CALL differential_create_snapshot('sales');")
 assert read('sales/main') == 1 and read('sales') == 1
+assert run(base / 'reader', f"ATTACH 'differential:{LOCATION}heads/sales' AS r ({S3}); "
+           "SELECT loaded FROM duckdb_extensions() WHERE extension_name='httpfs';")[-1] == [{'loaded': False}]
 run(writer, W + "UPDATE sales.t SET v = 2; CALL differential_create_snapshot('sales');")
 assert read('sales/main', 'reader2') == 2 and heads() == [('sales', 'main', 2)]
 passed('exports publish heads/<database>/<uuid>/<branch>; fresh readers attach the latest by name')

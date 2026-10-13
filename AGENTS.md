@@ -8,7 +8,7 @@
   exception: an `AT (...)` clause opens a hidden read-only snapshot attachment and takes its
   reader pin at bind time. Do not extend it to identities, snapshots or exports.
 - Use only disposable directories and provider namespaces for destructive tests.
-- Keep `docs/implementation-status.md` current. Record actual commands/results;
+- Record actual commands/results in private, untracked implementation notes;
   distinguish passed probes from full acceptance criteria and untested guarantees.
 - Preserve unrelated user edits.
 - Do not adopt a core patch, fork, daemon, or weaker durability without a product decision.
@@ -144,7 +144,7 @@ make test_minio                           # S3 suites, disposable MinIO (Docker)
   fault, race and S3 suites to `scripts/run_integration.py` or `test/integration/minio.py`.
   Artifact paths come from `test/integration/paths.py`.
 - Tests and builds write result transcripts to the untracked `build/evidence/`. Do not track
-  transcripts; record commands and results in `docs/implementation-status.md` instead.
+  transcripts or implementation notes.
 - There is exactly one store, control and export format, with no migrations
   (nothing was published before 0.1.0). Once released, any format change needs a version bump,
   a migration and tests against data written by the previous release.
