@@ -24,7 +24,7 @@ objects) are specified in [storage-format.md](storage-format.md).
 Your databases stay ordinary DuckDB databases: native file format, catalog, SQL and
 transactions. Around them the extension keeps its own bookkeeping: databases, branches,
 snapshots, operations, pins, exports, and the chunk maps that tie each version to its stored
-64 KiB chunks. That bookkeeping lives in an embedded SQLite database in the repository, the same
+64 KiB objects. That bookkeeping lives in an embedded SQLite database in the repository, the same
 choice DuckLake makes. DuckLake's
 [catalog guide](https://ducklake.select/docs/stable/duckdb/usage/choosing_a_catalog_database)
 recommends SQLite "for local data warehousing using multiple local clients" and notes that a
@@ -49,6 +49,11 @@ only metadata.
 
 ## Write path
 
+The first logical chunk covers DuckDB's 12 KiB header region; subsequent chunks cover
+64 KiB each. All objects remain 64 KiB, with zero padding. This aligns the data chunks with
+native blocks while retaining byte-granular WAL, truncation and recovery behavior. See the
+[exact geometry](storage-format.md#core-idea).
+
 Native writes modify an in-process overlay of whole 64 KiB chunks per inode and are
 appended to an unsynced per-process journal before returning. A completed write
 therefore survives process death, the same as native writes into the page cache. A
@@ -68,9 +73,20 @@ Verified chunks are cached process-wide (32 MiB, by SHA-256 identity). The paylo
 which protects old SQLite snapshots of external-pool mappings from physical deletion, is
 taken only for external pools.
 
+S3 export handles report themselves as remote to DuckDB, enabling native block prefetch
+under its default `storage_block_prefetch = 'REMOTE_ONLY'`. DuckDB batches adjacent blocks
+before the extension resolves chunks and coalesces S3 ranges. Local files and mutable
+local overlays retain local classification. `NEVER` disables native prefetch; it does not
+disable the extension's independent cached S3 read-ahead.
+
+Temporary spill files use a local `temp_directory`. The planner validates explicit SETs,
+and ATTACH validates a preconfigured path before opening the repository. Neither validation
+creates files. The filesystem also rejects Differential directory creation with a spill
+policy error, covering settings supplied outside the normal SQL path.
+
 ## Manifests and generations
 
-A root identity is SHA-256 over the logical length and the ordered list of 16 MiB
+A root identity is SHA-256 over the logical length and the ordered list of 256-slot
 manifest pages. Each page is stored once by its own hash, so consecutive generations
 share unchanged pages, and sealing re-hashes only the pages changed since the last seal.
 

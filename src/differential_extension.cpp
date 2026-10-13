@@ -12,7 +12,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/planner_extension.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include <cstdlib>
 #include <optional>
 #include <cstdio>
@@ -25,6 +27,7 @@
 #include "duckdb_adapter/secrets.hpp"
 #include "duckdb_adapter/remote_cache.hpp"
 #include "duckdb_adapter/differential_catalog.hpp"
+#include "duckdb_adapter/spill_policy.hpp"
 #include <map>
 #include <mutex>
 #include <memory>
@@ -103,8 +106,17 @@ struct DifferentialStorageInfo : StorageExtensionInfo {
 // paths. That exposes "s3://" to DuckDB's httpfs autoloader before our storage callback runs.
 // Keep the prefix and supply TYPE explicitly so only our AWS SDK reader handles this path.
 // This hook changes the plan only: repository access and S3 work remain in ATTACH execution.
-void PreserveS3AttachPrefix(PlannerExtensionInput &, BoundStatement &statement) {
-    if (!statement.plan || statement.plan->type != LogicalOperatorType::LOGICAL_ATTACH)
+void PlanDifferential(PlannerExtensionInput &, BoundStatement &statement) {
+    if (!statement.plan)
+        return;
+    if (statement.plan->type == LogicalOperatorType::LOGICAL_SET) {
+        auto &setting = statement.plan->Cast<LogicalSet>();
+        if (setting.scope != SetScope::VARIABLE && StringUtil::CIEquals(setting.name, "temp_directory") &&
+            !setting.value.IsNull())
+            ValidateDifferentialTempDirectory(setting.value.ToString());
+        return;
+    }
+    if (statement.plan->type != LogicalOperatorType::LOGICAL_ATTACH)
         return;
     auto &info = statement.plan->Cast<LogicalSimple>().info->Cast<AttachInfo>();
     auto type = info.options.find("type");
@@ -123,6 +135,7 @@ void PreserveS3AttachPrefix(PlannerExtensionInput &, BoundStatement &statement) 
 unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                        AttachedDatabase &db, const string &, AttachInfo &info, AttachOptions &options) {
     differential::Timer timer(differential::Metric::AttachResolve);
+    ValidateDifferentialTempDirectory(BufferManager::GetBufferManager(context).GetTemporaryDirectory());
     auto target = info.path;
     if (StringUtil::CIEquals(target.substr(0, 13), "differential:") &&
         differential::S3Location::Is(target.substr(13)))
@@ -501,7 +514,7 @@ void ExecuteStatus(ClientContext &, TableFunctionInput &input, DataChunk &output
         {"repository_open", configuration.open ? "true" : "false"},
         {"repository_shared", configuration.shared ? "true (group-writable, for several local users)"
                                                    : "false (owner only)"},
-        {"local_store_format", "1 (paged manifests, write journal)"},
+        {"local_store_format", "1 (header-aligned chunks, paged manifests, write journal)"},
         {"local_providers",
          "chunks in the metadata store by default; immutable-file pools with DATA_PATH '/directory'"},
         {"qualified_catalog_definitions",
@@ -592,7 +605,7 @@ static void LoadInternal(ExtensionLoader &loader) {
                                   duckdb::LogicalType::BOOLEAN, duckdb::Value::BOOLEAN(false));
     duckdb::StorageExtension::Register(config, "differential", duckdb::make_shared_ptr<duckdb::DifferentialStorage>(store));
     duckdb::PlannerExtension planner;
-    planner.post_bind_function = duckdb::PreserveS3AttachPrefix;
+    planner.post_bind_function = duckdb::PlanDifferential;
     duckdb::PlannerExtension::Register(config, std::move(planner));
     duckdb::TableFunction status("differential_status", {}, duckdb::ExecuteStatus, duckdb::BindStatus,
                                  duckdb::InitProbe);

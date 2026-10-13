@@ -5,10 +5,15 @@ names index (names/<name>/<uuid>) and pool-qualified pack references (a clone's 
 source database's packs). The bucket is inspected with DuckDB's official httpfs. Needs the
 disposable MinIO bucket initialized by minio.py and network access for httpfs."""
 import json
+import hashlib
+import io
 import os
 from pathlib import Path
+import sqlite3
+import struct
 import subprocess
 import sys
+import uuid
 from urllib.parse import urlparse
 from evidence import evidence_path
 from paths import DUCKDB_CLI, EXTENSION
@@ -77,6 +82,68 @@ assert f"\ndescriptor {snapshots[1]['export_locator']}\n" in record and '\nbranc
 assert '\nmessage line one%0Aline two\n' in record and '\nname second\n' in record, record
 assert '\nparent 0\n' in text(commits[1]), text(commits[1])
 passed('commit records list newest first (inverted snapshot numbers) and link each snapshot to its parent')
+
+# Independently decode the documented byte layout. Compare every exported byte with
+# SQLite's immutable chunk map, including the padded header object's unused suffix.
+def blob(key):
+    return bytes.fromhex(run('inspect', HTTPFS + f"SELECT hex(content) AS bytes FROM read_blob('{LOCATION}{key}');")[-1][0]['bytes'])
+
+
+packs = {}
+with sqlite3.connect(f'file:{base / "writer/engine.sqlite"}?mode=ro', uri=True) as metadata:
+    for snapshot in snapshots:
+        descriptor = blob(snapshot['export_locator'])
+        assert hashlib.sha256(descriptor).hexdigest() == snapshot['export_locator'].split('/')[-1]
+        stream = io.BytesIO(descriptor)
+        lines = [stream.readline().decode().rstrip('\n') for _ in range(10)]
+        assert lines[0] == 'differential-export-v1'
+        size, count = int(lines[7]), int(lines[9])
+        chunk_count = 0 if not size else 1 if size <= 12288 else 2 + (size - 12289) // 65536
+        assert count == (chunk_count + 4095) // 4096
+        pages = [stream.readline().decode().split() for _ in range(count)]
+        assert stream.readline() == b'first-index\n'
+        first_index = stream.read()
+        remote = bytearray(size)
+        for page, (digest, length) in enumerate(pages):
+            index = blob(lines[8] + 'indexes/' + digest)
+            assert len(index) == int(length) and hashlib.sha256(index).hexdigest() == digest
+            if page == 0:
+                assert index == first_index
+            assert index[:4] == b'DIX1'
+            pack_count = struct.unpack_from('<I', index, 4)[0]
+            entries = 8 + 48 * pack_count
+            assert len(index) == entries + 36 * 4096
+            for slot in range(4096):
+                chunk = page * 4096 + slot
+                if chunk >= chunk_count:
+                    break
+                offset = entries + slot * 36
+                expected = index[offset:offset + 32].hex()
+                pack, packed_slot = struct.unpack_from('<HH', index, offset + 32)
+                if pack == 65535:
+                    continue
+                assert pack < pack_count
+                pack_entry = 8 + pack * 48
+                pool = str(uuid.UUID(bytes=index[pack_entry:pack_entry + 16]))
+                pack_hash = index[pack_entry + 16:pack_entry + 48].hex()
+                key = f'dbs/{pool}/packs/{pack_hash}'
+                if key not in packs:
+                    packs[key] = blob(key)
+                    assert hashlib.sha256(packs[key]).hexdigest() == pack_hash
+                payload = packs[key][packed_slot * 65536:(packed_slot + 1) * 65536]
+                assert len(payload) == 65536 and hashlib.sha256(payload).hexdigest() == expected
+                start = 0 if chunk == 0 else 12288 + (chunk - 1) * 65536
+                length = min(12288 if chunk == 0 else 65536, size - start)
+                assert not any(payload[length:]), 'object padding must be zero'
+                remote[start:start + length] = payload[:length]
+        local = bytearray(size)
+        for chunk, payload in metadata.execute('''SELECT r.page_no*256+e.slot,o.data FROM root_pages r
+                JOIN page_entries e ON e.page=r.page JOIN objects o ON o.hash=e.object WHERE r.root=?''', (lines[6],)):
+            start = 0 if chunk == 0 else 12288 + (chunk - 1) * 65536
+            length = min(12288 if chunk == 0 else 65536, size - start)
+            local[start:start + length] = payload[:length]
+        assert remote == local and remote[8:12] == b'DUCK'
+passed('independent descriptor/index/pack decoder reconstructs both snapshots byte-for-byte, including header alignment')
 
 # A clone is a new database: its export reuses the source's packs through pool-qualified references.
 rows = run('writer', f"""

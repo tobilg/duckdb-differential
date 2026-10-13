@@ -53,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix='differential-minio-') as tmp:
         subprocess.run([sys.executable,str(ROOT/'test/integration/doc_examples.py'),endpoint,tmp],env=env,check=True,timeout=900)
         subprocess.run([sys.executable,str(ROOT/'test/integration/s3_secrets.py'),endpoint,tmp],env=env,check=True,timeout=900)
         subprocess.run([sys.executable,str(ROOT/'test/integration/s3_cache.py'),endpoint,tmp],env=env,check=True,timeout=900)
+        subprocess.run([sys.executable,str(ROOT/'test/integration/s3_prefetch.py'),endpoint,tmp],env=env,check=True,timeout=900)
         subprocess.run([sys.executable,str(ROOT/'test/integration/coexistence.py'),endpoint,tmp],env=env,check=True,timeout=600)
         subprocess.run([sys.executable,str(ROOT/'examples/s3.py'),'--bucket','differential-sdk-test','--prefix','example-test/','--endpoint',endpoint,'--path-style','--allow-http'],env=env,check=True,timeout=120)
         subprocess.run([sys.executable,str(ROOT/'test/integration/existing_provider.py'),'--bucket','differential-sdk-test','--prefix','capability-test/','--endpoint',endpoint,'--path-style','--allow-http','--report',str(evidence_path('existing-provider-minio.json'))],env=env,check=True,timeout=300)

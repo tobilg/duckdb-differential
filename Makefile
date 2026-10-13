@@ -14,14 +14,14 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Integration build: test hooks compiled in, and the extension NOT linked into the CLI or
 # libduckdb, so the Python suites exercise the loadable artifact exactly as users load it.
 # Release artifacts (`make release`) never contain the hooks.
-.PHONY: integration test_integration test_minio vcpkg bump-version
+.PHONY: integration test_integration test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness vcpkg bump-version
 
 bump-version:
 	@test -n "$(V)" || { echo "Usage: make bump-version V=X.Y.Z" >&2; exit 2; }
 	@python3 "$(PROJ_DIR)scripts/bump_version.py" "$(V)"
 
 INTEGRATION_FLAGS=$(BUILD_FLAGS) -DDUCKDB_EXTENSION_CONFIGS='${PROJ_DIR}extension_config_integration.cmake' \
-	-DDIFFERENTIAL_TEST_HOOKS=ON -DBUILD_UNITTESTS=0
+	-DDIFFERENTIAL_TEST_HOOKS=ON -DBUILD_UNITTESTS=1
 
 integration:
 	mkdir -p build/integration
@@ -32,6 +32,22 @@ integration:
 test_integration:
 	ctest --test-dir build/integration/extension/differential --output-on-failure
 	python3 scripts/run_integration.py
+
+# Unmodified DuckDB SQLLogicTests against both storage backends, with audited exclusions.
+UPSTREAM_BUILD_DIR ?= build/integration
+UPSTREAM_JOBS ?= 2
+UPSTREAM_ARGS ?=
+test_upstream:
+	python3 scripts/test_upstream.py --build-dir $(UPSTREAM_BUILD_DIR) --jobs $(UPSTREAM_JOBS) $(UPSTREAM_ARGS)
+
+test_upstream_pr:
+	python3 scripts/test_upstream.py --build-dir $(UPSTREAM_BUILD_DIR) --jobs $(UPSTREAM_JOBS) --profile pr $(UPSTREAM_ARGS)
+
+test_upstream_skips:
+	python3 scripts/test_upstream.py --build-dir $(UPSTREAM_BUILD_DIR) --jobs $(UPSTREAM_JOBS) --audit-skips $(UPSTREAM_ARGS)
+
+test_upstream_harness:
+	python3 test/upstream/test_harness.py --build-dir $(UPSTREAM_BUILD_DIR)
 
 # S3 suites against a disposable, pinned MinIO container plus the HTTP fault harness.
 test_minio:

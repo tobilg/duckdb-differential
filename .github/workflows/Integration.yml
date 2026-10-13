@@ -75,8 +75,22 @@ jobs:
       - name: Unit and integration suites
         run: make test_integration
 
+      - name: Upstream harness checks
+        run: make test_upstream_harness
+
+      - name: Upstream native comparison (PR)
+        run: make test_upstream_pr
+
       - name: S3 suites (MinIO)
         if: matrix.minio
         run: |
           docker pull ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9
           make test_minio
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-${{ matrix.name }}
+          path: build/evidence/
+          retention-days: 14

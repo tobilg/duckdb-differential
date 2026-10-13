@@ -19,7 +19,9 @@ SELECT value FROM sales.t AT (VERSION => 1);       -- 42, DuckLake-style time tr
 FROM sales.snapshots();
 ```
 
-**Status: experimental.** Full v1 acceptance is not complete. Only macOS arm64 and a MinIO S3
+**Status: experimental** Build from source and load the local artifact
+([development](#development)); community installation commands describe the planned release.
+Full v1 acceptance is not complete. Only macOS arm64 and a MinIO S3
 endpoint are fully tested; real AWS was exercised manually (exports, reads, branch heads), and
 other platforms are untested.
 
@@ -50,7 +52,8 @@ other platforms are untested.
 
 ## Installation
 
-`differential` is a DuckDB community extension for DuckDB 1.5.6:
+`differential` targets DuckDB 1.5.6 and is prepared for community publication. Until it is
+published, [build and load it locally](#build). The planned community installation is:
 
 ```sql
 INSTALL differential FROM community;
@@ -247,8 +250,7 @@ heads are guarded, and how to isolate tenants is in
 
 ## Development
 
-The sections below are for working on the extension itself. Users install it from the
-community repository ([Installation](#installation)).
+The sections below cover building, loading and verifying the extension before publication.
 
 The repository follows DuckDB's C++ [extension template](https://github.com/duckdb/extension-template):
 DuckDB (`duckdb/`, v1.5.6) and `extension-ci-tools/` are submodules, and CI uses the same
@@ -273,20 +275,36 @@ The release loadable is `build/release/extension/differential/differential.duckd
 A locally built extension is unsigned: start DuckDB 1.5.6 with `-unsigned` and load it by path
 instead of `LOAD differential;`.
 
+See [upstream testing](docs/upstream-testing.md) for the full upstream SQLLogicTest inventory,
+PR profile, manual full runs and individually audited exclusions. Evidence is written to untracked
+`build/evidence/`.
+
 ### Integration suites
 
 ```sh
 make integration                 # build/integration: test hooks on, extension NOT linked into the CLI
 make test_integration            # C++ unit tests + crash/fault/race/lifecycle suites (Python)
+make test_upstream_harness       # verify the SQLLogicTest adapter
+make test_upstream_pr            # PR coverage: native baseline + Differential
+make test_upstream               # manual full upstream SQLLogicTest inventory, including slow tests
+make test_upstream_skips         # manual audit of individually documented exclusions
 docker pull ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9
 make test_minio                  # S3 suites against a disposable pinned MinIO container (Docker)
 ```
 
 `make integration` compiles the fault-injection hooks (`-DDIFFERENTIAL_TEST_HOOKS=ON`) and
-builds an extension-free CLI and `libduckdb`, so every suite LOADs the loadable artifact. Release
+builds a CLI and `libduckdb` without Differential linked in, so suites LOAD its loadable artifact. Release
 builds never contain the hooks. Scripts find artifacts through `test/integration/paths.py`;
 override with `DIFFERENTIAL_BUILD_DIR`, `DIFFERENTIAL_EXTENSION`, `DUCKDB_BINARY` or
 `DUCKDB_LIBRARY`. Test scripts write result transcripts to `build/evidence/` (not tracked).
+
+CI runs the upstream harness checks and smaller PR profile. Run the complete suite manually
+with `make test_upstream`, and audit exclusions with `make test_upstream_skips` when updating
+DuckDB, changing the adapter or reviewing exclusions. Both commands are outside CI.
+
+Upstream comparisons install required official test extensions into a build cache and use
+network access for public fixtures. Tests have no default per-test time limit. The three
+individually documented excessive-disk workloads are excluded without executing them during audits.
 
 - **MinIO tests** use only a disposable tmpfs container, a loopback port and generated
   credentials; every S3 call uses the AWS SDK. They cover export response loss and fault

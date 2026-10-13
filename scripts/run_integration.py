@@ -17,6 +17,7 @@ SUITES = [
     ('phase0.py', ['--duckdb', DUCKDB_CLI, '--durable'], {}),
     ('store_crash.py', [], {}),
     ('native_matrix.py', [], {}),
+    ('spilling.py', [], {}),
     ('qualified_catalog.py', [], {}),
     ('checkpoint_boundaries.py', [], {}),
     ('block_reuse.py', [], {}),

@@ -2,6 +2,7 @@
 
 Measured on macOS 26.7 arm64 with stock DuckDB 1.5.6 and a release build without
 test hooks. These are development measurements, not release performance promises.
+The baseline sections below predate the header-alignment change unless explicitly dated.
 Native sync points remain durability boundaries: every native FileSync commits the
 buffered writes with SQLite FULL + fullfsync (F_FULLFSYNC), which is stronger than
 stock DuckDB 1.5.6 on macOS (plain fsync). External payload files use
@@ -134,3 +135,43 @@ The fixture owns and removes its MinIO container. No cloud infrastructure is
 created. Deep-history/large-metadata-store scale, WAN latency, physical-disk-cold
 performance and full wire-I/O attribution remain unmeasured. There is no
 claimed optimum for chunk/cache/request sizes and no asserted throughput SLO.
+
+## Header alignment and native prefetch (2026-10-13)
+
+The first 12 KiB of a logical file occupy their own zero-padded object. An isolated default
+256 KiB native block therefore touches four data chunks. The unit test overwrites a full
+block, verifies exactly four changed chunk mappings, no old-payload materialization, and
+an unchanged header object. Native 16 KiB, 64 KiB and 256 KiB allocation sizes also pass
+the DDL/DML, checkpoint and historical-read matrix. This does not imply a universal 20–25%
+I/O reduction: adjacent writes can share boundary chunks, and small native blocks still
+perform partial-chunk writes.
+
+`benchmarks/chunk_layout.py` compares loadable builds in separate disposable repositories
+using 200000 rows, single-threaded execution, three repetitions and fresh CLI processes.
+It records elapsed time and payload materialization for bulk checkpoint, one-row checkpoint,
+scattered updates and full scan. OS caches are not purged. Supply `--extension label=path`
+more than once to compare artifacts; the script contains only the current implementation.
+
+An interleaved before/after run on macOS arm64 (three repetitions per artifact, both
+release builds) produced these medians. Native durability was enabled throughout.
+
+| Workload | Before ms | Aligned ms | Before materialized bytes | Aligned materialized bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Bulk checkpoint | 286.66 | 304.72 | 262144 | 131072 |
+| One-row checkpoint | 154.54 | 174.85 | 4521984 | 4521984 |
+| Scattered update checkpoint | 257.92 | 225.05 | 8257536 | 7208960 |
+| Full scan | 59.21 | 67.69 | 7143424 | 7077888 |
+
+Payload read amplification falls for bulk and scattered checkpoints. Latency is mixed:
+scattered updates improve, while the other medians are slower. Three repetitions including
+process startup do not establish a general speedup or a tail-latency guarantee. The benefit
+verified independently is alignment and avoidance of neighboring-payload reads for a full
+native block overwrite. Raw samples and artifact hashes are in the local evidence report.
+
+The MinIO prefetch fixture scans 16 DOUBLE columns over 131072 rows, with 16384-row groups,
+one thread and fresh processes. With `NEVER`, the native file reader issues 65 reads of
+256 KiB. With default `REMOTE_ONLY`, remote exports issue 49 reads of 256 KiB and 8 reads
+of 512 KiB (57 data reads total). All scan results match. A local snapshot still issues
+65 reads; `ALWAYS_PREFETCH` produces the same batching on either backend. These are observed
+native read calls, not S3 request counts or an AWS throughput claim. Cache, transport range
+coalescing and the extension's own read-ahead are separate layers.

@@ -245,6 +245,57 @@ int main(int argc, char **argv) {
         std::cout << "PASS 250 deterministic overlap/hole/EOF/truncate/regrow cases across overlay, NORMAL and "
                      "synced states, manifest reuse, zero-copy fork, unlink handles, immutable history and reopen\n";
         {
+            Store store(path);
+            auto file = store.Open("aligned", true, true, false);
+            // Model a native header and two distinct, incompressible 256 KiB blocks.
+            std::vector<unsigned char> bytes(12288 + 2 * 262144);
+            std::mt19937_64 random(123);
+            for (auto &byte : bytes)
+                byte = random() & 255;
+            store.Write(file.id, bytes.data(), bytes.size(), 0);
+            auto original = store.Seal(file.id);
+            auto refs = store.RootChunks(original.id, 0, 100);
+            Require(refs.size() == 9, "header and eight data chunks expected");
+            auto header = store.Object(refs[0].object);
+            Require(std::equal(bytes.begin(), bytes.begin() + 12288, header->begin()) &&
+                        std::all_of(header->begin() + 12288, header->end(), [](unsigned char b) { return b == 0; }),
+                    "header object padding is not zero");
+            // A full native block overwrite must not read either neighboring chunk.
+            Store::DropCaches();
+            auto before = counters[size_t(Counter::LocalMaterializedBytes)].load();
+            std::fill(bytes.begin() + 12288, bytes.begin() + 12288 + 262144, 0xA7);
+            store.Write(file.id, bytes.data() + 12288, 262144, 12288);
+            Require(counters[size_t(Counter::LocalMaterializedBytes)].load() == before,
+                    "aligned full block overwrite read old payload");
+            auto changed = store.Seal(file.id);
+            auto after = store.RootChunks(changed.id, 0, 100);
+            unsigned replaced = 0;
+            for (size_t i = 0; i < refs.size(); i++)
+                replaced += refs[i].object != after[i].object;
+            Require(replaced == 4 && refs[0].object == after[0].object,
+                    "native block overwrite must replace exactly four chunks and preserve the header");
+            // Truncation at either side of each kind of boundary, followed by sparse regrowth,
+            // must not reveal previously stored bytes. Forks keep the original immutable image.
+            for (uint64_t cut : {0ull, 12287ull, 12288ull, 12289ull, 77823ull, 77824ull, 77825ull}) {
+                auto fork = store.Fork(changed.id, "cut-" + std::to_string(cut));
+                store.Truncate(fork.id, cut);
+                store.Sync();
+                store.Truncate(fork.id, bytes.size());
+                auto sealed = store.Seal(fork.id);
+                std::vector<unsigned char> actual(bytes.size(), 0xFF);
+                store.ReadRoot(sealed.id, actual.data(), actual.size(), 0);
+                Require(std::equal(bytes.begin(), bytes.begin() + cut, actual.begin()), "truncate lost prefix");
+                Require(std::all_of(actual.begin() + cut, actual.end(), [](unsigned char b) { return b == 0; }),
+                        "truncate/regrow exposed old bytes at a chunk boundary");
+            }
+            std::vector<unsigned char> actual(bytes.size());
+            store.ReadRoot(changed.id, actual.data(), actual.size(), 0);
+            Require(actual == bytes, "truncation of forks changed their immutable source");
+            store.Verify();
+        }
+        std::cout << "PASS isolated header padding, four-chunk native block overwrite without old reads, "
+                     "header/data boundary truncation, regrowth and immutable forks\n";
+        {
             // Paged manifests: a one-chunk change re-hashes one 16 MiB page, and the new root
             // shares every other page with its predecessor.
             Store store(path);

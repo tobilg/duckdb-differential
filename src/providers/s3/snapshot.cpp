@@ -321,8 +321,10 @@ Descriptor Decode(const std::vector<unsigned char> &bytes) {
     if (d.snapshot <= 0 || !IsHash(d.root) || d.size > (uint64_t(1) << 40) || d.pool != Pool(d.database))
         throw std::runtime_error("[differential:corrupt_data] Corrupt export bounds/namespace");
     auto count = number();
-    auto expected = (d.size + Store::CHUNK * INDEX_CHUNKS - 1) / (Store::CHUNK * INDEX_CHUNKS);
-    if (count != expected || count > 4096)
+    auto expected = (Store::ChunkCount(d.size) + INDEX_CHUNKS - 1) / INDEX_CHUNKS;
+    // The 1 TiB size bound above permits 4097 pages: the shorter first chunk
+    // pushes the final 52 KiB into one additional index page.
+    if (count != expected)
         throw std::runtime_error("[differential:corrupt_data] Corrupt export index count");
     for (uint64_t i = 0; i < count; i++) {
         auto entry = line();
@@ -518,7 +520,7 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
             throw std::runtime_error("[differential:corrupt_data] Uploaded dependency failed read-back verification");
         control.RecordRemoteVerified(e.provider, key, hash, bytes.size());
     };
-    auto total_chunks = (d.size + Store::CHUNK - 1) / Store::CHUNK;
+    auto total_chunks = Store::ChunkCount(d.size);
     auto pages = (total_chunks + INDEX_CHUNKS - 1) / INDEX_CHUNKS;
     // Pass 1: chunks this provider has never stored, in first-appearance (file) order so a
     // pack holds neighbouring file ranges and later reads coalesce.
@@ -1032,7 +1034,7 @@ uint64_t RemoteSnapshot::Read(void *data, uint64_t length, uint64_t offset) {
     if (length == 0)
         return 0;
     logical_read_bytes += length;
-    auto first = offset / Store::CHUNK, last = (offset + length - 1) / Store::CHUNK;
+    auto first = Store::ChunkIndex(offset), last = Store::ChunkIndex(offset + length - 1);
     std::vector<uint64_t> chunks;
     for (auto c = first; c <= last; c++)
         chunks.push_back(c);
@@ -1065,7 +1067,7 @@ uint64_t RemoteSnapshot::Read(void *data, uint64_t length, uint64_t offset) {
             auto read_chunks = last - first + 1;
             stream->window = std::min<uint64_t>(MAX_WINDOW_CHUNKS,
                                                 stream->window ? stream->window * 2 : read_chunks);
-            auto end = std::min<uint64_t>({last + stream->window, (descriptor.size - 1) / Store::CHUNK,
+            auto end = std::min<uint64_t>({last + stream->window, Store::ChunkIndex(descriptor.size - 1),
                                            (last / INDEX_CHUNKS + 1) * INDEX_CHUNKS - 1});
             for (auto c = std::max(last + 1, stream->ahead); c <= end; c++) {
                 chunks.push_back(c);
@@ -1080,8 +1082,8 @@ uint64_t RemoteSnapshot::Read(void *data, uint64_t length, uint64_t offset) {
     uint64_t done = 0;
     while (done < length) {
         auto pos = offset + done;
-        auto take = std::min(length - done, Store::CHUNK - pos % Store::CHUNK);
-        std::memcpy(out + done, fetched.at(pos / Store::CHUNK)->data() + pos % Store::CHUNK, size_t(take));
+        auto take = std::min(length - done, Store::ChunkLength(Store::ChunkIndex(pos)) - Store::ChunkPosition(pos));
+        std::memcpy(out + done, fetched.at(Store::ChunkIndex(pos))->data() + Store::ChunkPosition(pos), size_t(take));
         done += take;
     }
     return length;
@@ -1094,7 +1096,7 @@ Root RemoteSnapshot::Materialize(Store &store, int64_t file) {
         std::vector<uint64_t> present;
         for (uint64_t slot = 0; slot < INDEX_CHUNKS; slot++) {
             auto chunk = page * INDEX_CHUNKS + slot;
-            if (chunk * Store::CHUNK >= descriptor.size)
+            if (chunk >= Store::ChunkCount(descriptor.size))
                 break;
             if (!Locate(*index, slot).hole)
                 present.push_back(chunk);
@@ -1105,8 +1107,8 @@ Root RemoteSnapshot::Materialize(Store &store, int64_t file) {
             std::map<uint64_t, SharedBytes> fetched;
             FetchChunks(batch, fetched);
             for (auto chunk : batch) {
-                auto offset = chunk * Store::CHUNK;
-                store.Write(file, fetched.at(chunk)->data(), std::min<uint64_t>(Store::CHUNK, descriptor.size - offset),
+                auto offset = Store::ChunkOffset(chunk);
+                store.Write(file, fetched.at(chunk)->data(), std::min(Store::ChunkLength(chunk), descriptor.size - offset),
                             offset);
             }
         }
@@ -1123,7 +1125,7 @@ std::vector<std::pair<ChunkRef, RemoteChunk>> RemoteSnapshot::Entries(uint64_t p
     std::vector<std::pair<ChunkRef, RemoteChunk>> entries;
     for (uint64_t slot = 0; slot < INDEX_CHUNKS; slot++) {
         auto chunk = page * INDEX_CHUNKS + slot;
-        if (chunk * Store::CHUNK >= descriptor.size)
+        if (chunk >= Store::ChunkCount(descriptor.size))
             break;
         auto location = Locate(*index, slot);
         if (!location.hole)

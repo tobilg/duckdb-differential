@@ -5,3 +5,14 @@ duckdb_extension_load(differential
     DONT_LINK
     EXTENSION_VERSION v0.1.0
 )
+
+# Bundled dependencies used by the upstream SQLLogicTests; no extension downloads.
+duckdb_extension_load(json)
+duckdb_extension_load(icu)
+duckdb_extension_load(tpch)
+duckdb_extension_load(tpcds)
+duckdb_extension_load(autocomplete)
+duckdb_extension_load(upstream_bridge
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/test/upstream/bridge
+    DONT_LINK
+)

@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from evidence import evidence_path
+from stock_capi import Host
 ROOT=Path(__file__).resolve().parents[2]
 import sys as _sys
 _sys.path.insert(0,str(ROOT/'test/integration'))
@@ -52,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix='differential-write-path-') as tmp:
     assert after-before<=8,(before,after)
     assert not any((root/'journal').iterdir()),'clean close left a write journal'
     passed(f'200 single-row commits retain {after-before} new payload objects; clean close removes the journal')
-    # Automatic bounded collection after checkpoints keeps superseded generations from accumulating.
+    # With automatic GC disabled, superseded generations remain queued for explicit collection.
     run(attach+"CREATE TABLE p.big AS SELECT range AS id, md5(range::VARCHAR) AS s FROM range(200000); CHECKPOINT p;")
     run("SET differential_auto_gc=false;"+attach+''.join(f"UPDATE p.big SET s=s||'x' WHERE id%7={i}; CHECKPOINT p;" for i in range(6)))
     queued=metrics(run)
@@ -64,14 +65,33 @@ with tempfile.TemporaryDirectory(prefix='differential-write-path-') as tmp:
     assert int(collected['deleted_objects'])>0 and drained['local_gc_queued_roots']==0 and drained['local_gc_queued_objects']==0,(collected,drained)
     assert rows(run("SELECT * FROM differential_cleanup_old_files(dry_run:=true);"))[0]['candidate_objects']=='0'
     passed(f'one explicit GC call cascades root -> page -> object queues to empty ({collected["deleted_objects"]} objects); dry run agrees')
-    run(attach+''.join(f"UPDATE p.big SET s=s||'y' WHERE id%5={i}; CHECKPOINT p;" for i in range(6)))
-    auto=int(rows(run("SELECT * FROM differential_cleanup_old_files(dry_run:=true);"))[0]['candidate_objects'])
-    # Only bytes released after the final checkpoint (closed WAL inodes) await the next pass.
-    assert auto*4<backlog,(auto,backlog)
+    # Seed a known backlog, then open a host with automatic GC enabled by default.
+    # The setting is read when files open; keep this host alive while its worker runs.
+    run("SET differential_auto_gc=false;"+attach+''.join(f"UPDATE p.big SET s=s||'y' WHERE id%5={i}; CHECKPOINT p;" for i in range(6)))
+    host=Host();connection=host.connect()
+    try:
+        host.query(connection,f"LOAD '{EXT}'; SET differential_repository='{root}';"+attach)
+        dry_sql="SELECT candidate_objects FROM differential_cleanup_old_files(dry_run:=true);"
+        auto_backlog=auto=host.query(connection,dry_sql)
+        assert auto_backlog>0,auto_backlog
+        deadline=time.monotonic()+60
+        checkpoints=0
+        while auto and time.monotonic()<deadline:
+            # Maintenance is bounded and can defer work when locks are busy. Further
+            # dirty checkpoints schedule another pass; an unchanged CHECKPOINT may not.
+            host.query(connection,"UPDATE p.t SET v=v+1; CHECKPOINT p;")
+            checkpoints+=1
+            time.sleep(.1)
+            auto=host.query(connection,dry_sql)
+        assert auto==0,('automatic GC did not drain',auto_backlog,auto,checkpoints)
+        assert host.query(connection,"SELECT count(*) FROM p.big;")==200000
+        assert host.query(connection,"ATTACH 'differential:plain' AS old (SNAPSHOT_VERSION 1); SELECT v FROM old.t;")==42
+    finally:host.close()
+    # Closing the host may release more WAL payloads after its final maintenance pass.
     rows(run("SELECT * FROM differential_cleanup_old_files(max_objects:=10000);"))
     assert rows(run("SELECT * FROM differential_cleanup_old_files(dry_run:=true);"))[0]['candidate_objects']=='0'
     assert run(attach+"SELECT count(*) AS n FROM p.big;").endswith('n\n200000\n')
-    passed(f'automatic bounded collection after checkpoints: {auto} reclaimable objects left vs {backlog} with auto GC disabled; queues cover every candidate')
+    passed(f'default automatic GC drains {auto_backlog} candidates across {checkpoints} checkpoints; live branch and snapshot retained; explicit GC clears close-time leftovers')
     # Introspection never takes the payload fence or the authority write lock.
     with open(root/'payload.lock','a+') as fence:
         fcntl.flock(fence,fcntl.LOCK_EX)

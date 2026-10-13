@@ -740,7 +740,7 @@ std::vector<std::string> Store::ReadAhead(Reader &reader, Inode &inode, uint64_t
                                           uint64_t file_length) {
     constexpr uint64_t MAX_WINDOW = 64; // 4 MiB per stream
     constexpr size_t MAX_STREAMS = 16;
-    auto first = offset / CHUNK, last = (offset + length - 1) / CHUNK;
+    auto first = ChunkIndex(offset), last = ChunkIndex(offset + length - 1);
     uint64_t from = 0, to = 0;
     {
         // A stream starts after two consecutive block-sized reads; only a read that needs data its
@@ -766,7 +766,7 @@ std::vector<std::string> Store::ReadAhead(Reader &reader, Inode &inode, uint64_t
             return {};
         stream->window = std::min(MAX_WINDOW, stream->window ? stream->window * 2 : last - first + 1);
         from = std::max(last + 1, stream->ahead);
-        to = std::min(last + stream->window, (file_length - 1) / CHUNK);
+        to = std::min(last + stream->window, ChunkIndex(file_length - 1));
         stream->ahead = to + 1;
     }
     std::vector<std::string> ahead;
@@ -851,10 +851,10 @@ uint64_t Store::Read(int64_t file, void *data, uint64_t n, uint64_t p, const voi
             length = uint64_t(q.Int(0));
             floor = NONE;
         }
-        if (p >= length)
+        if (n == 0 || p >= length)
             return;
         n = std::min(n, length - p);
-        auto first = p / CHUNK, last = (p + n - 1) / CHUNK;
+        auto first = ChunkIndex(p), last = ChunkIndex(p + n - 1);
         std::map<uint64_t, std::string> committed;
         {
             Timer lookup(Metric::ExtentLookup);
@@ -879,8 +879,8 @@ uint64_t Store::Read(int64_t file, void *data, uint64_t n, uint64_t p, const voi
         auto out = static_cast<unsigned char *>(data);
         uint64_t done = 0;
         while (done < n) {
-            auto pos = p + done, index = pos / CHUNK;
-            auto take = std::min(n - done, CHUNK - pos % CHUNK);
+            auto pos = p + done, index = ChunkIndex(pos);
+            auto take = std::min(n - done, ChunkLength(index) - ChunkPosition(pos));
             const unsigned char *source;
             SharedBytes held;
             auto dirty = inode->chunks.find(index);
@@ -894,7 +894,7 @@ uint64_t Store::Read(int64_t file, void *data, uint64_t n, uint64_t p, const voi
                                                                    : ObjectBytes(reader, found->second, inode->pool);
                 source = held->data();
             }
-            std::memcpy(out + done, source + pos % CHUNK, take);
+            std::memcpy(out + done, source + ChunkPosition(pos), take);
             done += take;
         }
         result = n;
@@ -905,7 +905,7 @@ uint64_t Store::Read(int64_t file, void *data, uint64_t n, uint64_t p, const voi
 // ---------------------------------------------------------------------------------------
 // Buffered mutation
 void Store::ApplyWrite(Inode &inode, const unsigned char *in, uint64_t n, uint64_t p, bool journaled) {
-    auto first = p / CHUNK, last = (p + n - 1) / CHUNK;
+    auto first = ChunkIndex(p), last = ChunkIndex(p + n - 1);
     std::map<uint64_t, std::shared_ptr<Bytes>> fresh;
     std::unique_ptr<PayloadFence> fence;
     if (!inode.pool.empty())
@@ -915,8 +915,8 @@ void Store::ApplyWrite(Inode &inode, const unsigned char *in, uint64_t n, uint64
         for (auto index = first; index <= last; ++index) {
             if (inode.chunks.count(index))
                 continue;
-            auto offset = index * CHUNK;
-            bool covered = p <= offset && p + n >= offset + CHUNK;
+            auto offset = ChunkOffset(index);
+            bool covered = p <= offset && p + n >= offset + ChunkLength(index);
             fresh.emplace(index, covered ? std::make_shared<Bytes>(CHUNK, 0)
                                          : std::make_shared<Bytes>(*CommittedChunk(reader, inode, index)));
         }
@@ -937,8 +937,8 @@ void Store::ApplyWrite(Inode &inode, const unsigned char *in, uint64_t n, uint64
     uint64_t done = 0;
     while (done < n) {
         auto pos = p + done;
-        auto take = std::min(n - done, CHUNK - pos % CHUNK);
-        std::memcpy(inode.chunks.at(pos / CHUNK)->data() + pos % CHUNK, in + done, take);
+        auto take = std::min(n - done, ChunkLength(ChunkIndex(pos)) - ChunkPosition(pos));
+        std::memcpy(inode.chunks.at(ChunkIndex(pos))->data() + ChunkPosition(pos), in + done, take);
         done += take;
     }
     if (!inode.dirty)
@@ -952,8 +952,8 @@ void Store::ApplyTruncate(Inode &inode, uint64_t n, bool journaled) {
         fence = std::make_unique<PayloadFence>(directory, false);
     WithReader([&](Reader &reader) {
         Load(reader, inode);
-        if (n < inode.size && n % CHUNK && !inode.chunks.count(n / CHUNK))
-            tail = std::make_shared<Bytes>(*CommittedChunk(reader, inode, n / CHUNK));
+        if (n < inode.size && ChunkPosition(n) && !inode.chunks.count(ChunkIndex(n)))
+            tail = std::make_shared<Bytes>(*CommittedChunk(reader, inode, ChunkIndex(n)));
     });
     if (journaled) {
         std::lock_guard<std::mutex> guard(journal_mutex);
@@ -963,18 +963,18 @@ void Store::ApplyTruncate(Inode &inode, uint64_t n, bool journaled) {
         journal->Append(JournalRecord::TRUNCATE, inode.id, n, nullptr, 0);
     }
     if (n < inode.size) {
-        auto keep = (n + CHUNK - 1) / CHUNK; // chunks at or above are discarded
+        auto keep = ChunkCount(n); // chunks at or above are discarded
         for (auto it = inode.chunks.lower_bound(keep); it != inode.chunks.end();) {
             dirty_bytes -= CHUNK;
             it = inode.chunks.erase(it);
         }
-        if (n % CHUNK) {
+        if (ChunkPosition(n)) {
             if (tail) {
-                inode.chunks.emplace(n / CHUNK, tail);
+                inode.chunks.emplace(ChunkIndex(n), tail);
                 dirty_bytes += CHUNK;
             }
-            auto &chunk = *inode.chunks.at(n / CHUNK);
-            std::fill(chunk.begin() + int64_t(n % CHUNK), chunk.end(), 0);
+            auto &chunk = *inode.chunks.at(ChunkIndex(n));
+            std::fill(chunk.begin() + int64_t(ChunkPosition(n)), chunk.end(), 0);
         }
         inode.floor = std::min(inode.floor, keep);
     }
@@ -1381,7 +1381,7 @@ std::string Store::ImportRootTx(uint64_t size, const std::vector<ChunkRef> &chun
     std::map<uint64_t, std::vector<const ChunkRef *>> pages;
     uint64_t next = 0;
     for (auto &ref : chunks) {
-        if (ref.chunk < next || ref.chunk * CHUNK >= size || ref.object.size() != 64)
+        if (ref.chunk < next || ref.chunk >= ChunkCount(size) || ref.object.size() != 64)
             throw std::runtime_error("[differential:corrupt_data] Corrupt imported chunk map");
         next = ref.chunk + 1;
         pages[ref.chunk / PAGE_CHUNKS].push_back(&ref);
@@ -1455,10 +1455,10 @@ uint64_t Store::ReadRootImpl(Reader &reader, const std::string &root, void *data
     RootInfo info{};
     if (!FindRoot(reader.db, root, info))
         throw std::runtime_error("[differential:not_found] File/root not found");
-    if (p >= info.size)
+    if (n == 0 || p >= info.size)
         return 0;
     n = std::min(n, info.size - p);
-    auto first = p / CHUNK, last = (p + n - 1) / CHUNK;
+    auto first = ChunkIndex(p), last = ChunkIndex(p + n - 1);
     std::map<uint64_t, std::string> map;
     {
         Timer lookup(Metric::ExtentLookup);
@@ -1481,14 +1481,14 @@ uint64_t Store::ReadRootImpl(Reader &reader, const std::string &root, void *data
     auto out = static_cast<unsigned char *>(data);
     uint64_t done = 0;
     while (done < n) {
-        auto pos = p + done, index = pos / CHUNK;
-        auto take = std::min(n - done, CHUNK - pos % CHUNK);
+        auto pos = p + done, index = ChunkIndex(pos);
+        auto take = std::min(n - done, ChunkLength(index) - ChunkPosition(pos));
         auto found = map.find(index);
         auto remote = found == map.end() ? fetched.end() : fetched.find(found->second);
         auto bytes = found == map.end()      ? ZeroChunk()
                      : remote != fetched.end() ? remote->second
                                                : ObjectBytes(reader, found->second, pool);
-        std::memcpy(out + done, bytes->data() + pos % CHUNK, take);
+        std::memcpy(out + done, bytes->data() + ChunkPosition(pos), take);
         done += take;
     }
     return n;

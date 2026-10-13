@@ -45,14 +45,14 @@ int main() {
         return 2;
     try {
         constexpr uint64_t CHUNK = Store::CHUNK;
-        // The published image (another host): two full chunks, a hole, and a partial chunk on the
+        // The published image (another host): a header chunk, a data chunk, a hole, and a partial chunk on the
         // second manifest page.
         Store source(source_path);
         auto image = source.Open("image", true, false, false);
-        std::vector<unsigned char> a(CHUNK, 'a'), b(CHUNK, 'b'), c(1000, 'c');
+        std::vector<unsigned char> a(Store::HEADER, 'a'), b(CHUNK, 'b'), c(1000, 'c');
         source.Write(image.id, a.data(), a.size(), 0);
-        source.Write(image.id, b.data(), b.size(), CHUNK);
-        source.Write(image.id, c.data(), c.size(), 300 * CHUNK);
+        source.Write(image.id, b.data(), b.size(), Store::HEADER);
+        source.Write(image.id, c.data(), c.size(), Store::ChunkOffset(300));
         auto root = source.Seal(image.id);
         auto chunks = source.RootChunks(root.id, 0, 301);
         Check(chunks.size() == 3, "source chunk map");
@@ -118,12 +118,12 @@ int main() {
         auto file = store->Open(branch.FileName(), false, false, false);
         std::vector<unsigned char> read(3 * CHUNK);
         Check(store->Read(file.id, read.data(), read.size(), 0) == read.size(), "read live file");
-        Check(std::equal(a.begin(), a.end(), read.begin()) && std::equal(b.begin(), b.end(), read.begin() + CHUNK) &&
-                  std::all_of(read.begin() + 2 * CHUNK, read.end(), [](unsigned char x) { return x == 0; }),
+        Check(std::equal(a.begin(), a.end(), read.begin()) && std::equal(b.begin(), b.end(), read.begin() + Store::HEADER) &&
+                  std::all_of(read.begin() + Store::HEADER + CHUNK, read.end(), [](unsigned char x) { return x == 0; }),
               "remote bytes and hole");
         Check(!batches.empty() && batches.back() == 2, "two remote chunks in one fetch");
         std::vector<unsigned char> tail(1000);
-        store->ReadRoot(root.id, tail.data(), tail.size(), 300 * CHUNK);
+        store->ReadRoot(root.id, tail.data(), tail.size(), Store::ChunkOffset(300));
         Check(tail == c, "remote partial chunk through the root");
         store->Verify();
 
@@ -196,7 +196,7 @@ int main() {
         auto big = source.Open("big", true, false, false);
         for (uint64_t chunk = 0; chunk < 40; chunk++) {
             std::vector<unsigned char> bytes(CHUNK, static_cast<unsigned char>(chunk + 1));
-            source.Write(big.id, bytes.data(), bytes.size(), chunk * CHUNK);
+            source.Write(big.id, bytes.data(), bytes.size(), Store::HEADER + chunk * CHUNK);
         }
         auto big_root = source.Seal(big.id);
         RemoteHead large = head;
@@ -206,7 +206,7 @@ int main() {
         large.root = big_root.id;
         large.snapshot = 30;
         large.size = big_root.size;
-        large.chunks = source.RootChunks(big_root.id, 0, 40);
+        large.chunks = source.RootChunks(big_root.id, 0, 41);
         large.locations.clear();
         for (size_t i = 0; i < large.chunks.size(); i++)
             large.locations[large.chunks[i].object] = RemoteChunk{std::string(64, 'c'), id, i};
@@ -218,7 +218,7 @@ int main() {
         int context = 0;
         std::vector<unsigned char> block(4 * CHUNK);
         for (uint64_t offset = 0; offset < 40 * CHUNK; offset += block.size()) {
-            Check(store->Read(big_file.id, block.data(), block.size(), offset, &context) == block.size(), "read big");
+            Check(store->Read(big_file.id, block.data(), block.size(), Store::HEADER + offset, &context) == block.size(), "read big");
             Check(block[0] == static_cast<unsigned char>(offset / CHUNK + 1) && block.back() == block[3 * CHUNK],
                   "read-ahead keeps reads correct");
         }
@@ -228,7 +228,7 @@ int main() {
         auto without = counters[size_t(Counter::RemoteObjectAheadBytes)].load();
         Store::DropCaches();
         for (uint64_t offset = 0; offset < 40 * CHUNK; offset += block.size())
-            store->Read(big_file.id, block.data(), block.size(), offset);
+            store->Read(big_file.id, block.data(), block.size(), Store::HEADER + offset);
         Check(counters[size_t(Counter::RemoteObjectAheadBytes)].load() == without &&
                   *std::max_element(batches.begin(), batches.end()) <= 4,
               "no read-ahead without a reader context");

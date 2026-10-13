@@ -9,6 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Native DuckDB block prefetch for S3 exports, with local-handle classification preserved.
+- Full upstream SQLLogicTest discovery with a native baseline, harness checks and an expanded
+  PR profile in CI, manual exclusion audits and manual full-suite execution with optional sharding.
+  No default per-test time limit.
+- Local-only spill-directory validation and out-of-core execution coverage.
+- Header-aligned chunks: a 12 KiB first chunk followed by 64 KiB chunks, all stored as
+  padded 64 KiB objects. The sole unpublished store/export format remains format 1.
+
 - Versioned native DuckDB databases over a durable, content-addressed differential store:
   snapshots with commit metadata, branches, clones, restore, branch deletion and snapshot expiry.
 - Every function is discoverable from SQL: `duckdb_functions()` returns its description, an

@@ -1,0 +1,2010 @@
+{
+  "duckdb_commit": "069cc9f9b5be802405797faecc284961b07c70ef",
+  "include": [
+    "test/**/*.test",
+    "test/**/*.test_slow",
+    "test/**/*.test_coverage"
+  ],
+  "skips": [
+    {
+      "path": "test/common/test_local_file_urls.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 72 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/extension/autoloading_encodings.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/extension/duckdb_extensions.test",
+      "category": "upstream_baseline_failure",
+      "reason": "Line 35 expects STATICALLY_LINKED after INSTALL json, but this pinned build reports REPOSITORY. Reproduced on both attachments and on a plain native host without either test bridge or Differential; duckdb_extensions.cpp derives the reported mode from the installed metadata.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column install_mode(index 2) REPOSITORY <> STATICALLY_LINKED"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column install_mode(index 2) REPOSITORY <> STATICALLY_LINKED"
+        }
+      }
+    },
+    {
+      "path": "test/extension/test_loadable_optimizer.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 9. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/extension/update_extensions.test",
+      "category": "upstream_baseline_failure",
+      "reason": "Line 28 runs UPDATE EXTENSIONS under enable_verification. The pinned LogicalOperator deserializer has no LOGICAL_UPDATE_EXTENSIONS case. Reproduced on both attachments and a plain native host without the bridge or Differential; no core patch or weakened query verification is applied.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Serialization Error: Unsupported type for deserialization of LogicalOperator!"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Serialization Error: Unsupported type for deserialization of LogicalOperator!"
+        }
+      }
+    },
+    {
+      "path": "test/extension/update_extensions_ci.test",
+      "category": "external_fixture",
+      "reason": "Upstream line 10 requires RUN_EXTENSION_UPDATE_TEST; this tests a separately prepared extension-installation repository/fixture, not provided by the storage-comparison build.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require-env RUN_EXTENSION_UPDATE_TEST: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require-env RUN_EXTENSION_UPDATE_TEST: 1"
+        }
+      }
+    },
+    {
+      "path": "test/fuzzer/duckfuzz/vector_type.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/fuzzer/pedro/another_binder_error.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/fuzzer/pedro/incomplete_checkpoint.test",
+      "category": "attachment_error_contract",
+      "reason": "Line 32 expects a primary-database FATAL checkpoint-abort error. Both native and Differential attachments instead report the native IO checkpoint failure and invalidate the attachment.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "IO Error: Checkpoint failed for database \"incomplete_checkpoint\"."
+        },
+        "differential": {
+          "status": "failed",
+          "message": "IO Error: Checkpoint failed for database \"incomplete_checkpoint\"."
+        }
+      }
+    },
+    {
+      "path": "test/fuzzer/sqlsmith/statistics_assertion_trigger.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 6. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/fuzzer/sqlsmith/subquery_binding_error.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 6. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/optimizer/joins/test_tpcds_pushdown.test",
+      "category": "upstream_empty",
+      "reason": "The pinned upstream file contains only name/group comments and no executable test commands.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/optimizer/pushdown/parquet_or_pushdown.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 8. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/parquet/encrypted_parquet.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 7. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/aggregate/distinct/grouped/distinct_grouping_tpch.test_slow",
+      "category": "excessive_disk_space",
+      "execution": "never",
+      "reason": "Excluded at the owner's request for excessive disk use: upstream line 8 explicitly requires 40 GB free disk for distinct grouping over TPC-H with external/parallel verification. Other TPC-H, grouping and DISTINCT tests remain in coverage.",
+      "source_sha256": "b9545c80a6fabc6b19c91d7783e154363a4778c50e43a2f91f727e644fae6757"
+    },
+    {
+      "path": "test/sql/alter/add_pk/test_add_pk_attach.test",
+      "category": "native_path_reopen",
+      "reason": "Line 29 explicitly reattaches the original native host filename after detaching the tested attachment. That host is an identity marker, so its native reopen cannot see the tested table; the same failure occurs in the native comparison.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Catalog Error: Table with name test does not exist!"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Catalog Error: Table with name test does not exist!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/attach/attach_default_database_case.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 7 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/attach/attach_encryption_fallback_readonly.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/attach/attach_no_wal_writes_mode.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/attach/attach_replay_with_no_wal_writes.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/catalog/dependencies/test_concurrent_index_creation.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/catalog/sequence/test_duckdb_sequences.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 4 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/csv/14874.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/csv/csv_windows_mixed_separators.test",
+      "category": "unsupported_platform",
+      "reason": "Upstream line 5 requires Windows path/pipe semantics. Differential targets Linux and macOS only.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require windows: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require windows: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/csv/overwrite/test_overwrite_pipe_windows.test",
+      "category": "unsupported_platform",
+      "reason": "Upstream line 8 requires Windows path/pipe semantics. Differential targets Linux and macOS only.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require windows: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require windows: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/csv/parallel/csv_parallel_clickbench.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/csv/test_big_compressed.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this compressed-CSV test with mode skip at line 7.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/csv/test_lineitem_gz.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this lineitem gzip test with mode skip at line 6.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/parquet/afl.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables the AFL Parquet fixture test with mode skip at line 5.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/parquet/encryption/arrow_compatibility.test",
+      "category": "requires_memory_database",
+      "reason": "Line 8 requires noforcestorage because Parquet encryption keys are not persisted across restarts. Both compared backends use durable storage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/parquet/parquet2strings.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this binary-string Parquet test with mode skip at line 20.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/parquet/parquet_encryption.test",
+      "category": "requires_memory_database",
+      "reason": "Line 8 requires noforcestorage because Parquet encryption keys are not persisted across restarts. Both compared backends use durable storage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/create/create_objects_readonly.test",
+      "category": "readonly_snapshot_contract",
+      "reason": "Line 12 reopens a writable native file read-only without creating a public snapshot. Differential READ_ONLY requires a published snapshot; creating one implicitly would change the product contract. Dedicated snapshot tests cover read-only operations.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Branch \"main\" has no snapshot to attach READ_ONLY"
+        }
+      }
+    },
+    {
+      "path": "test/sql/delete/in_memory_bulk_delete.test_slow",
+      "category": "in_memory_accounting",
+      "reason": "Line 26 expects exactly 262144 bytes under IN_MEMORY_TABLE; persistent storage reports zero. DuckDB test/configs/force_storage.json individually excludes this same file for its memory-accounting assumption.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column memory_usage_bytes(index 1) 0 <> 262144"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column memory_usage_bytes(index 1) 0 <> 262144"
+        }
+      }
+    },
+    {
+      "path": "test/sql/export/export_types.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this export-types test with mode skip at line 6.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/filter/test_zonemap.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this zonemap test with mode skip at line 7.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/function/autocomplete/create_secret.test",
+      "category": "upstream_empty",
+      "reason": "The pinned file contains only name/group comments, with no executable SQL or assertions.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/function/string/parse_path_windows.test",
+      "category": "unsupported_platform",
+      "reason": "Line 8 requires Windows path semantics; Differential supports Linux and macOS.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require windows: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require windows: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/function/variant/variant_typeof.test",
+      "category": "requires_memory_database",
+      "reason": "Line 5 requires no_force_storage; this VARIANT typeof test explicitly does not permit persistent storage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require no_force_storage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require no_force_storage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/index/art/constraints/test_art_tx_same_row_id.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this ART row-ID transaction test with mode skip at line 6.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/index/art/memory/test_art_linear.test_slow",
+      "category": "requires_memory_database",
+      "reason": "Line 5 requires noforcestorage. The linear ART-memory growth assertions require an in-memory database.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/index/art/storage/test_art_readonly.test",
+      "category": "readonly_snapshot_contract",
+      "reason": "Line 16 reopens a live native file read-only without creating a public snapshot. Differential READ_ONLY requires a published snapshot; the harness must not create one on behalf of the test.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Branch \"main\" has no snapshot to attach READ_ONLY"
+        }
+      }
+    },
+    {
+      "path": "test/sql/index/art/storage/test_upsert_reclaim_space.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this space-reclamation test with mode skip at line 5.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/index/art/vacuum/test_art_vacuum_integers.test_slow",
+      "category": "in_memory_accounting",
+      "reason": "Line 107 assumes in-memory ART-buffer reclamation decreases pragma_database_size memory usage. Native persistent storage fails the same comparison; DuckDB test/configs/force_storage.json individually excludes this file for its memory-accounting assumption.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column (mem_to_bytes(\"current\".memory_usage) < db_size.usage)(index 1) 0 <> 1"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column (mem_to_bytes(\"current\".memory_usage) < db_size.usage)(index 1) 0 <> 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/index/art/vacuum/test_art_vacuum_strings.test_slow",
+      "category": "in_memory_accounting",
+      "reason": "Line 59 assumes in-memory ART allocation is between 2x and 4x a transient string table. Native persistent storage fails the same ratio; DuckDB test/configs/force_storage.json individually excludes this file for its memory-accounting assumption.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column ((mem_to_bytes(\"current\".memory_usage) > (2 * base.usage)) AND (mem_to_bytes(\"current\".memory_usage) < (4 * base.usage)))(index 1) 0 <> 1"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column ((mem_to_bytes(\"current\".memory_usage) > (2 * base.usage)) AND (mem_to_bytes(\"current\".memory_usage) < (4 * base.usage)))(index 1) 0 <> 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/enable_logging_file_no_path.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the default log-file path test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/file_system_logging_attach.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 10 requires noforcestorage for the attachment filesystem log records test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/file_system_logging_attach_deadlock.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 10 requires noforcestorage for the attachment filesystem logging deadlock regression test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/http_log_timing.test",
+      "category": "requires_memory_database",
+      "reason": "Line 5 explicitly requires noforcestorage. This HTTP-log timing test does not permit a persistent database, while both comparison backends use durable storage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the logging controls and records test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging_buffer_size.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the log-buffer sizing test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging_call_functions.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the logging table-function calls test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging_context_ids.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the logging context IDs test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging_csv.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the CSV logging storage test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging_file_bind_replace.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the log-file binding replacement test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/logging_types.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 4 requires noforcestorage for the log types test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/test_logging_function.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the logging scalar function test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/logging/test_logging_function_large.test_slow",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage for the large logging scalar-function payloads test. Both comparison backends use durable initial storage; the unmodified test explicitly rejects that configuration.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/parallelism/interquery/concurrent_read_during_vacuum_rebuild.test_slow",
+      "category": "upstream_race",
+      "reason": "Line 70 assumes a full checkpoint compacted row groups during concurrent readers. DuckDB skips vacuum during a concurrent checkpoint (src/storage/table/row_group_collection.cpp:1346), so rowid may correctly stay 245760 rather than 122880 on either backend. Other vacuum-rebuild tests verify deterministic compaction.",
+      "intermittent": true,
+      "evidence": "Eight repetitions on macOS arm64 with the upstream 500000-row threshold: native passed 3 and failed 5; Differential passed 1 and failed 7. Both failures have the same rowid mismatch.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column rowid(index 3) 245760 <> 122880"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column rowid(index 3) 245760 <> 122880"
+        }
+      }
+    },
+    {
+      "path": "test/sql/parallelism/interquery/parallel_dependencies_catalog_operations.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 6, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/parallelism/intraquery/depth_first_evaluation.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/parser/table_at_clause.test",
+      "category": "extension_contract",
+      "reason": "Line 11 expects the native catalog to reject AT time travel as unsupported. Differential deliberately supports AT and reports the absence of a retained snapshot instead; changing that behavior would contradict the public snapshot API.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "No retained snapshot at or before timestamp on this branch"
+        }
+      }
+    },
+    {
+      "path": "test/sql/peg_parser/transformer/load_statement.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/pragma/pragma_database_size_readonly.test",
+      "category": "extension_contract",
+      "reason": "PRAGMA database_size: the source reopens a just-written native file READ_ONLY without creating a public snapshot. Differential READ_ONLY intentionally addresses retained snapshots. The bridge must not silently insert a checkpoint or snapshot into the workload.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Branch \"main\" has no snapshot to attach READ_ONLY"
+        }
+      }
+    },
+    {
+      "path": "test/sql/pragma/profiling/test_attach_and_checkpoint_latency.test",
+      "category": "upstream_storage_guard",
+      "reason": "test attach and checkpoint latency. Upstream line 9 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/pragma/profiling/test_commit_write_wal_latency_and_count.test",
+      "category": "upstream_storage_guard",
+      "reason": "Measure COMMIT write latency, then measure WAL replay on ATTACH. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/pragma/profiling/test_custom_profiling_memory_and_temp_dir.test_slow",
+      "category": "in_memory_accounting",
+      "reason": "Line 32 requires nonzero temporary spill while creating a 100-million-row hash table under a 0.7 GB limit. Both persistent attachments write table data to their database files instead, so system_peak_temp_dir_size is zero. DuckDB test/configs/force_storage.json excludes this exact path because it measures in-memory storage usage; other profiler and spill tests remain covered.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column (system_peak_temp_dir_size != 0)(index 2) 0 <> true"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column (system_peak_temp_dir_size != 0)(index 2) 0 <> true"
+        }
+      }
+    },
+    {
+      "path": "test/sql/pragma/profiling/test_profiling_fs.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test profiling file system reads and writes.. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/pragma/test_pragma_database_list.test",
+      "category": "requires_memory_database",
+      "reason": "Line 16 requires the memory catalog to have a NULL file path after load. Both comparison backends are persistent attachments with real storage paths, so this exact in-memory metadata expectation cannot hold.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column file(index 2)"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column file(index 2)"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/basic_sample_tests.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 4; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/sample_stores_rows_from_later_on.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/table_sample_converts_to_block_sample.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/table_sample_is_stored.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/test_sample_is_destroyed_on_updates.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/test_sample_types.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/sample/table_samples/test_table_sample_errors.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/create_secret_expression.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test secrets with expressions as params. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/create_secret_filesystem_logging.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes SET secret_directory='__TEST_DIR__/secret_fs_logging'; after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/create_secret_hffs_autoload.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes set allow_persistent_secrets=false; after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/create_secret_persistence_no_client_context.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes set secret_directory='__TEST_DIR__/create_secret_persistence_no_client_context' after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/secret_compatibility_http.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes set secret_directory='./data/secrets/http' after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/settings/test_disabled_local_filesystem_metadata.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes SET secret_directory='__TEST_DIR__/disabled_fs_secrets'; after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/settings/test_disabled_local_filesystem_secrets.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes SET secret_directory='__TEST_DIR__/disabled_fs_secrets'; after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/settings/test_external_access_metadata.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "Line 13 expects the first duckdb_secrets() call to initialize local secret storage after external access has been disabled and therefore fail. Differential ATTACH already initializes that storage through its required default-secret lookup; the metadata query succeeds without filesystem access. This is DuckDB SecretManager::InitializeSecrets behavior, not a bypass of a filesystem read.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Query unexpectedly succeeded!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/settings/test_external_access_secrets.test",
+      "category": "secret_manager_lifecycle",
+      "reason": "The source executes SET secret_directory='__TEST_DIR__/external_access_secrets'; after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/attach/attach_invalidation_default_db.test",
+      "category": "primary_database_contract",
+      "reason": "The test requires a failed checkpoint on the original host database to invalidate the entire instance with FATAL Error. The storage bridge uses an attached database on both sides; DuckDB reports an attachment-scoped IO Error and leaves sibling attachments usable. The source explicitly tests the original-host distinction.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "IO Error: Checkpoint failed for database \"attach_inval_default_main_before_header\". The database has been invalidated."
+        },
+        "differential": {
+          "status": "failed",
+          "message": "IO Error: Checkpoint failed for database \"attach_inval_default_main_before_header\". The database has been invalidated."
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/buffer_manager_temp_dir.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test setting of the temporary directory. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/checkpoint/indexed_table_delete_insert_fragmentation.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test that delete+insert cycles on indexed tables do not create new row groups excessively.. Upstream line 6 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/checkpoint/initial_database_autocheckpoint_failure.test",
+      "category": "primary_database_contract",
+      "reason": "Line 24 requires a FATAL Error after autocheckpoint failure on the original host. Both comparison backends use an attachment and get DuckDB's durable-COMMIT, attachment-scoped IO Error instead. Do not change checkpoint ordering or durability to match an original-host assertion.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "IO Error: Transaction COMMIT succeeded and is durable, but the autocheckpoint failed."
+        },
+        "differential": {
+          "status": "failed",
+          "message": "IO Error: Transaction COMMIT succeeded and is durable, but the autocheckpoint failed."
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/alp/alp_uncompressed_mode_regression.test_slow",
+      "category": "native_path_reopen",
+      "reason": "After two load commands, line 107 explicitly ATTACHes the first native host filename to compare v1.4.0 and v1.5.0 compression metrics. Both bridge modes store table data in a separate attachment; the original host contains only the identity marker. Reopening that native path therefore cannot expose v1_4_0_metrics without rewriting the source ATTACH. The independent ALP version and stress tests remain covered.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Catalog Error: Table with name v1_4_0_metrics does not exist!"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Catalog Error: Table with name v1_4_0_metrics does not exist!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/alprd/alprd_uncompressed_mode_regression.test_slow",
+      "category": "native_path_reopen",
+      "reason": "After two load commands, line 107 explicitly ATTACHes the first native host filename to compare v1.4.0 and v1.5.0 compression metrics. Both bridge modes store table data in a separate attachment; the original host contains only the identity marker. Reopening that native path therefore cannot expose v1_4_0_metrics without rewriting the source ATTACH. The independent ALPRD version and stress tests remain covered.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Catalog Error: Table with name v1_4_0_metrics does not exist!"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Catalog Error: Table with name v1_4_0_metrics does not exist!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/roaring/roaring_analyze_array.test",
+      "category": "upstream_storage_guard",
+      "reason": "Check the produced (final_)analyze result. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/roaring/roaring_analyze_bitset.test",
+      "category": "upstream_storage_guard",
+      "reason": "Check the produced (final_)analyze result. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/roaring/roaring_analyze_run.test",
+      "category": "upstream_storage_guard",
+      "reason": "Check the produced (final_)analyze result. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/roaring/roaring_bool_analyze_array.test",
+      "category": "upstream_storage_guard",
+      "reason": "Check the produced (final_)analyze result. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/roaring/roaring_bool_analyze_bitset.test",
+      "category": "upstream_storage_guard",
+      "reason": "Check the produced (final_)analyze result. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/compression/roaring/roaring_bool_analyze_run.test",
+      "category": "upstream_storage_guard",
+      "reason": "Check the produced (final_)analyze result. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/concurrent_table_insertion.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 10, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/concurrent_wal/concurrent_checkpoint_abort.test_slow",
+      "category": "primary_database_contract",
+      "reason": "The source explicitly requires instance-wide invalidation when a checkpoint fails on the original primary database. Both comparison modes use an attachment instead; subsequent concurrent inserts get DuckDB's attachment-scoped checkpoint-invalidation IO Error, rather than the expected previous-fatal-error message. Other checkpoint-abort and concurrent WAL cases remain covered.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Database \"main_db\" has been invalidated because checkpointing failed. Detach and reattach it before using it again."
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Database \"main_db\" has been invalidated because checkpointing failed. Detach and reattach it before using it again."
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/encryption/temp_files/encrypted_offloading_block_files.test_slow",
+      "category": "excessive_disk_space",
+      "execution": "never",
+      "reason": "Excluded at the owner's request for excessive disk use: lines 7-27 retain separate GCM and CTR databases with 500 million random DOUBLE values each (about 8 GB of incompressible payload in total), plus row IDs, database overhead and 1 GB of spill. Both local probes consumed several GiB and were stopped before filling the disk. Other encrypted spill, join, WAL and cipher tests remain in coverage.",
+      "source_sha256": "385f8cc997b0ebddd54f2fc2242cbb3c7baded4a381c33e865eda18a4d17b633"
+    },
+    {
+      "path": "test/sql/storage/encryption/wal/encrypted_wal_lazy_creation.test",
+      "category": "requires_memory_database",
+      "reason": "Line 12 requires noforcestorage before checking lazy encrypted WAL creation. The unmodified test explicitly disallows persistent initial storage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay.test",
+      "category": "upstream_storage_guard",
+      "reason": "Replay optimistic row groups for replacements on a table with a unique index. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay_desync.test",
+      "category": "upstream_storage_guard",
+      "reason": "Replayed optimistic row groups remain reachable through their unique index. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/temp_directory/max_swap_space_error.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test the maximum swap space.. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/temp_directory/offloading_block_files.test_slow",
+      "category": "excessive_disk_space",
+      "execution": "never",
+      "reason": "Excluded under the owner's excessive-disk policy: lines 13-29 create 500 million random DOUBLE values with row IDs, then allow another 1 GB of spill. The source documents a 3.2 GiB database at the default block size (7.4 GiB with smaller blocks). The incomplete Differential probe already occupied 4.3 GiB before the local disk guard stopped it. Other spill and compression tests remain covered.",
+      "source_sha256": "39d7016699bea94fbfe9f671d03cb439ba9ecb877ec3eb957d90ec4e144f148c"
+    },
+    {
+      "path": "test/sql/storage/types/variant/variant_extract_stats.test",
+      "category": "upstream_storage_guard",
+      "reason": "variant extract stats. Upstream line 4 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/wal/test_wal_bc.test",
+      "category": "native_import_wal_contract",
+      "reason": "The v0.9.2 fixture includes wal_test_092.db.wal and tests native WAL replay. Byte-preserving Differential import requires an offline checkpoint-consistent source with no WAL sidecars. Checkpointing the fixture before import would remove the WAL state under test.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Import requires a checkpoint-consistent source with no WAL sidecars"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/wal/wal_autocheckpoint_entries.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test automatic checkpoint when WAL entry count reaches or exceeds threshold. Upstream line 7 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/storage/wal/wal_size_unaligned_appends.test_slow",
+      "category": "native_path_inspection",
+      "reason": "Line 31 uses read_blob on the original native host filename plus .wal to assert a physical WAL size. The host contains only the bridge identity marker; the tested native attachment and Differential virtual file both live elsewhere, so both modes return no blob rows. Preserving this exact assertion would require rewriting the upstream SQL or fabricating a native sidecar. Other WAL replay, unaligned row-group and extension durability tests remain covered.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Wrong row count in query! (test/sql/storage/wal/wal_size_unaligned_appends.test_slow:31)! Expected 1 rows, but got 0 rows"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Wrong row count in query! (test/sql/storage/wal/wal_size_unaligned_appends.test_slow:31)! Expected 1 rows, but got 0 rows"
+        }
+      }
+    },
+    {
+      "path": "test/sql/subquery/scalar/test_correlated_side_effects.test",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 7; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/table_function/duckdb_databases.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test duckdb_databases function. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/tpcds/dsdgen_readonly.test",
+      "category": "extension_contract",
+      "reason": "TPC-DS generator write protection: the source reopens a just-written native file READ_ONLY without creating a public snapshot. Differential READ_ONLY intentionally addresses retained snapshots. The bridge must not silently insert a checkpoint or snapshot into the workload.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Branch \"main\" has no snapshot to attach READ_ONLY"
+        }
+      }
+    },
+    {
+      "path": "test/sql/tpch/dbgen_readonly.test",
+      "category": "extension_contract",
+      "reason": "TPC-H generator write protection: the source reopens a just-written native file READ_ONLY without creating a public snapshot. Differential READ_ONLY intentionally addresses retained snapshots. The bridge must not silently insert a checkpoint or snapshot into the workload.",
+      "expected": {
+        "native": {
+          "status": "passed"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Branch \"main\" has no snapshot to attach READ_ONLY"
+        }
+      }
+    },
+    {
+      "path": "test/sql/tpch/tpch_power_test.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 6, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/transactions/test_alter_sequence_ownership_conflict.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test write-write conflict with a DROP and an ALTER. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/transactions/test_alter_sequence_ownership_conflict2.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test DROP and OWNED BY transactionality | ownership commits first. Upstream line 5 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/types/bignum/test_int_varchar_bignum_compatibility.test_slow",
+      "category": "upstream_disabled",
+      "reason": "Upstream disables this file with mode skip at line 6, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/sql/types/geo/geometry_stats_prune.test",
+      "category": "upstream_storage_guard",
+      "reason": "geometry stats prune. Upstream line 6 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/types/geo/geometry_stats_prune_null.test",
+      "category": "upstream_storage_guard",
+      "reason": "Test that the && filter is not pruned away for geometry columns containing NULLs. Upstream line 36 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/types/geo/geometry_stats_prune_shredded.test",
+      "category": "upstream_storage_guard",
+      "reason": "geometry stats prune shredded. Upstream line 8 explicitly requires noforcestorage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/types/variant/variant_map_to_variant_filter.test",
+      "category": "upstream_storage_guard",
+      "reason": "MAP(VARCHAR, VARIANT) -> VARIANT must read the selected rows under a filter. Upstream line 6 explicitly requires no_force_storage; this unmodified test rejects both persistent comparison configurations. Its in-memory/fixture-specific contract is not replaced by a storage-adapter expectation.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require no_force_storage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require no_force_storage: 1"
+        }
+      }
+    }
+  ],
+  "pr_include": [
+    "test/sql/attach/**/*.test",
+    "test/sql/catalog/**/*.test",
+    "test/sql/constraints/**/*.test",
+    "test/sql/alter/**/*.test",
+    "test/sql/storage/**/*.test",
+    "test/sql/index/**/*.test",
+    "test/sql/transactions/**/*.test",
+    "test/sql/insert/**/*.test",
+    "test/sql/delete/**/*.test",
+    "test/sql/update/**/*.test",
+    "test/sql/upsert/**/*.test",
+    "test/sql/merge/**/*.test",
+    "test/sql/prepared/**/*.test",
+    "test/sql/types/**/*.test",
+    "test/sql/aggregate/**/*.test",
+    "test/sql/join/**/*.test",
+    "test/sql/window/**/*.test",
+    "test/sql/subquery/**/*.test"
+  ],
+  "requirements": {
+    "test/sql/aggregate/aggregates/test_bigint_avg.test": {
+      "reason": "The numeric result requires an extended-precision long double, unavailable on macOS arm64; execute on platforms that provide it.",
+      "directives": [
+        "require longdouble"
+      ]
+    },
+    "test/sql/function/list/aggregates/avg.test": {
+      "reason": "The final precision assertions require an extended-precision long double; execute the complete file where available.",
+      "directives": [
+        "require longdouble"
+      ]
+    },
+    "test/sql/index/art/memory/test_art_varchar.test_slow": {
+      "reason": "Builds an ART for 7.2 million strings without spilling; upstream requires 16 GB RAM.",
+      "directives": [
+        "require ram 16gb"
+      ]
+    },
+    "test/sql/join/iejoin/test_iejoin_sort_tasks.test_slow": {
+      "reason": "The 10-million-row IEJoin explicitly sets an 8 GB memory limit and requires 8 GB RAM.",
+      "directives": [
+        "require ram 8gb"
+      ]
+    },
+    "test/sql/sample/test_sample_too_big.test": {
+      "reason": "Exercises huge reservoir sample boundaries; upstream requires 16 GB RAM.",
+      "directives": [
+        "require ram 16gb"
+      ]
+    },
+    "test/sql/storage/compression/zstd/zstd_giant_string.test_slow": {
+      "reason": "Inserts 500 ten-megabyte strings into an explicit native attachment; upstream requires 16 GB RAM.",
+      "directives": [
+        "require ram 16gb"
+      ]
+    },
+    "test/sql/types/nested/array/array_large.test": {
+      "reason": "Large nested-array verification requires 8 GB RAM in the upstream test.",
+      "directives": [
+        "require ram 8gb"
+      ]
+    },
+    "test/sql/sample/same_seed_same_sample_vec_size_2.test": {
+      "reason": "Upstream requires a DuckDB build with vector size exactly 2; the standard extension build uses 2048. Run normally whenever this source guard is satisfied.",
+      "directives": [
+        "require exact_vector_size 2"
+      ]
+    },
+    "test/sql/storage/compact_block_size/compact_vector_size.test": {
+      "reason": "Upstream requires a DuckDB build with vector size exactly 512; the standard extension build uses 2048. Run normally whenever this source guard is satisfied.",
+      "directives": [
+        "require exact_vector_size 512"
+      ]
+    }
+  },
+  "configs": {
+    "test/sql/storage/compact_block_size/create_table_compression.test": {
+      "reason": "Run the upstream 16 KiB block-size variant instead of skipping its block-size requirement.",
+      "options": {
+        "block_size": 16384
+      }
+    },
+    "test/sql/storage/compact_block_size/insertion_order_odd_batches.test": {
+      "reason": "Run odd-sized batch inserts with the 16 KiB blocks required by this file.",
+      "options": {
+        "block_size": 16384
+      }
+    },
+    "test/sql/index/art/memory/test_art_varchar.test_slow": {
+      "reason": "Its 16 GB host requirement and disabled spilling need a larger memory allowance than the ordinary 1 GB harness limit.",
+      "settings": {
+        "memory_limit": "8GB"
+      }
+    },
+    "test/sql/parallelism/interquery/concurrent_read_during_vacuum_rebuild.test_slow": {
+      "reason": "Use the 500000-row threshold from DuckDB test/configs/vacuum_rebuild_indexes_force_storage.json, only for this test requiring index rebuilding.",
+      "settings": {
+        "vacuum_rebuild_indexes": "500000"
+      }
+    },
+    "test/sql/pragma/profiling/test_cumulative_vacuum_time.test_slow": {
+      "reason": "Use the 500000-row threshold from DuckDB test/configs/vacuum_rebuild_indexes_force_storage.json, only for this test requiring index rebuilding.",
+      "settings": {
+        "vacuum_rebuild_indexes": "500000"
+      }
+    },
+    "test/sql/storage/vacuum/vacuum_rebuild_indexes.test_slow": {
+      "reason": "Use the 500000-row threshold from DuckDB test/configs/vacuum_rebuild_indexes_force_storage.json, only for this test requiring index rebuilding.",
+      "settings": {
+        "vacuum_rebuild_indexes": "500000"
+      }
+    },
+    "test/sql/storage/vacuum/vacuum_rebuild_indexes_attach_overrides_global.test_slow": {
+      "reason": "Use the 500000-row threshold from DuckDB test/configs/vacuum_rebuild_indexes_force_storage.json, only for this test requiring index rebuilding.",
+      "settings": {
+        "vacuum_rebuild_indexes": "500000"
+      }
+    },
+    "test/sql/storage/vacuum/vacuum_rebuild_indexes_threshold.test_slow": {
+      "reason": "Use the 500000-row threshold from DuckDB test/configs/vacuum_rebuild_indexes_force_storage.json, only for this test requiring index rebuilding.",
+      "settings": {
+        "vacuum_rebuild_indexes": "500000"
+      }
+    },
+    "test/parquet/variant/variant_comparison.test": {
+      "reason": "Persistent VARIANT requires storage version v1.5.0 or later; use the latest-storage setting from DuckDB test/configs/latest_storage.json.",
+      "settings": {
+        "storage_compatibility_version": "latest"
+      }
+    },
+    "test/parquet/variant/variant_json_copy.test": {
+      "reason": "Persistent VARIANT requires storage version v1.5.0 or later; use the latest-storage setting from DuckDB test/configs/latest_storage.json.",
+      "settings": {
+        "storage_compatibility_version": "latest"
+      }
+    },
+    "test/parquet/variant/variant_small_decimal.test": {
+      "reason": "Persistent VARIANT requires storage version v1.5.0 or later; use the latest-storage setting from DuckDB test/configs/latest_storage.json.",
+      "settings": {
+        "storage_compatibility_version": "latest"
+      }
+    },
+    "test/sql/copy/csv/glob/read_csv_glob_crawl.test_slow": {
+      "reason": "Root-recursive glob does not traverse directory symlinks; copy the eight nested samename fixtures into the disposable working tree.",
+      "fixtures": [
+        "data/csv/glob/crawl"
+      ]
+    },
+    "test/sql/copy/parquet/writer/parquet_zstd_sequence.test_slow": {
+      "reason": "The large sequence LIST aggregate exceeds both 1 GB and 2 GB on both backends; allow 4 GB without changing the Parquet workload.",
+      "settings": {
+        "memory_limit": "4GB"
+      }
+    },
+    "test/sql/copy/csv/test_copy_gzip_large_block.test_slow": {
+      "settings": {
+        "memory_limit": "8GB"
+      },
+      "reason": "The >4 GiB gzip round-trip uses 20 MB CSV lines and multiple 305 MiB reader buffers; both native and Differential exhaust 1 GB, while 2 GB causes the CSV buffer manager to attempt an unsupported compressed-file seek. Keep the workload unchanged with an 8 GB allowance."
+    },
+    "test/sql/join/test_hash_join_many_columns.test_slow": {
+      "settings": {
+        "memory_limit": "4GB"
+      },
+      "reason": "The unmodified 20,000-column HUGEINT join requires more than the default 1 GB just to build its probe table; both storage backends fail allocation at 1 GB."
+    },
+    "test/extension/install_extension_httpfs.test": {
+      "preload": [
+        "httpfs"
+      ],
+      "reason": "The test changes extension_directory before require httpfs at line 49. Its line-8 comment explicitly permits httpfs to be preloaded; load the prepared dependency before it changes directories."
+    },
+    "test/sql/storage/types/variant/extension_types.test": {
+      "settings": {
+        "storage_compatibility_version": "latest"
+      },
+      "reason": "The test persists VARIANT columns containing extension types; native DuckDB rejects VARIANT with the default persistent storage v1.0. Use its latest-storage configuration on both backends."
+    },
+    "test/sql/storage/types/variant/index_fetch.test": {
+      "reason": "The test exercises storage statistics or values introduced in v1.5.0; both persistent attachments must use the current storage compatibility version.",
+      "settings": {
+        "storage_compatibility_version": "latest"
+      }
+    },
+    "test/sql/storage/types/variant/update.test": {
+      "reason": "The test exercises storage statistics or values introduced in v1.5.0; both persistent attachments must use the current storage compatibility version.",
+      "settings": {
+        "storage_compatibility_version": "latest"
+      }
+    },
+    "test/sql/types/geo/geometry_stats.test": {
+      "reason": "The test exercises storage statistics or values introduced in v1.5.0; both persistent attachments must use the current storage compatibility version.",
+      "settings": {
+        "storage_compatibility_version": "latest"
+      }
+    },
+    "test/sql/settings/reset/reset_threads.test": {
+      "reason": "The test compares the initial thread count with RESET threads. Let DuckDB choose its native default instead of the harness concurrency cap.",
+      "options": {
+        "max_threads": null
+      }
+    },
+    "test/sql/secrets/secret_compatibility_http.test": {
+      "reason": "Use disposable copies of the public cross-version secret fixtures with mode 0600, as required by data/secrets/README.md.",
+      "fixtures": [
+        "data/secrets/http"
+      ]
+    },
+    "test/sql/tpch/test_tpch_options.test_slow": {
+      "reason": "The source builds two SF1 copies in the primary catalog and two more in explicit in-memory schemas, then compares them with EXCEPT. A 4 GB allowance avoids unnecessary spill caused by the harness 1 GB default; no query or durability setting is changed.",
+      "settings": {
+        "memory_limit": "4GB"
+      }
+    },
+    "test/sql/storage/compression/zstd/zstd_giant_string.test_slow": {
+      "reason": "The source commits 500 ten-megabyte strings and explicitly requires 16 GB RAM. The scan requests a single 8 GiB decode buffer, exceeding both the default 1 GB and a trial 8 GB decimal cap. Allow 12 GB on hosts satisfying the upstream RAM guard.",
+      "settings": {
+        "memory_limit": "12GB"
+      }
+    }
+  }
+}

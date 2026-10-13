@@ -30,7 +30,7 @@ Each decision was made by the repository owner; changing one needs the owner's a
 - **Catalog functions and AT.** Catalog-scoped functions and `AT` time travel are
   provided, with bind-time reader pins. A `TYPE differential` secret was not adopted.
 
-- **Community extension (2026-10-11).** Published through duckdb/community-extensions:
+- **Community extension (2026-10-11).** Prepared for publication through duckdb/community-extensions:
   - built with DuckDB's C++ extension template; the standalone build is retired;
   - dependencies from vcpkg at `cd61e1e` (AWS SDK 1.11.820, SQLite 3.53.2, OpenSSL 3.6.3);
   - Linux amd64/arm64 and macOS amd64/arm64 only;
@@ -134,6 +134,8 @@ submodules, `extension_config.cmake`, `vcpkg.json`). See `README.md#development`
 make vcpkg && export VCPKG_TOOLCHAIN_PATH=$PWD/build/vcpkg/scripts/buildsystems/vcpkg.cmake GEN=ninja
 make release && make test                 # community-CI equivalent: SQL logic tests in test/sql
 make integration && make test_integration # hooks build; C++ unit tests + Python suites
+make test_upstream_harness test_upstream_pr # adapter checks and PR coverage
+make test_upstream test_upstream_skips     # full SQLLogicTest inventory and exclusion audit
 make test_minio                           # S3 suites, disposable MinIO (Docker)
 ```
 
@@ -143,11 +145,22 @@ make test_minio                           # S3 suites, disposable MinIO (Docker)
 - Add SQL-level behaviour to `test/sql/*.test` (deterministic output only); add process-death,
   fault, race and S3 suites to `scripts/run_integration.py` or `test/integration/minio.py`.
   Artifact paths come from `test/integration/paths.py`.
+- The full upstream SQLLogicTest tree runs against native and Differential attachments, with
+  individual reviewed exclusions in `test/upstream/suite.json`. CI uses the harness checks and
+  smaller PR profile. Run the full suite and exclusion audit manually with `make test_upstream`
+  and `make test_upstream_skips`; keep both out of CI workflows. Audit exclusions when updating
+  DuckDB, changing the adapter or reviewing the exclusion list. Manual full runs support
+  optional sharding. Do not add directory-wide exclusions
+  or classify timeouts as unsupported tests. Normal runs have no per-test time limit.
+  Required official HTTP, INET and SQLite test dependencies are cached under `build/`.
+  Individually listed excessive-disk workloads are excluded by owner decision; their audit
+  checks the pinned source without executing them.
+  The separate upstream bridge is test-only.
 - Tests and builds write result transcripts to the untracked `build/evidence/`. Do not track
   transcripts or implementation notes.
 - There is exactly one store, control and export format, with no migrations
-  (nothing was published before 0.1.0). Once released, any format change needs a version bump,
-  a migration and tests against data written by the previous release.
+  (the extension is not published yet; the sole header-aligned layout is format 1). Once released,
+  any format change needs a version bump, a migration and tests against data written by the previous release.
 - `make bump-version V=X.Y.Z` keeps all version references consistent; `community/description.yml`
   is the community-extensions descriptor draft (submit only when the owner asks).
 - MinIO and coexistence tests need Docker and network access (pinned image, official DuckDB

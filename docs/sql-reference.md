@@ -59,6 +59,17 @@ SET differential_s3_max_requests = 16;
 SELECT current_setting('differential_s3_max_requests') AS max_requests;
 ```
 
+DuckDB's `temp_directory` must be local (or empty to disable spilling). Nonlocal paths
+produce `local_temp_directory_required` at SET after loading Differential, or at ATTACH
+when configured earlier. Remote export handles use native prefetch by default; its setting
+is independent of Differential's cache-backed read-ahead.
+
+```sql
+-- main
+SET temp_directory = '/data/spill';
+SET storage_block_prefetch = 'REMOTE_ONLY';
+```
+
 ## ATTACH
 
 ```sql

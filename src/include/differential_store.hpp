@@ -58,7 +58,20 @@ class Reader {
 class Store {
   public:
     static constexpr uint64_t CHUNK = 65536;
-    static constexpr uint64_t PAGE_CHUNKS = 256;                // manifest page: 16 MiB of logical file
+    // The format isolates the three 4 KiB native headers. Objects still have exactly
+    // CHUNK bytes; the unused suffix of object 0 is zero. This byte geometry applies
+    // to every file (including WALs), independent of names or native block IDs.
+    static constexpr uint64_t HEADER = 12288;
+    static constexpr uint64_t ChunkIndex(uint64_t offset) {
+        return offset < HEADER ? 0 : 1 + (offset - HEADER) / CHUNK;
+    }
+    static constexpr uint64_t ChunkOffset(uint64_t index) {
+        return index == 0 ? 0 : HEADER + (index - 1) * CHUNK;
+    }
+    static constexpr uint64_t ChunkLength(uint64_t index) { return index == 0 ? HEADER : CHUNK; }
+    static constexpr uint64_t ChunkPosition(uint64_t offset) { return offset - ChunkOffset(ChunkIndex(offset)); }
+    static constexpr uint64_t ChunkCount(uint64_t size) { return size == 0 ? 0 : ChunkIndex(size - 1) + 1; }
+    static constexpr uint64_t PAGE_CHUNKS = 256;                // manifest page: 256 chunk slots
     static constexpr uint64_t DIRTY_LIMIT = 64ull * 1024 * 1024; // overlay bound before a NORMAL commit
     static constexpr int FORMAT = 1;
     // File modes for everything this repository creates (private, or shared with its group).

@@ -9,6 +9,7 @@
 #include "differential_export.hpp"
 #include "differential_recovery.hpp"
 #include "remote_cache.hpp"
+#include "spill_policy.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include <fcntl.h>
@@ -20,6 +21,8 @@
 #include <map>
 
 namespace duckdb {
+static_assert(differential::Store::HEADER == 3 * Storage::FILE_HEADER_SIZE,
+              "Differential chunk geometry must match DuckDB's data-block start");
 void ProbeEvent(const char *, const string &, int64_t = 0, idx_t = 0);
 namespace {
 // Leases whose buffered writes could not be published at close. Holding them keeps other
@@ -143,7 +146,9 @@ class DurableFileSystem : public FileSystem {
     string GetName() const override { return "differential_durable"; }
     bool CanHandleFile(const string &uri) override { return uri.rfind("diff:", 0) == 0; }
     bool CanSeek() override { return true; }
-    bool OnDiskFile(FileHandle &) override { return true; }
+    // DuckDB's REMOTE_ONLY block prefetch uses this classification. Only export
+    // handles are wholly remote; local files and mutable overlays retain local behavior.
+    bool OnDiskFile(FileHandle &h) override { return !H(h).remote; }
     bool IsPathAbsolute(const string &) override { return true; }
     string PathSeparator(const string &) override { return "/"; }
     string CanonicalizePath(const string &uri, optional_ptr<FileOpener> = nullptr) override {
@@ -372,6 +377,10 @@ class DurableFileSystem : public FileSystem {
     }
     bool IsPipe(const string &, optional_ptr<FileOpener> = nullptr) override { return false; }
     bool DirectoryExists(const string &, optional_ptr<FileOpener> = nullptr) override { return false; }
+    void CreateDirectory(const string &path, optional_ptr<FileOpener> = nullptr) override {
+        ValidateDifferentialTempDirectory(path);
+        throw IOException("Differential does not support directory creation");
+    }
     void MoveFile(const string &a, const string &b, optional_ptr<FileOpener> = nullptr) override {
         auto source = Resolve(a);
         auto target = Resolve(b);

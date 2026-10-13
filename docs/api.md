@@ -349,6 +349,11 @@ change when it is exported.
 
 ### Caching S3 reads
 
+S3 export handles enable DuckDB's native block prefetch with the default
+`storage_block_prefetch = 'REMOTE_ONLY'`. `SET storage_block_prefetch = 'NEVER'` disables
+that layer; the extension's own cache-backed read-ahead remains separate. Local handles
+retain DuckDB's local prefetch behavior.
+
 Reads of S3 data (exports, branch heads, evicted snapshots) are cached at three levels:
 
 | Level | Holds | Lifetime | Control |
@@ -385,6 +390,10 @@ as `REGION` and `ENDPOINT` to each ATTACH and function call.
 
 S3 settings can come from DuckDB secrets ([secrets manager](https://duckdb.org/docs/current/configuration/secrets_manager)),
 so ATTACH and function calls need no S3 options.
+
+Configure DuckDB's `secret_directory` and `allow_persistent_secrets` before using secrets
+or attaching Differential. ATTACH looks up the default differential secret and initializes
+DuckDB's secret storage; DuckDB rejects changes to those settings after initialization.
 
 **`TYPE s3` secrets** are the standard S3 secrets of httpfs (which DuckDB autoloads on
 `CREATE SECRET`). For every S3 location, the extension uses the secret whose `SCOPE` matches
@@ -521,7 +530,8 @@ pass-through backend (`DIFFERENTIAL_PROBE_ROOT`), diagnostic raw addressing
 `differential_status()` reports `test_hooks`.
 
 Fixed v1 bounds:
-- 1 TiB logical files, 64 KiB chunks and 16 MiB manifest pages.
+- 1 TiB logical files; a 12 KiB first chunk followed by 64 KiB chunks, stored as 64 KiB objects.
+  Manifest pages have 256 slots (the first covers 16 MiB − 52 KiB, later pages 16 MiB).
 - A 64 MiB write overlay per store and a 32 MiB local verified-chunk cache.
 - 8 MiB S3 packs. Remote reads are cached in DuckDB's external file cache (within
   `memory_limit`) and, when `differential_remote_cache_size` is set, in the repository disk cache.
@@ -532,8 +542,9 @@ Fixed v1 bounds:
 There is no disk quota for authoritative storage. Failover and remote export expiry are not
 supported; several writers per database only as [shared databases](#shared-databases-several-writers).
 
-The local store format is 1 and the control format is 1; repositories in any other format fail
-with `incompatible_format` (there are no migrations). Native DuckDB bytes are unchanged.
+The local store format is 1 (header-aligned chunks) and the control format is 1. Repositories
+in any other format fail with `incompatible_format` (there are no migrations). Native DuckDB
+bytes are unchanged.
 
 Stable error prefixes use `[differential:<category>]`: `not_found`, `retired`,
 `name_conflict`, `read_only_attachment`, `writer_busy`, `stale_epoch`,
@@ -549,3 +560,14 @@ automatic checkpoints already counted in commit time. Export time includes cache
 work and retry checks. SDK request time includes permit wait and internal retries.
 `local_gc_queued_*` counts candidates awaiting the next collection step; queued candidates
 may still be live.
+
+### Temporary spill files
+
+Set DuckDB's `temp_directory` to a local path when queries may exceed `memory_limit`.
+This also applies to S3-backed databases. After loading Differential, a nonlocal SET fails
+with `local_temp_directory_required`; ATTACH checks paths configured earlier. Validation
+creates neither the directory nor the repository. An empty string disables spilling.
+
+```sql
+SET temp_directory = '/tmp/duckdb-spill';
+```

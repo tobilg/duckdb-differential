@@ -1,0 +1,47 @@
+# name: test/sql/spill_policy.test
+# description: Spill directory validation is local-only and never opens the repository
+# group: [differential]
+
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/spill_policy_unused'
+
+statement error
+SET temp_directory = 'diff://spill.tmp'
+----
+local_temp_directory_required
+
+statement error
+PRAGMA temp_directory = 'differential:spill'
+----
+local_temp_directory_required
+
+statement error
+SET temp_directory = 's3://bucket/spill'
+----
+local_temp_directory_required
+
+statement error
+SET temp_directory = 'https://example.invalid/spill'
+----
+local_temp_directory_required
+
+query I
+SELECT status FROM differential_status() WHERE capability = 'repository_open'
+----
+false
+
+statement ok
+SET temp_directory = '__TEST_DIR__/local_spill'
+
+statement ok
+SET VARIABLE temp_directory = 'diff://this-is-just-a-variable'
+
+statement ok
+SET temp_directory = ''
+
+query I
+SELECT current_setting('temp_directory') = ''
+----
+true

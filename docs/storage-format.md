@@ -24,7 +24,8 @@ see the [lifecycle guide](lifecycle.md).
 
 DuckDB itself is not modified. It reads and writes an ordinary native database file, and
 DuckDB 1.5.6 storage bytes are unchanged. The extension stores that file as a **logical file**
-split into fixed **64 KiB chunks**. Each chunk is stored once, under its SHA-256 (an **object**).
+split into a **12 KiB first chunk** and subsequent **64 KiB chunks**, aligned with native data
+blocks. Every chunk is zero-padded to a 64 KiB object and stored once under its SHA-256.
 A version of the file is therefore just a map from chunk index to object hash, so versions
 share every unchanged chunk.
 
@@ -41,14 +42,27 @@ native DuckDB file (logical bytes)      chunk map (per file / per root)       ob
 | Term | Meaning |
 | --- | --- |
 | **Logical file** | One native file: a branch's main database file, or its `.wal` / `.wal.checkpoint` / `.wal.recovery` sidecar. |
-| **Chunk** | Bytes `[i·65536, (i+1)·65536)` of a logical file. The last chunk is zero-padded; the file length is stored separately. |
+| **Chunk** | Chunk 0 covers bytes `[0, 12288)`. Chunk `i ≥ 1` covers `[12288 + (i−1)·65536, 12288 + i·65536)`. Unused object bytes are zero; logical length is stored separately. |
 | **Object** | An immutable 64 KiB chunk, identified by the lowercase hex SHA-256 of exactly 65536 bytes. |
 | **Hole** | A chunk with no mapping: never written, or truncated away. Reads return zeros; nothing is stored. |
 | **Extent** | A live mapping `(file, chunk index) → object` of a writable file. |
-| **Manifest page** | An immutable map of 256 consecutive chunk slots (16 MiB of logical file) to objects. |
+| **Manifest page** | An immutable map of 256 consecutive chunk slots to objects (the first page covers 16 MiB − 52 KiB; later pages cover 16 MiB). |
 | **Root** | An immutable version of a logical file: its length plus its ordered manifest pages. |
 | **Generation** | The root sealed at a branch's latest completed native checkpoint (internal). |
 | **Snapshot** | A public, numbered version of a database: a root plus ID, name, time, branch and commit metadata. |
+
+The same byte mapping applies to main files, WALs and recovery sidecars. It does not inspect
+file names or change native bytes. For offset `x`, the chunk index is `0` when `x < 12288`,
+otherwise `1 + floor((x − 12288) / 65536)`. The number of chunks in a file of length `n` is
+zero for an empty file, otherwise `chunk_index(n − 1) + 1`. The first index page covers
+256 MiB − 52 KiB; subsequent pages cover 256 MiB. A file at the 1 TiB limit needs 4097 pages.
+
+The first chunk isolates DuckDB's three 4096-byte headers. A default 256 KiB native data
+block occupies exactly four chunks, so a full-block overwrite does not read neighboring
+payload. Smaller native allocation sizes (16–64 KiB) still use ordinary partial-chunk
+writes. Chunk 0's unused 52 KiB suffix and the last chunk's unused suffix are always zero,
+including after truncation and regrowth. Pack offsets remain `slot * 65536`; logical file
+offsets use the mapping above.
 
 ## Repository layout
 
@@ -277,7 +291,7 @@ s3://bucket/prefix/
     ├── branches/<branch name>              branch head: mutable pointer to the branch's latest export
     ├── snapshots/<9999999999 - n>          commit record of snapshot n, newest first in a listing
     ├── packs/<sha256>                      the database's data pool: up to 128 chunks (8 MiB) each
-    └── indexes/<sha256>                    DIX1 chunk index pages, 4096 chunks (256 MiB) each
+    └── indexes/<sha256>                    DIX1 index pages, 4096 chunk slots each
 ```
 
 Packs, index pages and descriptors are named by the SHA-256 of their exact bytes; commit
@@ -311,7 +325,7 @@ Index page `p` covers logical chunks `[4096·p, 4096·(p+1))`. Layout, little-en
 
 Each 36-byte entry is the chunk's raw SHA-256 (32 bytes), then the pack number (u16), then
 the slot within that pack (u16). Pack number `0xFFFF` marks a hole: zeros, no data. Size is
-always `8 + 32n + 147456` bytes.
+always `8 + 48n + 147456` bytes.
 
 ### Descriptor
 
@@ -329,7 +343,7 @@ duckdb-<version>                  (writer's DuckDB version, e.g. duckdb-v1.5.6)
 <root hash>                       (the snapshot's root identity)
 <logical length in bytes>
 dbs/<database uuid>/              (the database's pool: its index pages and new packs)
-<index page count>                (= ceil(length / 256 MiB))
+<index page count>                (= ceil(chunk_count(length) / 4096))
 <index hash> <index byte size>    (one line per index page, in order)
 first-index                       (when there is at least one index page)
 <the first index page, raw bytes> (its size and hash must match the first index line)
@@ -587,10 +601,11 @@ is cached at two levels:
   exports in any other format are refused; a future format change must add its own migration
   and tests.
 - Fixed bounds:
-  - 64 KiB chunks; 256-chunk (16 MiB) manifest pages;
+  - a 12 KiB first chunk, then 64 KiB chunks; all payload objects are 64 KiB;
+  - 256-slot manifest pages (the first covers 52 KiB less than 16 MiB);
   - 4096-chunk index pages; 8 MiB packs;
   - a 1 TiB logical file; 64 MiB journal records;
-  - a 1 MiB descriptor, at most 4096 index pages.
+  - a 1 MiB descriptor, at most 4097 index pages.
 
 ## Inspecting a repository
 
@@ -610,6 +625,8 @@ The formats on this page were checked against real data:
 - **S3 (2026-10-10):** an independent decoder rebuilt each exported snapshot's native file from
   descriptor → index → packs, byte-identical to the local root, starting with DuckDB's `DUCK`
   magic, on the pinned MinIO fixture.
-- **Identifiers (2026-10-11):** after the format identifiers were renamed, a new repository and
-  export showed `user_version` 1, `control_format` 1, `differential-export-v1` and `DIX1`. The
-  layouts themselves did not change.
+- **Header alignment (2026-10-13):** format 1 isolates the 12 KiB header region. The extension
+  has not been published; only this layout is implemented, with no legacy reader or migration.
+  Boundary, truncation and native allocation-size coverage is in the unit and integration suites.
+  The independent decoder in `s3_layout.py` reconstructs both MinIO snapshots byte-for-byte,
+  verifies descriptor/index/pack/chunk hashes and checks zero padding.
