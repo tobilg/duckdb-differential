@@ -72,7 +72,13 @@ inline bool HardwareAvailable() {
     return available;
 }
 #elif defined(__aarch64__)
-__attribute__((target("crc"))) inline uint32_t Hardware(uint32_t crc, const unsigned char *p, size_t n) {
+// GCC spells the AArch64 extension "+crc"; Clang accepts "crc".
+#if defined(__clang__)
+#define DIFFERENTIAL_TARGET_CRC __attribute__((target("crc")))
+#else
+#define DIFFERENTIAL_TARGET_CRC __attribute__((target("+crc")))
+#endif
+DIFFERENTIAL_TARGET_CRC inline uint32_t Hardware(uint32_t crc, const unsigned char *p, size_t n) {
     while (n >= 8) {
         uint64_t word;
         std::memcpy(&word, p, 8);
