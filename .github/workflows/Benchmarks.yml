@@ -1,0 +1,81 @@
+#
+# Scale benchmarks on Linux (benchmarks/scale.py). Manual only: dispatch it on a commit to measure that
+# commit; compare runs of the same scale (hosted runners are noisy, so absolute numbers are indicative).
+#
+name: Benchmarks
+on:
+  workflow_dispatch:
+    inputs:
+      scale_gib:
+        description: Data set size in GiB (needs about five times as much free disk)
+        default: '2'
+      workloads:
+        description: Comma-separated workloads, or all
+        default: all
+      commits:
+        description: Snapshots of the shared database for history_sync
+        default: '2000'
+
+permissions:
+  contents: read
+
+env:
+  GEN: ninja
+  VCPKG_INSTALL_OPTIONS: --clean-after-build
+  VCPKG_TARGET_TRIPLET: x64-linux-release
+  VCPKG_HOST_TRIPLET: x64-linux-release
+
+jobs:
+  scale:
+    name: Scale benchmarks (linux_amd64, ${{ inputs.scale_gib }} GiB)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Fetch the DuckDB version tag
+        run: |
+          set -euo pipefail
+          head=$(git -C duckdb rev-parse HEAD)
+          tag=$(git -C duckdb ls-remote --tags origin | awk -v h="$head" '$1==h {sub("refs/tags/","",$2); sub(/\^\{\}$/,"",$2); print $2; exit}')
+          test -n "$tag" || { echo "The duckdb submodule commit $head carries no release tag" >&2; exit 1; }
+          git -C duckdb fetch --depth=1 --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          git -C duckdb config core.abbrev 10
+
+      # Hosted runners have about 14 GB free; the benchmark needs native, differential and MinIO copies.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config zip unzip tar curl
+
+      - name: Set up vcpkg
+        run: |
+          make vcpkg
+          echo "VCPKG_TOOLCHAIN_PATH=$PWD/build/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+
+      - name: Build (release)
+        run: make release
+
+      - name: Pull MinIO
+        run: docker pull ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9
+
+      - name: Benchmarks
+        env:
+          DIFFERENTIAL_BUILD_DIR: build/release
+          DUCKDB_LIBRARY: ${{ github.workspace }}/build/release/src/libduckdb.so
+        run: |
+          python3 benchmarks/scale.py --scale-gib "${{ inputs.scale_gib }}" --workloads "${{ inputs.workloads }}" \
+            --commits "${{ inputs.commits }}" --work-dir "$RUNNER_TEMP" --output build/evidence/scale.json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-${{ github.sha }}-${{ inputs.scale_gib }}gib
+          path: build/evidence/
+          retention-days: 30

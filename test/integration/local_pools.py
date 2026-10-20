@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory(prefix='differential-local-pools-') as tmp:
     assert run("ATTACH 'differential:sales' AS d (DATA_PATH 'elsewhere');",False).returncode != 0
     def counts():
         with sqlite3.connect(repo/'engine.sqlite') as con:
-            return con.execute('SELECT (SELECT count(*) FROM objects WHERE data IS NOT NULL),(SELECT count(*) FROM local_objects)').fetchone()
+            return con.execute('SELECT (SELECT count(*) FROM objects WHERE segment IS NOT NULL),(SELECT count(*) FROM local_objects)').fetchone()
     before = counts(); assert before[0] == 0 and before[1] > 0, before
     sentinel=pool/'keep.txt';sentinel.write_text('unowned')
     foreign=pool/'differential-pools'/'unregistered-namespace';foreign.mkdir();(foreign/'keep.txt').write_text('foreign')
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='differential-local-pools-') as tmp:
         assert con.execute('PRAGMA foreign_key_check').fetchall() == []
         assert con.execute('SELECT count(*) FROM local_deletions').fetchone()[0] == 0
     for path, repository, provider, digest in locations:
-        assert (Path(path)/'differential-pools'/repository/provider/digest[:2]/digest).stat().st_size == 65536
+        assert (Path(path)/'differential-pools'/repository/provider/digest[:2]/digest).stat().st_size == 262144
     providers = list(csv.DictReader(io.StringIO(run('SELECT * FROM differential_providers();'))))
     assert any(p['data_path'] == str(pool.resolve()) for p in providers), providers
     databases = list(csv.DictReader(io.StringIO(run('SELECT * FROM differential_databases();'))))

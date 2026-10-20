@@ -1,5 +1,8 @@
 #include "differential_control.hpp"
 #include "differential_local.hpp"
+#include "differential_metrics.hpp"
+#include <algorithm>
+#include <set>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
@@ -128,7 +131,7 @@ int main() {
         std::filesystem::create_directories(corrupt.parent_path());
         {
             std::ofstream output(corrupt, std::ios::binary);
-            std::vector<char> zeros(65536);
+            std::vector<char> zeros(Store::CHUNK);
             output.write(zeros.data(), zeros.size());
         }
         bool rejected = false;
@@ -154,6 +157,59 @@ int main() {
             rejected = true;
         }
         Require(rejected, "missing external object accepted");
+        {
+            // Writes of pool files are journaled in segments that no publication references: such a
+            // segment is retired and deleted once it passes 4 MiB, not kept until collection.
+            auto folder_bytes = [](const std::filesystem::path &path) {
+                uint64_t total = 0;
+                for (auto &entry : std::filesystem::directory_iterator(path))
+                    total += std::filesystem::file_size(entry);
+                return total;
+            };
+            auto deleted = counters[size_t(Counter::LocalSegmentsDeleted)].load();
+            auto pooled = store->Open("pooled", true, true, false, "", pool);
+            auto wal = store->Open("pooled.wal", true, true, false, "", pool);
+            std::vector<unsigned char> block(Store::CHUNK);
+            std::vector<unsigned char> expected;
+            for (uint64_t k = 0; k < 160; ++k) { // 40 MiB, synced every 4 MiB
+                std::fill(block.begin(), block.end(), (unsigned char)(k + 1));
+                store->Write(pooled.id, block.data(), block.size(), Store::ChunkOffset(1 + k));
+                store->Write(wal.id, block.data(), 1000, k * 1000);
+                if (k % 16 == 15)
+                    store->Sync(pooled.id);
+            }
+            store->Sync(pooled.id);
+            Require(folder_bytes(repository + "/segments") == 0, "unreferenced segments kept for collection");
+            Require(folder_bytes(repository + "/journal") <= Store::UNREFERENCED_SEGMENT_LIMIT + 4 * Store::CHUNK + 64 * 1024,
+                    "unreferenced active segment not bounded");
+            Require(counters[size_t(Counter::LocalSegmentsDeleted)].load() >= deleted + 5,
+                    "unreferenced segments not deleted at publication");
+            store->Verify();
+            auto names = [](const std::filesystem::path &path) {
+                std::set<std::string> result;
+                for (auto &entry : std::filesystem::directory_iterator(path))
+                    result.insert(entry.path().filename().string());
+                return result;
+            };
+            auto active = names(repository + "/journal");
+            {
+                // A store that closes cleanly deletes its unreferenced segment as well.
+                Store closing(repository);
+                auto file = closing.Open("closed", true, true, false, "", pool);
+                closing.Write(file.id, block.data(), block.size(), Store::ChunkOffset(1));
+                closing.Sync(file.id);
+                Require(names(repository + "/journal").size() == active.size() + 1, "closing store has no segment");
+            }
+            Require(names(repository + "/journal") == active && folder_bytes(repository + "/segments") == 0,
+                    "clean close kept an unreferenced segment");
+            Store reopened_store(repository);
+            auto reopened = reopened_store.Open("pooled", false, false, false, "", pool);
+            for (uint64_t k = 0; k < 160; k += 37) {
+                reopened_store.Read(reopened.id, block.data(), block.size(), Store::ChunkOffset(1 + k));
+                Require(std::all_of(block.begin(), block.end(), [&](unsigned char c) { return c == k + 1; }),
+                        "pool bytes lost with their journal segment");
+            }
+        }
         pin.reset();
         store.reset();
         std::filesystem::remove_all(base);

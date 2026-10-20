@@ -11,7 +11,8 @@ from a `TYPE s3` secret ([secrets](api.md#secrets)). The blocks are executed as 
 test suite against MinIO (`test/integration/doc_examples.py`), except those marked "not run".
 
 **Contents**
-- Statements: [settings](#settings) · [ATTACH](#attach) · [DETACH](#detach) ·
+- Statements: [settings](#settings) · [ATTACH](#attach) ([WAL shipping](#wal-shipping),
+  [followers](#followers)) · [DETACH](#detach) ·
   [AT](#at-time-travel) · [catalog functions](#catalog-functions) ·
   [CREATE SECRET (TYPE differential)](#create-secret-type-differential)
 - Conventions: [parameters](#conventions) · [S3 option parameters](#s3-option-parameters) ·
@@ -22,7 +23,8 @@ test suite against MinIO (`test/integration/doc_examples.py`), except those mark
   [differential_operations](#differential_operations) · [differential_providers](#differential_providers) ·
   [differential_retention_roots](#differential_retention_roots) ·
   [differential_storage_stats](#differential_storage_stats) · [differential_status](#differential_status) ·
-  [differential_remote_heads](#differential_remote_heads) · [differential_writers](#differential_writers)
+  [differential_remote_heads](#differential_remote_heads) · [differential_writers](#differential_writers) ·
+  [differential_followers](#differential_followers)
 - Snapshots and branches: [differential_create_snapshot](#differential_create_snapshot) ·
   [differential_create_branch](#differential_create_branch) ·
   [differential_clone_database](#differential_clone_database) · [differential_restore](#differential_restore) ·
@@ -33,10 +35,13 @@ test suite against MinIO (`test/integration/doc_examples.py`), except those mark
   [differential_claim_branch_heads](#differential_claim_branch_heads) ·
   [differential_resolve_conflict](#differential_resolve_conflict)
 - Import and recovery: [differential_import_database](#differential_import_database) ·
-  [differential_recover_export](#differential_recover_export)
+  [differential_recover_export](#differential_recover_export) ·
+  [differential_recover_branch](#differential_recover_branch)
 - Maintenance: [differential_cleanup_old_files](#differential_cleanup_old_files) ·
   [differential_delete_orphaned_files](#differential_delete_orphaned_files) ·
-  [differential_compact](#differential_compact)
+  [differential_compact](#differential_compact) ·
+  [differential_cleanup_remote_files](#differential_cleanup_remote_files) ·
+  [differential_cleanup_metadata](#differential_cleanup_metadata)
 
 ## Settings
 
@@ -48,6 +53,9 @@ test suite against MinIO (`test/integration/doc_examples.py`), except those mark
 | `differential_snapshot_on_checkpoint` | BOOLEAN | `false` | Publish every completed checkpoint of a writable branch as a snapshot (`commit_message = 'checkpoint'`). Read when a file is opened. Shared databases do this by default (`PUBLISH_ON_CHECKPOINT`). |
 | `differential_remote_cache_size` | VARCHAR | `'0'` (off) | Size of the repository's disk cache for S3 data, in `memory_limit` syntax (`'4GB'`, `'512MiB'`). Global. |
 | `differential_s3_max_requests` | BIGINT | `16` | Parallel S3 requests per process, 1–64, shared by all S3 locations and DuckDB instances. Global; the last value set applies. |
+| `differential_group_commit` | BOOLEAN | `true` | Concurrent native syncs of different databases in this process share one durable transaction and sync (up to 16 MiB of new data each; a larger sync commits alone). Durability per sync is unchanged. Process-wide; the last value set applies. |
+| `differential_export_verification` | VARCHAR | `'checksum'` | `'checksum'`: the S3 service verifies each uploaded object's SHA-256. `'read_back'`: exports also download and hash every object they upload, for S3-compatible services that ignore upload checksums. Process-wide; the last value set applies. |
+| `differential_export_staging` | VARCHAR | `'disk'` | `'disk'`: exports stage each object as a file under the repository before uploading it (quota: 8 MiB per parallel request, 64–512 MiB). `'memory'`: uploads stream from memory within the same budget per process. Process-wide; the last value set applies. |
 
 ```sql
 -- main
@@ -56,6 +64,9 @@ SET differential_auto_gc = true;
 SET differential_snapshot_on_checkpoint = false;
 SET differential_remote_cache_size = '1GB';
 SET differential_s3_max_requests = 16;
+SET differential_group_commit = true;
+SET differential_export_verification = 'checksum';
+SET differential_export_staging = 'disk';
 SELECT current_setting('differential_s3_max_requests') AS max_requests;
 ```
 
@@ -76,6 +87,7 @@ SET storage_block_prefetch = 'REMOTE_ONLY';
 ATTACH 'differential:<database>' [AS alias] [(option value, ...)]
 ATTACH 'differential:s3://<bucket>/<prefix>/descriptors/<sha256>' [AS alias] [(S3 options)]
 ATTACH 'differential:s3://<bucket>/<prefix>/heads/<database>[/<database uuid>][/<branch>]' [AS alias] [(S3 options)]
+ATTACH 'differential:s3://<bucket>/<prefix>/heads/<database>[/<database uuid>][/<branch>]' [AS alias] (FOLLOW true [, FOLLOW_INTERVAL seconds] [, S3 options])
 ATTACH 'diff://db/<database uuid>/{branches|snapshots}/<id>' [AS alias] (TYPE differential)
 ```
 
@@ -86,6 +98,9 @@ ATTACH 'diff://db/<database uuid>/{branches|snapshots}/<id>' [AS alias] (TYPE di
 - `…/heads/<database>[/<uuid>][/<branch>]` attaches the latest exported snapshot of a branch
   (default `main`) read-only. The UUID is needed only when two databases of that name export to
   the prefix.
+- With `FOLLOW true` a head path is a follower: read-only, and it moves to the branch's newest state on
+  its own, every shipped commit when the database ships its WAL (`SHIP_WAL`), else every exported
+  snapshot. See [followers](#followers).
 - `diff://…` are the internal URIs from the `uri` columns; they stay valid after names are reused.
 
 | Option | Type | Default | Description |
@@ -104,6 +119,10 @@ ATTACH 'diff://db/<database uuid>/{branches|snapshots}/<id>' [AS alias] (TYPE di
 | `ON_BUSY` | VARCHAR | `'warn'` | Shared databases, writable: another live writer of the branch at ATTACH prints a warning (`'warn'`), refuses with `writer_busy` (`'error'`) or is ignored (`'ignore'`). |
 | `PUBLISH_ON_CHECKPOINT` | BOOLEAN | `true` | Shared databases, writable: every completed checkpoint becomes a snapshot published in the background. |
 | `PUBLISH_ON_DETACH` | BOOLEAN | `false` | Shared databases, writable: when the branch's file closes, wait until its final checkpoint is published. |
+| `SHIP_WAL` | VARCHAR | `'off'` | Single-writer databases with an S3 `DATA_PATH`, writable: ship every published state of the attached branch to S3 continuously ([WAL shipping](#wal-shipping)). `'async'`: a commit returns after its local commit and is shipped within `SHIP_INTERVAL`; `'sync'`: a commit also waits until it is in S3. Stored per database: later writable attachments ship until `SHIP_WAL 'off'`. |
+| `SHIP_INTERVAL` | DOUBLE | `1` | Seconds (0–3600) between two shipped epochs of a branch in `async` mode, bounding S3 requests. Stored with `SHIP_WAL`. |
+| `FOLLOW` | BOOLEAN | `false` | Head paths only: a [follower](#followers) that moves to the branch's newest state. |
+| `FOLLOW_INTERVAL` | DOUBLE | `10` | Seconds (1–3600) between a follower's checks of S3; one request per check when nothing changed. |
 | `TYPE` | VARCHAR | | `differential` for `diff://` URIs; gives the attachment catalog functions and `AT`. |
 
 Native options such as `BLOCK_SIZE` pass through to DuckDB; unknown options fail. At most one
@@ -179,6 +198,56 @@ ATTACH 'differential:team' AS team (DATA_PATH 's3://my-bucket/lake/', WRITERS 's
     ON_CONFLICT 'branch', ON_BUSY 'warn', PUBLISH_ON_CHECKPOINT true, PUBLISH_ON_DETACH true);
 CREATE TABLE team.t AS SELECT range AS id FROM range(100);
 CALL differential_create_snapshot('team');
+```
+
+### WAL shipping
+
+A single-writer S3 database can ship its committed state to S3 continuously, so another host can
+recover a branch as of its last shipped commit with
+[differential_recover_branch](#differential_recover_branch) (and DuckDB replays the WAL natively).
+Each publication of the branch's files becomes part of an epoch under
+`dbs/<uuid>/log/<branch>/…`; `differential_branches` reports what was shipped. Losing the host then
+loses only commits not yet shipped: none acknowledged in `'sync'` mode, at most `SHIP_INTERVAL` of
+commits in `'async'` mode. The [storage format](storage-format.md#continuous-wal-shipping)
+describes epochs and chains.
+
+S3 requests cost money (Amazon S3 Standard in `us-east-1`: $0.005 per 1,000 PUTs, $0.0004 per 1,000
+GETs/HEADs). A busy branch costs one PUT per `SHIP_INTERVAL` in `async` mode (default 1 s: about
+$13 a month; 10 s: about $1.30) or one PUT per commit in `sync` mode (10 commits per second: about
+$130 a month); an idle branch costs nothing. The [cost table](api.md#s3-request-costs) lists every
+configuration.
+
+```sql
+-- main
+ATTACH 'differential:orders' AS orders (DATA_PATH 's3://my-bucket/lake/', SHIP_WAL 'sync');
+CREATE TABLE orders.t AS SELECT range AS id FROM range(100);
+INSERT INTO orders.t VALUES (100);
+SELECT ship_wal, shipped_epoch IS NOT NULL AS shipped, ship_pending FROM differential_branches('orders');
+-- expect output: "ship_wal":"sync"
+```
+
+```sql
+-- main
+ATTACH 'differential:orders' AS orders (SHIP_WAL 'async', SHIP_INTERVAL 5);   -- stored: later attachments ship too
+INSERT INTO orders.t VALUES (101);
+DETACH orders;                                                                 -- ships what is left
+```
+
+### Followers
+
+`FOLLOW true` on a head path attaches the branch read-only and keeps it current: a background
+thread checks S3 every `FOLLOW_INTERVAL` seconds (one GET, or one HEAD for a branch that only
+exports, when nothing changed) and opens a newer state as soon as there is one. Each transaction
+reads one state; the next transaction reads the newest. `AT` is not available on a follower.
+[differential_followers](#differential_followers) lists them. An idle follower costs one HEAD per
+interval: about $0.10 a month at the default 10 s, $1.04 at 1 s ([costs](api.md#s3-request-costs)).
+
+```sql
+-- reader
+ATTACH 'differential:s3://my-bucket/lake/heads/orders/main' AS orders_live (FOLLOW true, FOLLOW_INTERVAL 10);
+SELECT count(*) AS n FROM orders_live.t;
+SELECT alias, follows FROM differential_followers();
+-- expect output: "follows":"commits"
 ```
 
 ## DETACH
@@ -263,8 +332,8 @@ SELECT count(*) AS heads FROM differential_remote_heads('s3://my-bucket/lake/', 
 
 ### S3 option parameters
 
-Accepted by ATTACH (as options), `differential_remote_heads`, `differential_import_database` and
-`differential_recover_export` (as named parameters). They are fixed when an S3 location is first
+Accepted by ATTACH (as options), `differential_remote_heads`, `differential_import_database`,
+`differential_recover_export` and `differential_cleanup_remote_files` (as named parameters). They are fixed when an S3 location is first
 registered; given again, they must match. A `TYPE s3` secret can supply region, endpoint, URL
 style and SSL instead.
 
@@ -311,11 +380,13 @@ style and SSL instead.
 ### differential_snapshots
 
 ```sql
-differential_snapshots(database VARCHAR)
+differential_snapshots(database VARCHAR, refresh => VARCHAR)
 ```
 
 All snapshots of a database, retired ones included. For a shared database it first reads new
-commit records from S3, so other writers' snapshots are listed too (`publication_state = 'remote'`).
+commit records and expiries from S3, so other writers' snapshots are listed too
+(`publication_state = 'remote'`). That read is incremental; `refresh => 'full'` lists all of the
+database's commit and expiry records (otherwise done at most once a day).
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -375,6 +446,10 @@ Every branch of a database, dropped ones included. Reads no S3.
 | `remote_state` | VARCHAR | Shared databases: `in_sync`, `ahead` (unpublished snapshots), `unpublished`, `diverged` or `forked`; else NULL. |
 | `remote_snapshot_id` | BIGINT | Shared databases: the S3 head's snapshot as last seen. |
 | `kept_branch` | VARCHAR | Shared databases: the fork a conflicting snapshot was published as. |
+| `ship_wal` | VARCHAR | Single-writer databases: `off`, `async` or `sync` ([WAL shipping](#wal-shipping)); NULL for shared databases. |
+| `shipped_chain`, `shipped_epoch` | BIGINT | The newest epoch this repository shipped for the branch. |
+| `shipped_at` | TIMESTAMPTZ | When it was shipped. |
+| `ship_pending` | BOOLEAN | Changes of the branch not shipped yet (NULL when not shipping). |
 
 ```sql
 -- main
@@ -468,7 +543,17 @@ differential_storage_stats()
 Counters as `metric VARCHAR`, `value BIGINT`: timings (`<name>_calls`, `<name>_nanoseconds`,
 `<name>_max_nanoseconds`), local storage (`local_*`), S3 requests and bytes (`s3_*`), remote reads
 and caches (`remote_*`), exports (`export_*`) and shared databases (`shared_*`). SDK and cache
-counters are process-wide. The [SQL API](api.md#introspection) describes the timing names.
+counters are process-wide. Group commit: `local_sync_requests` (durable syncs),
+`local_sync_transactions` (transactions that committed them), `local_sync_batch_max` (most syncs in
+one transaction) and `local_sync_batch_fallbacks` (batches retried one sync at a time). Every timing
+also reports its distribution (`<name>_stddev_nanoseconds`, `_p50_`, `_p95_` and `_p99_nanoseconds`), and
+each S3 operation type is timed on its own (`s3_request_get`, `s3_request_range_get`, `s3_request_put`,
+`s3_request_conditional_put`, `s3_request_multipart_part`, `s3_request_multipart_control`,
+`s3_request_head`, `s3_request_list`, `s3_request_delete`), as are both halves of a durable publication
+(`local_segment_sync`, `local_metadata_commit`). WAL shipping: `ship_epochs`, `ship_epoch_bytes`,
+`ship_chains_started`, `ship_rounds`, `ship_failures`; followers: `follow_epochs_applied`. Segments:
+`local_journal_bytes` (active segments), `local_segment_bytes` (retired ones), `local_segments`,
+`local_background_publications`, `local_segment_bytes_compacted` and `local_segments_deleted`. The [SQL API](api.md#introspection) describes the timing names.
 
 ```sql
 -- main
@@ -482,7 +567,8 @@ differential_status()
 ```
 
 `capability VARCHAR`, `status VARCHAR`: implementation scope, durability profiles, limits, whether
-test hooks are compiled in, and the last background publication error (`shared_publication`).
+test hooks are compiled in, the last background publication error (`shared_publication`), and how
+WAL shipping (`wal_shipping`) and followers (`followers`) work.
 Does not open the repository.
 
 ```sql
@@ -535,6 +621,32 @@ databases). Read from S3 at execution.
 ```sql
 -- main
 SELECT branch_name, host, live FROM differential_writers('team');
+```
+
+### differential_followers
+
+```sql
+differential_followers()
+```
+
+This process's [followers](#followers). Reads no S3.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `alias` | VARCHAR | The follower's attachment. |
+| `database_name`, `branch_name` | VARCHAR | What it follows. |
+| `follows` | VARCHAR | `commits` (the branch ships its WAL) or `snapshots` (exported snapshots). |
+| `follow_interval_ms` | BIGINT | Time between checks. |
+| `chain`, `epoch` | BIGINT | `commits`: the shipped state it reads. |
+| `snapshot_id` | BIGINT | `snapshots`: the snapshot it reads. |
+| `state_time` | TIMESTAMPTZ | When that state was shipped or published. |
+| `checked_at` | TIMESTAMPTZ | Its last check of S3. |
+| `polls`, `changes` | BIGINT | Checks, and newer states opened. |
+| `error` | VARCHAR | The last failed check, NULL after a success. |
+
+```sql
+-- main
+SELECT alias, follows, epoch, checked_at FROM differential_followers();
 ```
 
 ## Snapshot and branch functions
@@ -656,9 +768,11 @@ differential_drop_branch(database VARCHAR, branch VARCHAR, export_mode => VARCHA
 ```
 
 Preserves a detached branch's contents as a snapshot (unless one holds them) and removes the
-branch; its name can be reused. The last active branch cannot be dropped. In a shared database the
-S3 head must still be this repository's last version; it then becomes a tombstone, dropping the
-branch for every writer.
+branch; its name can be reused. The last active branch cannot be dropped. With an S3 data path its
+S3 head becomes a tombstone, so remote readers no longer find it and remote collection can reclaim
+its data once its snapshots expire (with `export_mode => 'deferred'`, when the export is retried).
+In a shared database the S3 head must still be this repository's last version; the tombstone then
+drops the branch for every writer.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -682,9 +796,11 @@ differential_expire_snapshots(database VARCHAR, versions => BIGINT[], older_than
 ```
 
 Retires snapshots: they can no longer be attached, named or found by time, and their data becomes
-collectible once nothing else needs it. Open attachments keep reading them; S3 exports stay. In a
-shared database, published snapshots expire for every writer, and a snapshot that is a branch head
-in S3 cannot expire.
+collectible once nothing else needs it. Open attachments keep reading them. Exported snapshots are
+also recorded as expired in S3, so
+[differential_cleanup_remote_files](#differential_cleanup_remote_files) can reclaim what only they
+reference. In a shared database, published snapshots expire for every writer, and a snapshot that
+is a branch head in S3 cannot expire.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -862,6 +978,44 @@ SELECT database_id FROM differential_recover_export('s3://my-bucket/lake/descrip
     data_path => 's3://my-bucket/lake/');
 ```
 
+### differential_recover_branch
+
+```sql
+differential_recover_branch(location VARCHAR, name VARCHAR, <S3 option parameters>, same_identity => BOOLEAN,
+                            request_id => VARCHAR)
+```
+
+Recovers the newest shipped state of a branch ([WAL shipping](#wal-shipping)) from
+`s3://bucket/prefix/heads/<database>[/<database uuid>][/<branch>]` into a new local database `name`:
+the newest chain's base is imported without downloading (read from S3 on demand) and every
+consecutive, verified epoch is applied. DuckDB replays the WAL at the first ATTACH. Takes the
+[S3 option parameters](#s3-option-parameters) except `data_path`; the new database uses the same S3
+location.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `location` | VARCHAR | | Branch path: `s3://bucket/prefix/heads/<database>[/<uuid>][/<branch>]` (branch `main` by default). |
+| `name` | VARCHAR | | New database name. |
+| `same_identity` | BOOLEAN | `false` | Keep the original database and branch identities: a failover of the writer. Turn shipping on again with `SHIP_WAL`; it continues in a newer chain. A repository still shipping the branch then gets `head_conflict`. |
+| S3 options | | | See [S3 option parameters](#s3-option-parameters). |
+| `request_id` | VARCHAR | | A repeated request returns the database recovered under `name`. |
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `database_id`, `database_name` | VARCHAR | The recovered database. |
+| `branch_id`, `branch_name` | VARCHAR | Its branch. |
+| `shipped_chain`, `shipped_epoch` | BIGINT | The newest epoch applied. |
+| `uri` | VARCHAR | Internal URI of the branch. |
+
+```sql
+-- recovery
+SELECT database_name, shipped_epoch FROM differential_recover_branch('s3://my-bucket/lake/heads/orders/main',
+    'orders_recovered');
+ATTACH 'differential:orders_recovered' AS recovered;
+SELECT count(*) AS n FROM recovered.t;
+-- expect output: "n":102
+```
+
 ## Maintenance functions
 
 ### differential_cleanup_old_files
@@ -873,7 +1027,7 @@ differential_cleanup_old_files(dry_run => BOOLEAN, cleanup_all => BOOLEAN, max_o
 
 Collects local data that nothing references any more (expired snapshots, dropped branches,
 replaced chunks). Runs automatically in small steps after checkpoints (`differential_auto_gc`).
-S3 data is never deleted.
+S3 data is collected separately by [differential_cleanup_remote_files](#differential_cleanup_remote_files).
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -946,4 +1100,70 @@ pins are preserved.
 ```sql
 -- main
 SELECT pages_reclaimed FROM differential_compact(max_pages => 1000);
+```
+
+### differential_cleanup_remote_files
+
+```sql
+differential_cleanup_remote_files(location VARCHAR, older_than => TIMESTAMPTZ, dry_run => BOOLEAN,
+                                  <S3 options>, request_id => VARCHAR)
+```
+
+Garbage-collects an S3 location: every database exported there, by any repository. Never runs
+automatically. Data is reachable from branch heads and from snapshots without an expiry record
+(see [differential_expire_snapshots](#differential_expire_snapshots)), and from this repository's
+retained exports and objects it reads only from S3. Collection works in two phases, so it never
+races an export:
+1. unreachable packs, index pages and descriptors last modified before `older_than` are
+   *condemned* (recorded under `gc/condemned/`); exports stop referencing them at once;
+2. a later run deletes what was condemned before `older_than` and is still unreachable.
+
+So data is deleted one grace period after it became unreachable at the earliest: run it
+regularly, for example weekly. Repositories whose shared-database branches read their base
+snapshot from S3 copy condemned data locally when they next attach or publish; one that stays
+offline for longer than the grace period can lose such data.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `older_than` | TIMESTAMPTZ | a week ago | Grace cutoff for both phases. |
+| `dry_run` | BOOLEAN | `false` | Count only: no record, no deletion. |
+| S3 options | | | See [S3 option parameters](#s3-option-parameters) (no `data_path`). |
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `dry_run` | BOOLEAN | Whether this was a dry run. |
+| `roots` | BIGINT | Descriptors that keep data alive. |
+| `live_objects` | BIGINT | Reachable packs, index pages and descriptors. |
+| `unreachable_objects`, `unreachable_bytes` | BIGINT | Unreachable objects older than `older_than`. |
+| `condemned_objects` | BIGINT | Objects condemned by this run. |
+| `deleted_objects`, `deleted_bytes` | BIGINT | Objects deleted by this run. |
+
+```sql
+-- main
+SELECT unreachable_objects, deleted_bytes FROM differential_cleanup_remote_files('s3://my-bucket/lake/',
+    dry_run => true);
+```
+
+### differential_cleanup_metadata
+
+```sql
+differential_cleanup_metadata(older_than => TIMESTAMPTZ, dry_run => BOOLEAN, request_id => VARCHAR)
+```
+
+Deletes metadata the repository no longer needs: completed operation records created before
+`older_than` (their request IDs no longer replay) and history entries of expired snapshots that
+took effect before it. Pending operations are kept.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `older_than` | TIMESTAMPTZ | (required) | Cutoff. |
+| `dry_run` | BOOLEAN | `false` | Count only. |
+
+Returns one row per table: `dry_run BOOLEAN`, `table_name VARCHAR` (`operations`, `history`) and
+`rows BIGINT`.
+
+```sql
+-- main
+SELECT table_name, rows FROM differential_cleanup_metadata(older_than => now() - INTERVAL 30 DAY,
+    dry_run => true);
 ```

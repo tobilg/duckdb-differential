@@ -21,15 +21,17 @@ LOCATION='s3://differential-sdk-test/resource-test/'
 # The same service under a second endpoint spelling is a second provider identity.
 SECOND=S3.replace('127.0.0.1','localhost')
 env=dict(os.environ,DIFFERENTIAL_STORE_ROOT=str(base/'writer'))
-sql=f"LOAD '{EXT}'; ATTACH 'differential:large' AS d (DATA_PATH '{LOCATION}', {S3}); CREATE TABLE d.t AS SELECT range AS id,sha256(range::VARCHAR) AS payload FROM range(900000); CALL differential_create_snapshot('d');"
+sql=f"LOAD '{EXT}'; ATTACH 'differential:large' AS d (DATA_PATH '{LOCATION}', {S3}); CREATE TABLE d.t AS SELECT range AS id,sha256(range::VARCHAR) AS payload FROM range(3000000); CALL differential_create_snapshot('d');"
 r=subprocess.run([CLI,'-init','/dev/null','-unsigned','-batch','-bail','-csv'],input=sql,env=env,text=True,capture_output=True,check=True,timeout=120)
 # Multiple CALL schemas are emitted, so parse the final lifecycle header/result only.
 lines=r.stdout.splitlines();header=next(i for i,line in enumerate(lines) if line.startswith('operation_id,database_id'))
 rows=list(csv.DictReader(io.StringIO('\n'.join(lines[header:]))));locator=rows[-1]['export_locator'];assert locator.startswith('descriptors/')
 os.environ['DIFFERENTIAL_STORE_ROOT']=str(base/'reader');host=Host();c=host.connect()
-LIMIT=16*1024*1024
+# 64MB: DuckDB 2.0's automatic read-ahead of remote storage alone can need more than 32MB with one
+# thread per core; three times as many rows keep the scan well above the limit.
+LIMIT=64*1024*1024
 try:
-    host.query(c,f"LOAD '{EXT}'; SET memory_limit='16MB'; ATTACH 'differential:{LOCATION}{locator}' AS old ({S3});")
+    host.query(c,f"LOAD '{EXT}'; SET memory_limit='64MB'; ATTACH 'differential:{LOCATION}{locator}' AS old ({S3});")
     assert host.query(c,'SELECT count(*) FROM old.t WHERE payload!=sha256(id::VARCHAR);')==0
     def metric(name):return host.query(c,f"SELECT value FROM differential_storage_stats() WHERE metric='{name}';")
     # The memory layer is DuckDB's external file cache: buffer-managed within memory_limit.
@@ -46,8 +48,18 @@ try:
     host.query(c,'DETACH old; DETACH another;')
     assert resident()<=LIMIT
 finally:host.close()
-evidence_path('s3-resource-results.json').write_text(json.dumps({'rows':900000,'native_memory_limit':LIMIT,'resident_external_file_cache_bytes':peak,'verified_bytes':transferred,'second_provider_verified_bytes':second_bytes,'scope':"two provider identities; remote reads cached in DuckDB's external file cache within memory_limit; MinIO loopback"},indent=2)+'\n')
+evidence_path('s3-resource-results.json').write_text(json.dumps({'rows':3000000,'native_memory_limit':LIMIT,'resident_external_file_cache_bytes':peak,'verified_bytes':transferred,'second_provider_verified_bytes':second_bytes,'scope':"two provider identities; remote reads cached in DuckDB's external file cache within memory_limit; MinIO loopback"},indent=2)+'\n')
 print("PASS scans larger than memory_limit stay correct; DuckDB's external file cache stays within memory_limit across two providers",flush=True)
+# Under memory pressure, remote block loads must never wait on each other through buffer eviction
+# (the cache reads only resident blocks and inserts from a worker). At 16MB DuckDB's own read-ahead
+# may run out of memory; every scan must still finish.
+for attempt in range(5):
+    sql=(f"LOAD '{EXT}'; SET memory_limit='16MB'; ATTACH 'differential:{LOCATION}{locator}' AS old ({S3});"
+         "SELECT count(*) FROM old.t WHERE payload!=sha256(id::VARCHAR);")
+    r=subprocess.run([CLI,'-init','/dev/null','-unsigned','-batch','-csv','-noheader'],input=sql,
+                     env=dict(os.environ,DIFFERENTIAL_STORE_ROOT=str(base/f'pressure-{attempt}')),text=True,capture_output=True,timeout=120)
+    assert r.stdout.split()==['0'] or 'Out of Memory' in r.stderr,(attempt,r.stdout,r.stderr)
+print('PASS remote scans under memory pressure finish (no eviction deadlock between block loads)',flush=True)
 # Upload staging grows with differential_s3_max_requests: 16 parallel 8 MiB pack uploads need
 # 128 MiB, above the 64 MiB floor, and must not fail with staging_full.
 parallel=base/'parallel'

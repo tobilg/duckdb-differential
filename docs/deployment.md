@@ -17,6 +17,7 @@ implemented and tested.
 | Restore, branch drop and maintenance from another process | **Yes** | Management locks and resumable intents |
 | Different OS users on one repository | **Yes, if the repository was created shared** (default: no) | `SET differential_repository_shared = true` before first use: setgid group-writable directories (`02770`) and group-writable files (`0660`) for the repository directory's group. Private repositories are `0700`/`0600` |
 | Repository on a network filesystem (NFS, SMB) | **No** (untested) | SQLite and the file locks need local-filesystem locking semantics |
+| Opening `engine.sqlite` with another SQLite library in a process that has the extension loaded (e.g. DuckDB's `sqlite` extension, Python's `sqlite3` beside an embedded DuckDB) | **No** (can crash or corrupt the store) | The extension links its own SQLite; a second copy in the same process ignores its locks. Inspect from a separate process; see [Inspecting a repository](storage-format.md#inspecting-a-repository) |
 
 ### Sharing a repository between local users
 
@@ -63,7 +64,8 @@ snapshots then come from S3.
 | Scenario | Works today? |
 | --- | --- |
 | Many hosts reading exported snapshots at once | **Yes.** `ATTACH 'differential:s3://…/descriptors/<sha256>'` needs only bucket access (for example a `TYPE s3` secret), and the objects are immutable |
-| Following a branch from another host | **Yes.** `ATTACH 'differential:s3://bucket/prefix/heads/sales/main'` attaches the latest exported snapshot of `sales/main`. Re-attach to pick up newer snapshots |
+| Following a branch from another host | **Yes.** `ATTACH 'differential:s3://bucket/prefix/heads/sales/main'` attaches the latest exported snapshot of `sales/main`; re-attach to pick up newer snapshots, or add `(FOLLOW true, FOLLOW_INTERVAL 10)` to follow it automatically: every shipped commit when the database ships its WAL (`SHIP_WAL`), else every exported snapshot |
+| Taking over a lost writer | **Yes, with WAL shipping.** With `SHIP_WAL 'async'` or `'sync'`, `differential_recover_branch('s3://bucket/prefix/heads/sales/main', 'sales', same_identity => true)` rebuilds the branch on another host as of the last shipped commit (none acknowledged is lost in `sync` mode) and that host continues the database. Without it, recovery starts from the latest exported snapshot |
 | Discovering what a bucket offers | **Yes.** `differential_remote_heads('s3://bucket/prefix/')` lists every exported branch head |
 | A host copying an export into its own writable database | **Yes.** `differential_recover_export` creates an independent copy with a new identity (a fork, not shared history) |
 | Several writer hosts exporting into the same bucket and prefix | **Yes, without interfering.** Each database writes under its own UUID (`dbs/<uuid>/`). Two databases with the same name need the UUID form `heads/<name>/<uuid>/<branch>` when attaching |

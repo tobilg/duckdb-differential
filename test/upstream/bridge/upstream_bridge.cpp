@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -45,14 +46,15 @@ static string Setup(ClientContext &context, const FunctionParameters &params) {
     }
     auto &manager = DatabaseManager::Get(context);
     auto host = manager.GetDatabase(context, DatabaseManager::GetDefaultDatabase(context));
-    auto alias = host->GetName();
+    auto alias = host->GetName().GetIdentifierName();
     auto quoted_alias = KeywordHelper::WriteOptionallyQuoted(alias);
     const string prefix = "__upstream_identity_";
     string identity;
     bool fixture = false;
     host->GetCatalog().GetSchema(context, "main").Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-        if (entry.name.compare(0, prefix.size(), prefix) == 0) {
-            identity = entry.name.substr(prefix.size());
+        auto &name = entry.name.GetIdentifierName();
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            identity = name.substr(prefix.size());
         } else {
             fixture = true;
         }

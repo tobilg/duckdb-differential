@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
             std::vector<unsigned char> bytes(size);
             for (size_t i = 0; i < size; i++)
                 bytes[i] = static_cast<unsigned char>(i * 7);
-            auto hash = Hash(bytes), key = "objects/" + hash;
+            auto hash = Hash(bytes), key = "dbs/00000000-0000-4000-8000-000000000000/packs/" + hash;
             auto file = std::filesystem::path(argv[2]) / "payload";
             {
                 std::ofstream output(file, std::ios::binary);
@@ -120,8 +120,9 @@ int main(int argc, char **argv) {
             provider.PutFile(key, file.string(),
                              hash); // Conditional idempotent PUT and multipart retry/abort.
             auto listed = provider.List("", 1);
-            if (listed.keys.empty())
-                throw std::runtime_error("LIST missing object");
+            if (listed.keys.empty() || listed.sizes.size() != listed.keys.size() ||
+                listed.modified.size() != listed.keys.size() || listed.modified[0] <= 0)
+                throw std::runtime_error("LIST missing object, size or modification time");
             bool corrupt = false;
             try {
                 provider.ReadRange(key, 123, expected.size(), size, std::string(64, '0'));
@@ -130,7 +131,7 @@ int main(int argc, char **argv) {
             }
             if (!corrupt)
                 throw std::runtime_error("Checksum mismatch accepted");
-            provider.DeleteOwnedObject(key);
+            provider.DeleteImmutable(key);
             bool missing = false;
             try {
                 provider.Head(key);

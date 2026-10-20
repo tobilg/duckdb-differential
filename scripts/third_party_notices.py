@@ -8,6 +8,7 @@ whenever VCPKG_COMMIT or vcpkg.json changes:
   python3 scripts/third_party_notices.py [build/release/vcpkg_installed]
 """
 import hashlib
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -57,8 +58,10 @@ def notice(port, version):
 
 
 duckdb_license = (ROOT / 'duckdb/LICENSE').read_text().strip()
-duckdb_version = subprocess.run(['git', '-C', str(ROOT / 'duckdb'), 'describe', '--tags'], capture_output=True,
-                                text=True).stdout.strip() or 'v1.5.6'
+# An untagged DuckDB pin is named by the Makefile's OVERRIDE_GIT_DESCRIBE, as in the build.
+override = re.search(r'^OVERRIDE_GIT_DESCRIBE \?= (\S+)', (ROOT / 'Makefile').read_text(), re.MULTILINE)
+duckdb_version = override.group(1) if override else subprocess.run(
+    ['git', '-C', str(ROOT / 'duckdb'), 'describe', '--tags'], capture_output=True, text=True).stdout.strip()
 texts, users = {}, {}
 for port in sorted(ports):
     text = (triplet / 'share' / port / 'copyright').read_text().strip()

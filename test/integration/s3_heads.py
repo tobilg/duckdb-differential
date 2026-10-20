@@ -27,7 +27,7 @@ def passed(name):
 
 
 def run(repository, sql, expected=0):
-    setup = (f"LOAD '{EXTENSION}'; SET extension_directory='{base / 'empty-extensions'}';"
+    setup = (f"LOAD '{EXTENSION}'; SET extension_directories=['{base / 'empty-extensions'}'];"
              "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;")
     r = subprocess.run([DUCKDB_CLI, '-init', '/dev/null', '-unsigned', '-batch', '-bail', '-json'],
                        input=setup + sql, text=True, capture_output=True,
@@ -124,4 +124,25 @@ error = run(writer, W + "UPDATE sales.t SET v = 7; CALL differential_create_snap
 assert 'head_conflict' in error, error
 assert read(f'sales/{writer_db}/main', 'reader14') == 60
 passed('a copied repository cannot overwrite heads it did not write (head_conflict) until it claims them')
+# Dropped branches: their heads become tombstones, also when the drop's export was deferred (then
+# differential_retry_export publishes it), and the name can be used again.
+dropper = base / 'drop-writer'
+D = f"ATTACH 'differential:drops' AS drops (DATA_PATH '{LOCATION}', {S3});"
+run(dropper, D + "CREATE TABLE drops.t AS SELECT 1 AS v; CALL differential_create_snapshot('drops');")
+for name, value in (('dev', 2), ('tmp', 3)):
+    run(dropper, f"CALL differential_create_branch('drops', '{name}');")
+    run(dropper, f"ATTACH 'differential:drops' AS b (BRANCH '{name}'); UPDATE b.t SET v = {value}; "
+                 "CALL differential_create_snapshot('b');")
+    assert read(f'drops/{name}', f'reader-drop-{name}') == value
+dropped_heads = lambda: [row['branch_name'] for row in run(base / 'lister', "SELECT branch_name FROM "
+                         f"differential_remote_heads('{LOCATION}', {S3_ARGS}) WHERE database_name = 'drops' ORDER BY 1;")[-1]]
+run(dropper, "CALL differential_drop_branch('drops', 'dev');")
+assert 'not_found' in run(base / 'reader-drop-gone', f"ATTACH 'differential:{LOCATION}heads/drops/dev' AS r ({S3});", 1)
+run(dropper, "CALL differential_drop_branch('drops', 'tmp', export_mode => 'deferred');")
+assert 'tmp' in dropped_heads()  # not published yet
+run(dropper, "CALL differential_retry_export('drops');")
+assert dropped_heads() == ['main']
+run(dropper, "CALL differential_create_branch('drops', 'dev');")  # the name again, from main's snapshot
+assert dropped_heads() == ['dev', 'main'] and read('drops/dev', 'reader-drop-again') == 1
+passed('dropped branches leave tombstones (also after a deferred drop, through retry_export); names are reusable')
 evidence_path('s3-heads.json').write_text(json.dumps({'scope': 'disposable pinned MinIO; no real AWS', 'passed': results}, indent=2) + '\n')

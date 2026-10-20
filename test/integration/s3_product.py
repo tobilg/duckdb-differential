@@ -26,7 +26,7 @@ s3_params=f"endpoint:='{endpoint}',path_style:=true,allow_http:=true"
 attach="ATTACH 'differential:sales' AS d;"
 def run(sql,directory=writer,extra=None,expected=0):
     env=dict(os.environ,DIFFERENTIAL_STORE_ROOT=str(directory));env.update(extra or {})
-    setup=f"LOAD '{EXT}'; SET extension_directory='{base/'empty-extensions'}'; SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;"
+    setup=f"LOAD '{EXT}'; SET extension_directories=['{base/'empty-extensions'}']; SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;"
     r=subprocess.run([CLI,'-init','/dev/null','-unsigned','-batch','-bail','-csv'],input=setup+sql,text=True,capture_output=True,env=env,timeout=120)
     assert r.returncode==expected,(sql,r.returncode,r.stdout,r.stderr)
     return r.stdout

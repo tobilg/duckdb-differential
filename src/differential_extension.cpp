@@ -11,7 +11,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_attach.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -27,6 +27,8 @@
 #include "duckdb_adapter/secrets.hpp"
 #include "duckdb_adapter/remote_cache.hpp"
 #include "duckdb_adapter/differential_catalog.hpp"
+#include "duckdb_adapter/follow.hpp"
+#include "differential_shipping.hpp"
 #include "duckdb_adapter/spill_policy.hpp"
 #include <map>
 #include <mutex>
@@ -87,6 +89,28 @@ void SetS3MaxRequests(ClientContext &, SetScope, Value &parameter) {
                                     int(differential::MAX_PARALLEL_REQUESTS));
     differential::SetRequestLimit(unsigned(value));
 }
+// Process-wide export settings: every DuckDB instance in the process shares them (the last SET applies).
+string Choice(const Value &parameter, const char *setting, std::initializer_list<const char *> choices) {
+    if (parameter.IsNull())
+        throw InvalidInputException("%s cannot be NULL", setting);
+    auto value = StringUtil::Lower(parameter.ToString());
+    for (auto choice : choices)
+        if (value == choice)
+            return value;
+    throw InvalidInputException("%s must be one of: %s", setting, StringUtil::Join(vector<string>(choices.begin(), choices.end()), ", "));
+}
+void SetExportVerification(ClientContext &, SetScope, Value &parameter) {
+    differential::SetExportVerification(
+        Choice(parameter, "differential_export_verification", {"checksum", "read_back"}) == "read_back");
+}
+void SetExportStaging(ClientContext &, SetScope, Value &parameter) {
+    differential::SetExportStaging(Choice(parameter, "differential_export_staging", {"disk", "memory"}) == "memory");
+}
+void SetGroupCommit(ClientContext &, SetScope, Value &parameter) {
+    if (parameter.IsNull())
+        throw InvalidInputException("differential_group_commit cannot be NULL");
+    differential::Store::SetGroupCommit(BooleanValue::Get(parameter.DefaultCastAs(LogicalType::BOOLEAN)));
+}
 void SetRemoteCacheSize(ClientContext &, SetScope, Value &parameter) {
     ParseRemoteCacheSize(parameter); // validate only; read when a remote file is opened
 }
@@ -111,14 +135,14 @@ void PlanDifferential(PlannerExtensionInput &, BoundStatement &statement) {
         return;
     if (statement.plan->type == LogicalOperatorType::LOGICAL_SET) {
         auto &setting = statement.plan->Cast<LogicalSet>();
-        if (setting.scope != SetScope::VARIABLE && StringUtil::CIEquals(setting.name, "temp_directory") &&
+        if (setting.scope != SetScope::VARIABLE && setting.name == "temp_directory" &&
             !setting.value.IsNull())
             ValidateDifferentialTempDirectory(setting.value.ToString());
         return;
     }
     if (statement.plan->type != LogicalOperatorType::LOGICAL_ATTACH)
         return;
-    auto &info = statement.plan->Cast<LogicalSimple>().info->Cast<AttachInfo>();
+    auto &info = *statement.plan->Cast<LogicalAttach>().info;
     auto type = info.options.find("type");
     bool prefixed = StringUtil::CIEquals(info.path.substr(0, 13), "differential:") &&
                     differential::S3Location::Is(info.path.substr(13));
@@ -144,7 +168,8 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
     auto repository = storage ? storage->repository : nullptr;
     auto catalog = [&](bool time_travel_snapshot = false) -> unique_ptr<Catalog> {
         return make_uniq<DifferentialCatalog>(db, repository, storage->time_travel, time_travel_snapshot,
-                                              info.path.rfind("diff://export/", 0) == 0);
+                                              info.path.rfind("diff://export/", 0) == 0 ||
+                                                  info.path.rfind("diff://follow/", 0) == 0);
     };
     if (target.rfind("diff://", 0) == 0) {
         // Internal URI; native options pass through unchanged.
@@ -162,7 +187,9 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
     opening.reset();
     RefreshS3Credentials(context, *control);
     string branch, snapshot_name, writers, on_conflict, on_busy;
-    std::optional<bool> publish_on_detach, publish_on_checkpoint;
+    std::optional<bool> publish_on_detach, publish_on_checkpoint, follow;
+    std::optional<string> ship_wal;
+    std::optional<int64_t> ship_interval, follow_interval; // milliseconds
     std::optional<int64_t> version, time;
     bool create = true;
     DataPathOptions data;
@@ -174,7 +201,8 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
         bool consumed = true;
         if (name == "branch" || name == "snapshot_version" || name == "snapshot_time" || name == "snapshot_name" ||
             name == "create_if_not_exists" || name == "writers" || name == "on_conflict" ||
-            name == "publish_on_detach" || name == "publish_on_checkpoint" || name == "on_busy") {
+            name == "publish_on_detach" || name == "publish_on_checkpoint" || name == "on_busy" ||
+            name == "ship_wal" || name == "ship_interval" || name == "follow" || name == "follow_interval") {
             if (value.IsNull())
                 throw BinderException("ATTACH option %s cannot be NULL", name);
             if (name == "branch")
@@ -189,6 +217,20 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
                 publish_on_detach = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
             else if (name == "publish_on_checkpoint")
                 publish_on_checkpoint = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
+            else if (name == "follow")
+                follow = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
+            else if (name == "ship_wal") {
+                ship_wal = StringUtil::Lower(value.ToString());
+                if (*ship_wal != "off" && *ship_wal != "async" && *ship_wal != "sync")
+                    throw BinderException("SHIP_WAL must be 'off', 'async' or 'sync'");
+            } else if (name == "ship_interval" || name == "follow_interval") {
+                auto seconds = DoubleValue::Get(value.DefaultCastAs(LogicalType::DOUBLE));
+                bool shipping = name == "ship_interval";
+                if (!(seconds >= (shipping ? 0.0 : 1.0)) || seconds > 3600)
+                    throw BinderException(shipping ? "SHIP_INTERVAL must be between 0 and 3600 seconds"
+                                                   : "FOLLOW_INTERVAL must be between 1 and 3600 seconds");
+                (shipping ? ship_interval : follow_interval) = int64_t(seconds * 1000);
+            }
             else if (name == "on_busy") {
                 on_busy = StringUtil::Lower(value.ToString());
                 if (on_busy != "warn" && on_busy != "error" && on_busy != "ignore")
@@ -214,12 +256,37 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
         options.access_mode = AccessMode::READ_ONLY;
         db.SetReadOnlyDatabase();
     };
+    if (follow_interval && !follow.value_or(false))
+        throw BinderException("FOLLOW_INTERVAL applies to FOLLOW true");
     if (differential::S3Location::Is(target)) {
         if (!branch.empty() || selectors || data.data_path_given || !writers.empty() || !on_conflict.empty() ||
-            publish_on_detach || publish_on_checkpoint || !on_busy.empty())
-            throw BinderException("An export attachment takes only S3 provider options");
+            publish_on_detach || publish_on_checkpoint || !on_busy.empty() || ship_wal || ship_interval)
+            throw BinderException("An export attachment takes only S3 provider options (and FOLLOW)");
         ApplyDifferentialSecret(context, data);
         std::pair<string, string> head_location;
+        if (follow.value_or(false)) {
+            // A follower moves to the branch's newest shipped commit (or exported snapshot).
+            if (!SplitHeadLocation(target, head_location))
+                throw BinderException("FOLLOW needs a branch path: 'differential:s3://<bucket>/<prefix>/heads/"
+                                      "<database>[/<database uuid>][/<branch>]'");
+            auto provider = EnsureS3(context, *control, data, head_location.first);
+            std::shared_ptr<Follower> follower;
+            try {
+                auto location = differential::ResolveBranchLocation(*control, provider, head_location.second);
+                follower = std::make_shared<Follower>(db.GetDatabase(), control, provider, location,
+                                                      follow_interval.value_or(10000), db.GetName().GetIdentifierName());
+                info.path = follower->Start();
+            } catch (const Exception &) {
+                throw;
+            } catch (const std::exception &error) {
+                throw BinderException(error.what());
+            }
+            read_only();
+            auto result = catalog();
+            result->Cast<DifferentialCatalog>().SetFollower(follower);
+            Follow(follower);
+            return result;
+        }
         if (SplitHeadLocation(target, head_location)) {
             // Latest exported snapshot of a branch, through its S3 branch head.
             auto provider = EnsureS3(context, *control, data, head_location.first);
@@ -240,6 +307,8 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
         read_only();
         return catalog();
     }
+    if (follow)
+        throw BinderException("FOLLOW applies to S3 branch paths ('differential:s3://…/heads/<database>/…')");
     if (target.empty())
         throw BinderException("Expected ATTACH 'differential:<database>'");
     if (target.find(':') != string::npos || target.find('/') != string::npos)
@@ -271,6 +340,9 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
             }
             provider = control->Profile(database);
         }
+        if (ship_wal || ship_interval)
+            throw BinderException("SHIP_WAL applies to single-writer databases; shared databases publish through S3 "
+                                  "already");
         if (!selectors) {
             bool read_only_attach = options.access_mode == AccessMode::READ_ONLY;
             if (read_only_attach && (!on_conflict.empty() || publish_on_detach || publish_on_checkpoint ||
@@ -367,6 +439,24 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
         if (!data.explicit_s3.empty())
             EnsureDataPath(context, *control, data); // verifies the options match the registration
     }
+    if (ship_wal || ship_interval) {
+        // Stored per database: every later writable attachment ships until SHIP_WAL 'off'.
+        if (selectors || options.access_mode == AccessMode::READ_ONLY)
+            throw BinderException("SHIP_WAL and SHIP_INTERVAL apply to writable attachments");
+        auto config = differential::GetShipConfig(*control, database);
+        if (ship_wal)
+            config.mode = *ship_wal;
+        if (ship_interval) {
+            if (config.mode == "off")
+                throw BinderException("SHIP_INTERVAL needs SHIP_WAL 'async' or 'sync'");
+            config.interval_ms = *ship_interval;
+        }
+        try {
+            differential::SetShipConfig(*control, database, config);
+        } catch (const std::exception &error) {
+            throw BinderException(error.what());
+        }
+    }
     if (selectors || options.access_mode == AccessMode::READ_ONLY) {
         int64_t id;
         if (version)
@@ -384,8 +474,11 @@ unique_ptr<Catalog> AttachDifferential(optional_ptr<StorageExtensionInfo> storag
         }
         info.path = "diff://db/" + database + "/snapshots/" + std::to_string(id);
         read_only();
-    } else
-        info.path = control->GetBranch(database, branch_name).URI();
+    } else {
+        auto attached = control->GetBranch(database, branch_name);
+        differential::StartShipping(control, attached); // when the database ships its WAL
+        info.path = attached.URI();
+    }
     return catalog();
 }
 } // namespace
@@ -423,7 +516,7 @@ struct ProbeState : GlobalTableFunctionState {
     bool done = false;
 };
 unique_ptr<FunctionData> BindProbe(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
     if (input.inputs[0].IsNull())
         throw InvalidInputException("Alias cannot be NULL");
     types.push_back(LogicalType::BOOLEAN);
@@ -444,7 +537,7 @@ void ExecuteProbe(ClientContext &context, TableFunctionInput &input, DataChunk &
     if (!context.transaction.IsAutoCommit())
         throw TransactionException("Management requires autocommit");
     auto &binding = input.bind_data->Cast<ProbeBind>();
-    auto db = DatabaseManager::Get(context).GetDatabase(context, binding.alias);
+    auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(binding.alias));
     if (!db || !db->GetStorageExtension())
         throw InvalidInputException("Expected differential attachment");
     auto path = db->GetStorageManager().GetDBPath();
@@ -494,7 +587,7 @@ struct StatusBinding : TableFunctionData {
         : repository(std::move(repository)) {}
 };
 unique_ptr<FunctionData> BindStatus(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
     types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
     names = {"capability", "status"};
     return make_uniq<StatusBinding>(input.info->Cast<StatusInfo>().repository);
@@ -514,14 +607,20 @@ void ExecuteStatus(ClientContext &, TableFunctionInput &input, DataChunk &output
         {"repository_open", configuration.open ? "true" : "false"},
         {"repository_shared", configuration.shared ? "true (group-writable, for several local users)"
                                                    : "false (owner only)"},
-        {"local_store_format", "1 (header-aligned chunks, paged manifests, write journal)"},
+        {"local_store_format", "2 (256 KiB block-aligned chunks, log-file byte ranges, paged manifests, "
+                               "append-only segments: write journal and payload in one)"},
         {"local_providers",
-         "chunks in the metadata store by default; immutable-file pools with DATA_PATH '/directory'"},
+         "chunks and log ranges in repository segments by default; immutable-file pools with DATA_PATH "
+         "'/directory'"},
         {"qualified_catalog_definitions",
          "native catalog names retained in views/macros; use original attachment alias when required"},
-        {"local_durability", "native-equivalent: writes journaled before returning (survive process death); "
-                             "durable at native FileSync via SQLite FULL (F_FULLFSYNC on macOS, fsync on Linux); "
+        {"local_durability", "native-equivalent: writes appended to a segment before returning (survive process "
+                             "death); durable at native FileSync: segment fsync, then SQLite FULL (fsync, as native "
+                             "DuckDB on every OS); local reads verified by CRC32C; "
                              "power loss untested"},
+        {"group_commit", string(differential::Store::GroupCommit() ? "on" : "off") +
+                             ": concurrent syncs of different databases in this process share one durable "
+                             "transaction (up to 16 MiB of new data; a larger sync commits alone)"},
         {"public_snapshot_identity_and_lifecycle", "local snapshots, branches/clones, compound "
                                                    "restore/delete and retirement; broader races under test"},
         {"sql_surface", "DuckLake-aligned: ATTACH 'differential:<database>' options, SET differential_*, "
@@ -534,6 +633,10 @@ void ExecuteStatus(ClientContext &, TableFunctionInput &input, DataChunk &output
                            "chain; never accepted as ATTACH or function options"},
         {"s3_snapshot_profile", "locally durable commits; remotely durable published snapshots in 8 MiB packs; "
                                 "pending exports retained; completed exports may drop local copies"},
+        {"export_uploads", string("verified by ") +
+                               (differential::ExportReadsBack() ? "reading them back (read_back)"
+                                                                : "the service's SHA-256 checksum (checksum)") +
+                               "; staged " + (differential::ExportStagesInMemory() ? "in memory" : "on disk")},
         {"distributed_writers", "optional per database (ATTACH ... WRITERS 'shared', S3 DATA_PATH): optimistic "
                                 "commits to S3 branch heads; a conflicting update fails and keeps its snapshot"},
         {"shared_publication", "checkpoints of shared databases are snapshots published in the background; "
@@ -543,10 +646,21 @@ void ExecuteStatus(ClientContext &, TableFunctionInput &input, DataChunk &output
                                }()},
         {"metadata_authority", "one local repository authority per host; one writer process per branch and "
                                "repository; shared databases: S3 branch heads and commit records"},
-        {"remote_gc", "no automatic remote export expiry or reclamation"},
+        {"remote_gc", "explicit, per S3 location (differential_cleanup_remote_files): unreachable data is condemned, "
+                      "then deleted once condemned and unreachable for the grace period; last error: " + [] {
+                          auto error = differential::LastRemoteCollectionError();
+                          return error.empty() ? std::string("none") : error;
+                      }()},
+        {"wal_shipping", "opt-in per single-writer S3 database (ATTACH ... SHIP_WAL 'async' | 'sync', SHIP_INTERVAL "
+                         "seconds): every published state of a writable branch is shipped to S3 as numbered epochs "
+                         "(dbs/<uuid>/log/...); recover with differential_recover_branch"},
+        {"followers", "ATTACH 'differential:s3://.../heads/<database>/...' (FOLLOW true, FOLLOW_INTERVAL seconds): "
+                      "read-only, moves to the newest shipped commit or exported snapshot; one request per interval "
+                      "when nothing changed; differential_followers()"},
         {"test_hooks", differential::test_hooks ? "compiled (test build)" : "absent"},
-        {"limits", "64 KiB chunks; 16 MiB manifest pages; 1 TiB logical file; 64 MiB write overlay per store; "
-                   "32 MiB local verified chunk cache; 8 MiB SQLite cache per store; remote reads cached in "
+        {"limits", "256 KiB chunks; 64 MiB manifest pages; 1 TiB logical file; write overlay per database "
+                   "published in the background beyond 16 MiB, by the writer beyond 64 MiB; 64 MiB segments; "
+                   "64 MiB local verified chunk cache; 8 MiB SQLite cache per store; remote reads cached in "
                    "DuckDB's external file cache (memory_limit) and optionally on disk "
                    "(differential_remote_cache_size); upload staging 8 MiB per parallel request; differential_s3_max_requests "
                    "(default 16) parallel S3 requests per process; no "
@@ -595,6 +709,24 @@ static void LoadInternal(ExtensionLoader &loader) {
                                   "instances in the process",
                                   duckdb::LogicalType::BIGINT, duckdb::Value::BIGINT(16), duckdb::SetS3MaxRequests,
                                   duckdb::SetScope::GLOBAL);
+    if (!config.HasExtensionOption("differential_group_commit"))
+        config.AddExtensionOption("differential_group_commit",
+                                  "Commit concurrent native syncs of different databases in one durable transaction "
+                                  "(one device flush). Process-wide",
+                                  duckdb::LogicalType::BOOLEAN, duckdb::Value::BOOLEAN(true), duckdb::SetGroupCommit,
+                                  duckdb::SetScope::GLOBAL);
+    if (!config.HasExtensionOption("differential_export_verification"))
+        config.AddExtensionOption("differential_export_verification",
+                                  "How exports verify each uploaded object: 'checksum' (the S3 service checks its "
+                                  "SHA-256) or 'read_back' (also download and hash it). Process-wide",
+                                  duckdb::LogicalType::VARCHAR, duckdb::Value("checksum"),
+                                  duckdb::SetExportVerification, duckdb::SetScope::GLOBAL);
+    if (!config.HasExtensionOption("differential_export_staging"))
+        config.AddExtensionOption("differential_export_staging",
+                                  "Where exports stage objects before uploading them: 'disk' (the repository's "
+                                  "staging directory) or 'memory'. Process-wide",
+                                  duckdb::LogicalType::VARCHAR, duckdb::Value("disk"), duckdb::SetExportStaging,
+                                  duckdb::SetScope::GLOBAL);
     if (!config.HasExtensionOption("differential_auto_gc"))
         config.AddExtensionOption("differential_auto_gc",
                                   "Run bounded differential garbage collection after native checkpoints",
@@ -607,7 +739,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     duckdb::PlannerExtension planner;
     planner.post_bind_function = duckdb::PlanDifferential;
     duckdb::PlannerExtension::Register(config, std::move(planner));
-    duckdb::TableFunction status("differential_status", {}, duckdb::ExecuteStatus, duckdb::BindStatus,
+    duckdb::TableFunction status("differential_status", vector<duckdb::LogicalType> {}, duckdb::ExecuteStatus, duckdb::BindStatus,
                                  duckdb::InitProbe);
     status.function_info = duckdb::make_shared_ptr<duckdb::StatusInfo>(store);
     loader.RegisterFunction(status);
@@ -622,7 +754,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 }
 void DifferentialExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
 std::string DifferentialExtension::Name() { return "differential"; }
-std::string DifferentialExtension::Version() const { return "v0.1.0"; }
+std::string DifferentialExtension::Version() const { return "v1.0.0"; }
 } // namespace duckdb
 extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(differential, loader) { duckdb::LoadInternal(loader); }

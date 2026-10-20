@@ -56,6 +56,8 @@ struct ObjectStat {
 };
 struct ObjectPage {
     std::vector<std::string> keys;
+    std::vector<uint64_t> sizes;   // per key
+    std::vector<int64_t> modified; // per key: S3 LastModified, microseconds since the epoch
     std::string continuation;
 };
 // Transport only. Publication, ownership and retention belong to the metadata authority.
@@ -77,11 +79,15 @@ class S3Provider {
     // Returns true when this call created the immutable object, false when an identical
     // object already existed (conditional PUT precondition).
     bool PutFile(const std::string &key, const std::string &file, const std::string &sha256);
+    // The same for an object held in memory (below the multipart threshold), without staging it.
+    bool PutBytes(const std::string &key, const std::vector<unsigned char> &bytes, const std::string &sha256);
     const S3Config &Config() const;
     // Requests this provider may run at once: its MAX_REQUESTS, within the process limit.
     unsigned Concurrency() const;
-    // Keys under the owned prefix (optionally only those under `within`), relative to the prefix.
-    ObjectPage List(const std::string &continuation = "", unsigned limit = 1000, const std::string &within = "");
+    // Keys under the owned prefix (optionally only those under `within`), relative to the prefix, in key
+    // order; with `start_after`, only keys after that one.
+    ObjectPage List(const std::string &continuation = "", unsigned limit = 1000, const std::string &within = "",
+                    const std::string &start_after = "");
     // Overwrite a small mutable object (branch heads only: dbs/<uuid>/branches/<name>). Every other
     // object is immutable and written once with PutFile.
     // Write a small mutable object (branch heads only: dbs/<uuid>/branches/<name>) conditionally: only
@@ -93,12 +99,15 @@ class S3Provider {
     // their one writer session and deleted when it ends (or by anyone once expired).
     void PutMarker(const std::string &key, const std::vector<unsigned char> &bytes);
     void DeleteMarker(const std::string &key);
-    // A small create-only record (snapshot expiry: dbs/<uuid>/expired/<n>); false if it existed.
+    // A small create-only record (snapshot expiry: dbs/<uuid>/expired/<n>, and its entry in the
+    // time-ordered dbs/<uuid>/expiries/ log); false if it existed.
     bool PutRecord(const std::string &key, const std::vector<unsigned char> &bytes);
     // Current content and ETag of a small database record (branch head, writer marker, commit or
     // expiry record) in one GET; nothing when it does not exist.
     std::optional<std::pair<std::vector<unsigned char>, std::string>> ReadMutable(const std::string &key);
-    void DeleteOwnedObject(const std::string &key);
+    // Remote garbage collection only: delete an immutable data object (descriptors/<sha256>,
+    // dbs/<uuid>/indexes/<sha256> or dbs/<uuid>/packs/<sha256>). Deleting a missing object succeeds.
+    void DeleteImmutable(const std::string &key);
     // Test fixture setup only; requires an explicitly enabled loopback HTTP endpoint.
     void CreateTestBucket();
     static std::vector<std::pair<std::string, uint64_t>> Metrics();

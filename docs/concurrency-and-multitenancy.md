@@ -41,7 +41,12 @@ By default a database belongs to exactly one repository, and therefore to one ho
 - Other hosts **read** its published snapshots from S3, by export locator or through branch
   heads (`ATTACH 'differential:s3://…/heads/<database>/<branch>'`).
 - Other hosts **cannot write** it. To continue elsewhere, `differential_recover_export` creates an
-  independent copy with a new identity (a fork, not shared history).
+  independent copy with a new identity (a fork, not shared history). With WAL shipping
+  (`SHIP_WAL`), `differential_recover_branch(..., same_identity => true)` lets another host take the
+  database over as of its last shipped commit (a failover, not a second writer: a repository that
+  still ships the branch gets `head_conflict`).
+- Other hosts can **follow** a branch read-only with `FOLLOW true` on its head path: every shipped
+  commit, or every exported snapshot.
 - In S3, every data object (packs, index pages, descriptors) is named by its content hash and
   written only if absent, so no writer can overwrite another's data. Each database writes under its
   own UUID (`dbs/<database uuid>/`), including its branch heads.

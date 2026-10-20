@@ -1,5 +1,6 @@
 #include "differential_metrics.hpp"
 #include "differential_s3.hpp"
+#include "differential_error.hpp"
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
@@ -8,6 +9,7 @@
 #include <aws/core/monitoring/HttpClientMetrics.h>
 #include <aws/core/monitoring/MonitoringFactory.h>
 #include <aws/core/monitoring/MonitoringInterface.h>
+#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
@@ -265,6 +267,12 @@ void SetRequestLimit(unsigned limit) {
     request_condition.notify_all();
 }
 unsigned RequestLimit() { return request_limit.load(); }
+// One SDK call, timed per operation type (retries included, the request permit wait excluded).
+template <class F>
+auto Timed(Metric metric, F &&call) {
+    Timer timer(metric);
+    return call();
+}
 struct S3Provider::Impl {
     std::shared_ptr<SDK> sdk = Runtime(); // Construct before and destroy after the client.
     S3Config config;
@@ -344,7 +352,7 @@ struct S3Provider::Impl {
         req.SetBucket(config.bucket.c_str());
         req.SetKey(Key(key));
         ++head_calls;
-        auto out = client->HeadObject(req);
+        auto out = Timed(Metric::S3RequestHead, [&] { return client->HeadObject(req); });
         if (!out.IsSuccess() && int(out.GetError().GetResponseCode()) == 404)
             return std::nullopt;
         Check(out, "HEAD");
@@ -354,6 +362,30 @@ struct S3Provider::Impl {
             throw std::runtime_error("[differential:corrupt_data] Invalid S3 object length");
         return ObjectStat{uint64_t(result.GetContentLength()),
                           it == result.GetMetadata().end() ? "" : it->second.c_str(), result.GetETag().c_str()};
+    }
+    // One create-only PUT of an immutable object whose SHA-256 the service verifies
+    // (x-amz-checksum-sha256). False when an identical object already exists.
+    bool PutOnce(const std::string &key, const std::shared_ptr<Aws::IOStream> &body, uint64_t size,
+                 const std::string &sha) {
+        Aws::S3::Model::PutObjectRequest req;
+        req.SetBucket(config.bucket.c_str());
+        req.SetKey(Key(key));
+        req.SetContentLength(int64_t(size));
+        req.SetMetadata(Aws::Map<Aws::String, Aws::String> {{"sha256", sha.c_str()}});
+        req.SetIfNoneMatch("*");
+        req.SetChecksumSHA256(Base64Hash(sha));
+        req.SetBody(body);
+        ++put_calls;
+        put_bytes += size;
+        auto out = Timed(Metric::S3RequestPut, [&] { return client->PutObject(req); });
+        if (!out.IsSuccess() && out.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED) {
+            auto existing = Head(key);
+            if (existing.size == size && existing.sha256 == sha)
+                return false;
+            throw Error(ErrorCode::ObjectConflict, "[differential:corrupt_data] Immutable object identity conflict");
+        }
+        Check(out, "PUT");
+        return true;
     }
     ObjectStat Head(const std::string &key) {
         auto result = TryHead(key);
@@ -390,7 +422,7 @@ std::vector<unsigned char> RangeGet(Aws::S3::S3Client &client, const S3Config &c
         return Aws::New<Aws::IOStream>("differential", buffer.get());
     });
     ++get_calls;
-    auto outcome = client.GetObject(req);
+    auto outcome = Timed(Metric::S3RequestRangeGet, [&] { return client.GetObject(req); });
     Check(outcome, "range GET");
     auto &result = outcome.GetResult();
     std::string expected = "bytes " + std::to_string(offset) + "-" + std::to_string(offset + length - 1) + "/";
@@ -434,7 +466,7 @@ std::vector<unsigned char> S3Provider::ReadObject(const std::string &key, uint64
         return Aws::New<Aws::IOStream>("differential", buffer.get());
     });
     ++get_calls;
-    auto outcome = impl->client->GetObject(req);
+    auto outcome = Timed(Metric::S3RequestGet, [&] { return impl->client->GetObject(req); });
     Check(outcome, "GET");
     auto &result = outcome.GetResult();
     auto size = uint64_t(buffer->Count());
@@ -473,65 +505,18 @@ bool S3Provider::PutFile(const std::string &key, const std::string &file, const 
     if (size > uint64_t(5) * 1024 * 1024 * 10000)
         throw std::runtime_error("Object exceeds bounded multipart limit");
     auto metadata = Aws::Map<Aws::String, Aws::String>{{"sha256", sha.c_str()}};
-    // Caller supplies stable staging. A bounded streaming checksum verifies it before upload.
-    {
-        std::ifstream in(file, std::ios::binary);
-        auto ctx = EVP_MD_CTX_new();
-        if (!ctx)
-            throw std::runtime_error("SHA256 allocation failure");
-        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(ctx, EVP_MD_CTX_free);
-        if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1)
-            throw std::runtime_error("SHA256 initialization failed");
-        char data[65536];
-        while (in) {
-            in.read(data, sizeof(data));
-            if (EVP_DigestUpdate(ctx, data, size_t(in.gcount())) != 1)
-                throw std::runtime_error("SHA256 update failed");
-        }
-        if (!in.eof())
-            throw std::runtime_error("Cannot read staging object");
-        unsigned char hash[32];
-        unsigned n;
-        if (EVP_DigestFinal_ex(ctx, hash, &n) != 1 || n != 32)
-            throw std::runtime_error("SHA256 finalization failed");
-        const char *hex = "0123456789abcdef";
-        std::string actual;
-        for (auto b : hash) {
-            actual += hex[b >> 4];
-            actual += hex[b & 15];
-        }
-        if (actual != sha)
-            throw std::runtime_error("[differential:corrupt_data] Staging object checksum mismatch");
-    }
-    if (size < impl->config.multipart_threshold) {
-        Aws::S3::Model::PutObjectRequest req;
-        req.SetBucket(impl->config.bucket.c_str());
-        req.SetKey(impl->Key(key));
-        req.SetContentLength(int64_t(size));
-        req.SetMetadata(metadata);
-        req.SetIfNoneMatch("*");
-        req.SetChecksumSHA256(Base64Hash(sha));
-        req.SetBody(
-            Aws::MakeShared<Aws::FStream>("differential", file.c_str(), std::ios::in | std::ios::binary));
-        ++put_calls;
-        put_bytes += size;
-        auto out = impl->client->PutObject(req);
-        if (!out.IsSuccess() &&
-            out.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED) {
-            auto existing = impl->Head(key);
-            if (existing.size == size && existing.sha256 == sha)
-                return false;
-            throw std::runtime_error("[differential:corrupt_data] Immutable object identity conflict");
-        }
-        Check(out, "PUT");
-        return true;
-    }
+    // A single PUT carries the SHA-256 the caller computed (x-amz-checksum-sha256): the service rejects a
+    // staging file that changed. Multipart parts are checked against it below as they are read.
+    if (size < impl->config.multipart_threshold)
+        return impl->PutOnce(
+            key, Aws::MakeShared<Aws::FStream>("differential", file.c_str(), std::ios::in | std::ios::binary), size,
+            sha);
     Aws::S3::Model::CreateMultipartUploadRequest create;
     create.SetBucket(impl->config.bucket.c_str());
     create.SetKey(impl->Key(key));
     create.SetMetadata(metadata);
     create.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::SHA256);
-    auto start = impl->client->CreateMultipartUpload(create);
+    auto start = Timed(Metric::S3RequestMultipartControl, [&] { return impl->client->CreateMultipartUpload(create); });
     Check(start, "multipart create");
     auto upload = start.GetResult().GetUploadId();
     try {
@@ -563,7 +548,7 @@ bool S3Provider::PutFile(const std::string &key, const std::string &file, const 
             part.SetContentLength(n);
             part.SetBody(body);
             part.SetChecksumSHA256(part_hash);
-            auto out = impl->client->UploadPart(part);
+            auto out = Timed(Metric::S3RequestMultipartPart, [&] { return impl->client->UploadPart(part); });
             Check(out, "multipart part");
             Aws::S3::Model::CompletedPart done;
             done.SetPartNumber(number);
@@ -586,7 +571,7 @@ bool S3Provider::PutFile(const std::string &key, const std::string &file, const 
         req.SetUploadId(upload);
         req.SetMultipartUpload(completed);
         req.SetIfNoneMatch("*");
-        auto out = impl->client->CompleteMultipartUpload(req);
+        auto out = Timed(Metric::S3RequestMultipartControl, [&] { return impl->client->CompleteMultipartUpload(req); });
         if (!out.IsSuccess() &&
             out.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED) {
             auto existing = impl->Head(key);
@@ -595,7 +580,7 @@ bool S3Provider::PutFile(const std::string &key, const std::string &file, const 
                 abort.SetBucket(impl->config.bucket.c_str());
                 abort.SetKey(impl->Key(key));
                 abort.SetUploadId(upload);
-                auto cleanup = impl->client->AbortMultipartUpload(abort);
+                auto cleanup = Timed(Metric::S3RequestMultipartControl, [&] { return impl->client->AbortMultipartUpload(abort); });
                 Check(cleanup, "duplicate multipart abort");
                 return false;
             }
@@ -607,11 +592,19 @@ bool S3Provider::PutFile(const std::string &key, const std::string &file, const 
         abort.SetBucket(impl->config.bucket.c_str());
         abort.SetKey(impl->Key(key));
         abort.SetUploadId(upload);
-        impl->client->AbortMultipartUpload(abort);
+        Timed(Metric::S3RequestMultipartControl, [&] { return impl->client->AbortMultipartUpload(abort); });
         // Process death can leave an upload: durable upload intents/reconciliation are a later integration
         // gate.
         throw;
     }
+}
+bool S3Provider::PutBytes(const std::string &key, const std::vector<unsigned char> &bytes, const std::string &sha) {
+    if (!IsHash(sha) || bytes.size() >= impl->config.multipart_threshold)
+        throw std::runtime_error("Invalid checksum, or an object for a multipart upload");
+    Impl::Permit permit(*impl);
+    // Streams the caller's buffer without copying it (the SDK rewinds it to retry).
+    Aws::Utils::Stream::PreallocatedStreamBuf buffer(const_cast<unsigned char *>(bytes.data()), bytes.size());
+    return impl->PutOnce(key, Aws::MakeShared<Aws::IOStream>("differential", &buffer), bytes.size(), sha);
 }
 std::optional<std::string> S3Provider::PutMutable(const std::string &key, const std::vector<unsigned char> &bytes,
                                                   const std::string &if_match) {
@@ -634,7 +627,7 @@ std::optional<std::string> S3Provider::PutMutable(const std::string &key, const 
         req.SetIfMatch(if_match.c_str());
     ++put_calls;
     put_bytes += bytes.size();
-    auto outcome = impl->client->PutObject(req);
+    auto outcome = Timed(Metric::S3RequestConditionalPut, [&] { return impl->client->PutObject(req); });
     auto status = outcome.IsSuccess() ? Aws::Http::HttpResponseCode::OK : outcome.GetError().GetResponseCode();
     // 412: the object changed (or exists); 409: a concurrent conditional write to the same key.
     if (status == Aws::Http::HttpResponseCode::PRECONDITION_FAILED || status == Aws::Http::HttpResponseCode::CONFLICT)
@@ -658,7 +651,7 @@ std::optional<std::pair<std::vector<unsigned char>, std::string>> S3Provider::Re
         return Aws::New<Aws::IOStream>("differential", buffer.get());
     });
     ++get_calls;
-    auto outcome = impl->client->GetObject(req);
+    auto outcome = Timed(Metric::S3RequestGet, [&] { return impl->client->GetObject(req); });
     if (!outcome.IsSuccess() && outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND)
         return std::nullopt;
     Check(outcome, "GET");
@@ -672,7 +665,8 @@ std::optional<std::pair<std::vector<unsigned char>, std::string>> S3Provider::Re
     get_bytes += size;
     return std::make_pair(std::move(buffer->bytes), std::string(result.GetETag().c_str()));
 }
-ObjectPage S3Provider::List(const std::string &continuation, unsigned limit, const std::string &within) {
+ObjectPage S3Provider::List(const std::string &continuation, unsigned limit, const std::string &within,
+                            const std::string &start_after) {
     if (!limit || limit > 1000)
         throw std::runtime_error("S3 list page must be bounded to 1..1000");
     Impl::Permit permit(*impl);
@@ -682,8 +676,10 @@ ObjectPage S3Provider::List(const std::string &continuation, unsigned limit, con
     req.SetMaxKeys(int(limit));
     if (!continuation.empty())
         req.SetContinuationToken(continuation.c_str());
+    else if (!start_after.empty())
+        req.SetStartAfter(impl->Key(start_after));
     ++list_calls;
-    auto out = impl->client->ListObjectsV2(req);
+    auto out = Timed(Metric::S3RequestList, [&] { return impl->client->ListObjectsV2(req); });
     Check(out, "LIST");
     ObjectPage page;
     for (auto &object : out.GetResult().GetContents()) {
@@ -691,6 +687,8 @@ ObjectPage S3Provider::List(const std::string &continuation, unsigned limit, con
         if (key.rfind(impl->config.prefix, 0) != 0)
             throw std::runtime_error("S3 LIST returned foreign key");
         page.keys.push_back(key.substr(impl->config.prefix.size()));
+        page.sizes.push_back(object.GetSize() < 0 ? 0 : uint64_t(object.GetSize()));
+        page.modified.push_back(object.GetLastModified().Millis() * 1000);
     }
     page.continuation = out.GetResult().GetNextContinuationToken().c_str();
     return page;
@@ -717,10 +715,11 @@ void S3Provider::PutMarker(const std::string &key, const std::vector<unsigned ch
     req.SetBody(body);
     ++put_calls;
     put_bytes += bytes.size();
-    Check(impl->client->PutObject(req), "PUT");
+    Check(Timed(Metric::S3RequestConditionalPut, [&] { return impl->client->PutObject(req); }), "PUT");
 }
 bool S3Provider::PutRecord(const std::string &key, const std::vector<unsigned char> &bytes) {
-    if (key.rfind("dbs/", 0) != 0 || key.find("/expired/") == std::string::npos || bytes.empty() ||
+    if (key.rfind("dbs/", 0) != 0 ||
+        (key.find("/expired/") == std::string::npos && key.find("/expiries/") == std::string::npos) || bytes.empty() ||
         bytes.size() > 64 * 1024)
         throw std::runtime_error("Only small expiry records are written this way");
     auto sha = Digest(bytes.data(), bytes.size());
@@ -736,7 +735,7 @@ bool S3Provider::PutRecord(const std::string &key, const std::vector<unsigned ch
     req.SetBody(body);
     ++put_calls;
     put_bytes += bytes.size();
-    auto outcome = impl->client->PutObject(req);
+    auto outcome = Timed(Metric::S3RequestConditionalPut, [&] { return impl->client->PutObject(req); });
     auto status = outcome.IsSuccess() ? Aws::Http::HttpResponseCode::OK : outcome.GetError().GetResponseCode();
     if (status == Aws::Http::HttpResponseCode::PRECONDITION_FAILED || status == Aws::Http::HttpResponseCode::CONFLICT)
         return false;
@@ -750,17 +749,31 @@ void S3Provider::DeleteMarker(const std::string &key) {
     req.SetBucket(impl->config.bucket.c_str());
     req.SetKey(impl->Key(key));
     ++delete_calls;
-    Check(impl->client->DeleteObject(req), "DELETE");
+    Check(Timed(Metric::S3RequestDelete, [&] { return impl->client->DeleteObject(req); }), "DELETE");
 }
-void S3Provider::DeleteOwnedObject(const std::string &key) {
-    if (key.rfind("objects/", 0) != 0 || !IsHash(key.substr(8)))
-        throw std::runtime_error("Deletion requires an owned immutable object key");
+void S3Provider::DeleteImmutable(const std::string &key) {
+    auto slash = key.rfind('/');
+    auto folder = slash == std::string::npos ? std::string() : key.substr(0, slash + 1);
+    bool shape = folder == "descriptors/";
+    bool epoch = false;
+    if (folder.rfind("dbs/", 0) == 0 && folder.size() > 40) {
+        auto database = folder.substr(4, 36), kind = folder.substr(40);
+        bool uuid = database.find_first_not_of("0123456789abcdef-") == std::string::npos;
+        shape = uuid && (kind == "/packs/" || kind == "/indexes/");
+        // Shipping epochs: dbs/<uuid>/log/<branch name>/<branch uuid>/<10 digits>/<10 digits>.
+        auto name = key.substr(slash + 1);
+        epoch = uuid && kind.rfind("/log/", 0) == 0 && name.size() == 10 &&
+                name.find_first_not_of("0123456789") == std::string::npos &&
+                std::count(kind.begin(), kind.end(), '/') == 5;
+    }
+    if (!epoch && (!shape || !IsHash(key.substr(slash + 1))))
+        throw std::runtime_error("Deletion requires an immutable descriptor, index, pack or shipping epoch key");
     Impl::Permit permit(*impl);
     Aws::S3::Model::DeleteObjectRequest req;
     req.SetBucket(impl->config.bucket.c_str());
     req.SetKey(impl->Key(key));
     ++delete_calls;
-    auto out = impl->client->DeleteObject(req);
+    auto out = Timed(Metric::S3RequestDelete, [&] { return impl->client->DeleteObject(req); });
     Check(out, "DELETE");
 }
 void S3Provider::CreateTestBucket() {

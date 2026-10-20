@@ -1,6 +1,7 @@
 # Project instructions
 
-- Target DuckDB v1.5.6 (the community repository's current stable). One C++ extension on
+- Target DuckDB v2.0.0 (the community repository's current stable; pinned to commit d54cbbe3df,
+  which the community repository builds as v2.0.0, until the tag exists). One C++ extension on
   DuckDB's C++ extension template, native storage semantics. Linux and macOS only.
 - All S3 operations must use the AWS SDK for C++ pinned through vcpkg (`VCPKG_COMMIT`).
 - Preserve native sync/namespace ordering, durable mappings, and all retention roots.
@@ -20,8 +21,13 @@
 
 Each decision was made by the repository owner; changing one needs the owner's agreement.
 
-- **Native-equivalent durability.** Writes go to an overlay and journal, and are
-  durable at native `FileSync` (SQLite FULL + `F_FULLFSYNC`).
+- **Native-equivalent durability.** Writes go to an overlay and the file group's append-only
+  segment, and are durable at native `FileSync` (segment `fsync`, then SQLite FULL with `fsync`,
+  on every OS as native DuckDB; macOS included, no `F_FULLFSYNC`: owner decision 2026-10-19).
+- **Store format 2 (2026-10-19).** Payload moved out of SQLite into append-only segments that
+  are also the write journal; 256 KiB block-aligned chunks; WAL sidecars stored as byte ranges;
+  CRC32C verifies local reads (SHA-256 stays the identity and the S3 checksum); exports are
+  `differential-export-v2`/`DIX2`. One format revision ahead of WAL shipping.
 - **Local eviction.** The local copy of a completed S3 export may be evicted; reads
   then go through S3, and branch/clone/restore rehydrate.
 - **SQL surface.** The surface is DuckLake-aligned, and the old functions were
@@ -78,6 +84,16 @@ Each decision was made by the repository owner; changing one needs the owner's a
   (`<repository>/cache/<2 hex>/<sha256>`, `differential_remote_cache_size`, default off) is
   content-addressed, verified on read, LRU-trimmed and never authoritative. Bulk copies never
   fill caches.
+- **WAL shipping and followers (2026-10-20).**
+  - `SHIP_WAL 'off' | 'async' | 'sync'` and `SHIP_INTERVAL` (seconds) on ATTACH, stored per database in
+    the metadata store (later writable attachments ship until `'off'`); single-writer S3 databases only.
+  - Epochs `dbs/<uuid>/log/<branch>/<branch uuid>/<inverted chain>/<inverted epoch>` are create-only and
+    hash-chained; chains restart from an internal base export (descriptor snapshot 0, not a public
+    snapshot) after each checkpoint, 256 epochs or 64 MiB. `sync` waits for S3 at every native sync.
+  - `differential_recover_branch` (lazy import; `same_identity` for failover). Remote collection keeps the
+    newest chain per branch.
+  - `FOLLOW true` / `FOLLOW_INTERVAL` (seconds, default 10) on head paths: a background poller prepares
+    hidden attachments; lookups pick one state per transaction; never S3 I/O while binding.
 - **S3 parallelism (2026-10-11).** `differential_s3_max_requests` (process-wide, 1–64, default 16,
   chosen from a real-AWS run of `benchmarks/s3_throughput.py`); per-location `MAX_REQUESTS` is
   an optional lower cap (0/unset = follow the setting).
@@ -92,13 +108,14 @@ Each decision was made by the repository owner; changing one needs the owner's a
 | `DATA_PATH`/S3 option parsing | `src/duckdb_adapter/sql_options.hpp` |
 | DuckDB secrets (`TYPE differential`, `TYPE s3` lookup) | `src/duckdb_adapter/secrets.{hpp,cpp}` |
 | Filesystem adapter (generations, leases, snapshot on checkpoint) | `src/duckdb_adapter/durable_filesystem.cpp` |
-| Byte store, journal, manifests | `src/storage/` |
+| Byte store, segments (journal and payload), manifests | `src/storage/` |
 | Metadata store (SQLite, control format 1) | `src/metadata/control.cpp`, `retention.cpp`, `resolve.cpp` |
-| S3 transport, packed exports, remote reads, disk cache, branch heads, shared databases | `src/providers/s3/` |
+| S3 transport, packed exports, remote reads, disk cache, branch heads, shared databases, remote GC, WAL shipping | `src/providers/s3/` |
+| Followers (polling, per-transaction state) | `src/duckdb_adapter/follow.{hpp,cpp}` |
 | Remote memory cache (DuckDB `ExternalFileCache`) | `src/duckdb_adapter/remote_cache.{hpp,cpp}` |
 | Local payload pools | `src/providers/local/` |
 
-Storage formats (repository layout, schema, hashes, journal, S3 packs/indexes/descriptors) are
+Storage formats (repository layout, schema, hashes, segments, S3 packs/indexes/descriptors) are
 specified in `docs/storage-format.md`. Keep it in sync with any format change, and bump the
 relevant version.
 
@@ -108,7 +125,8 @@ and function with an example, and must stay complete; its examples and those of
 
 - **Attaching.** `ATTACH 'differential:<db>'` with `BRANCH`, `SNAPSHOT_VERSION`/`SNAPSHOT_TIME`/
   `SNAPSHOT_NAME`, `READ_ONLY`, `CREATE_IF_NOT_EXISTS`, `DATA_PATH` (local directory or
-  `s3://bucket/prefix/`), S3 options and `SECRET`. `ATTACH 'differential:s3://…/descriptors/<sha256>'`
+  `s3://bucket/prefix/`), S3 options, `SECRET`, `SHIP_WAL`/`SHIP_INTERVAL`, and on head paths
+  `FOLLOW`/`FOLLOW_INTERVAL`. `ATTACH 'differential:s3://…/descriptors/<sha256>'`
   attaches an export, `…/heads/<db>[/<branch>]` a branch's latest export.
 - **Settings.** `SET differential_repository | differential_repository_shared | differential_auto_gc |
   differential_snapshot_on_checkpoint | differential_remote_cache_size | differential_s3_max_requests`.
@@ -137,6 +155,7 @@ make integration && make test_integration # hooks build; C++ unit tests + Python
 make test_upstream_harness test_upstream_pr # adapter checks and PR coverage
 make test_upstream test_upstream_skips     # full SQLLogicTest inventory and exclusion audit
 make test_minio                           # S3 suites, disposable MinIO (Docker)
+make bench-tpch                           # TPC-H SF1, native vs Differential local/S3 -> docs/benchmarks-tpch.md
 ```
 
 - `make integration` compiles failpoints and probes (`-DDIFFERENTIAL_TEST_HOOKS=ON`) and does not
@@ -152,14 +171,14 @@ make test_minio                           # S3 suites, disposable MinIO (Docker)
   DuckDB, changing the adapter or reviewing the exclusion list. Manual full runs support
   optional sharding. Do not add directory-wide exclusions
   or classify timeouts as unsupported tests. Normal runs have no per-test time limit.
-  Required official HTTP, INET and SQLite test dependencies are cached under `build/`.
+  Required official HTTP, INET, SQLite, Quack and Encodings test dependencies are cached under `build/`.
   Individually listed excessive-disk workloads are excluded by owner decision; their audit
   checks the pinned source without executing them.
   The separate upstream bridge is test-only.
 - Tests and builds write result transcripts to the untracked `build/evidence/`. Do not track
   transcripts or implementation notes.
 - There is exactly one store, control and export format, with no migrations
-  (the extension is not published yet; the sole header-aligned layout is format 1). Once released,
+  (the extension is not published yet; the sole layout is store format 2, export v2). Once released,
   any format change needs a version bump, a migration and tests against data written by the previous release.
 - `make bump-version V=X.Y.Z` keeps all version references consistent; `community/description.yml`
   is the community-extensions descriptor draft (submit only when the owner asks).

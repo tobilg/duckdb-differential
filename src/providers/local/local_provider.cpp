@@ -1,6 +1,7 @@
 #include "differential_local.hpp"
 #include "differential_hooks.hpp"
 #include "differential_metrics.hpp"
+#include "differential_store.hpp"
 #include <openssl/evp.h>
 #include <algorithm>
 #include <filesystem>
@@ -31,16 +32,10 @@ struct FD {
     throw std::runtime_error(std::string("[differential:") + category + "] " + action);
 }
 void Crash(const char *point) { Failpoint("DIFFERENTIAL_LOCAL_CRASH", point); }
-// Data reaches the device with fsync; F_FULLFSYNC additionally flushes the device cache.
-void Sync(int fd, bool device_flush) {
+// Durable at fsync, as native DuckDB on every OS (no F_FULLFSYNC device-cache flush on macOS).
+void Sync(int fd, bool) {
     if (fsync(fd))
         Error("Local pool sync failed");
-#ifdef __APPLE__
-    if (device_flush && fcntl(fd, F_FULLFSYNC))
-        Error("Local pool full sync failed");
-#else
-    (void)device_flush;
-#endif
 }
 void SyncDirectory(const std::filesystem::path &path, bool device_flush) {
     FD fd(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
@@ -48,6 +43,19 @@ void SyncDirectory(const std::filesystem::path &path, bool device_flush) {
         Error("Cannot open local pool directory");
     Sync(fd.value, device_flush);
 }
+#ifdef __linux__
+// Linux: a batch of at least this many files is made durable with two syncfs calls (data, then
+// names) instead of one fsync per file plus directory syncs. syncfs reports writeback errors of
+// the file system since Linux 5.8.
+constexpr size_t SYNCFS_BATCH = 8;
+void SyncFileSystem(const std::string &path) {
+    FD fd(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (fd.value < 0)
+        Error("Cannot open local pool directory");
+    if (syncfs(fd.value))
+        Error("Local pool file system sync failed");
+}
+#endif
 void CreateDirectories(const std::filesystem::path &path, const Permissions &permissions) {
     if (std::filesystem::exists(path)) {
         if (!std::filesystem::is_directory(std::filesystem::symlink_status(path)))
@@ -77,7 +85,7 @@ void CheckHash(const std::string &hash) {
 void Verify(const std::string &hash, const std::vector<unsigned char> &bytes) {
     unsigned char digest[32];
     unsigned n = 0;
-    if (bytes.size() != 65536 ||
+    if (bytes.size() != Store::CHUNK ||
         EVP_Digest(bytes.data(), bytes.size(), digest, &n, EVP_sha256(), nullptr) != 1 || n != 32)
         throw std::runtime_error("[differential:corrupt_data] Invalid local payload length/digest");
     const char hex[] = "0123456789abcdef";
@@ -212,9 +220,9 @@ std::vector<unsigned char> LocalPool::Get(const std::string &hash) {
     if (fd.value < 0)
         throw std::runtime_error("[differential:unavailable_object] Local pool object unavailable");
     struct stat st {};
-    if (fstat(fd.value, &st) || !S_ISREG(st.st_mode) || st.st_size != 65536)
+    if (fstat(fd.value, &st) || !S_ISREG(st.st_mode) || uint64_t(st.st_size) != Store::CHUNK)
         throw std::runtime_error("[differential:corrupt_data] Invalid local object file");
-    std::vector<unsigned char> bytes(65536);
+    std::vector<unsigned char> bytes(Store::CHUNK);
     size_t done = 0;
     while (done < bytes.size()) {
         auto n = read(fd.value, bytes.data() + done, bytes.size() - done);
@@ -241,6 +249,11 @@ void LocalPool::PutBatch(const std::vector<std::pair<std::string, const std::vec
     std::vector<Staged> staged;
     std::set<std::string> directories, seen;
     bool created_directory = false;
+#ifdef __linux__
+    bool batched = objects.size() >= SYNCFS_BATCH;
+#else
+    bool batched = false;
+#endif
     try {
         for (auto &object : objects) {
             CheckHash(object.first);
@@ -257,7 +270,7 @@ void LocalPool::PutBatch(const std::vector<std::pair<std::string, const std::vec
                 created_directory = true;
             }
             struct stat existing {};
-            if (stat(target.c_str(), &existing) == 0 && S_ISREG(existing.st_mode) && existing.st_size == 65536)
+            if (stat(target.c_str(), &existing) == 0 && S_ISREG(existing.st_mode) && uint64_t(existing.st_size) == Store::CHUNK)
                 continue; // immutable name already published; reads verify its digest
             auto pattern = (folder / "write-XXXXXX").string();
             std::vector<char> writable(pattern.begin(), pattern.end());
@@ -281,9 +294,14 @@ void LocalPool::PutBatch(const std::vector<std::pair<std::string, const std::vec
                 Count(Counter::LocalPoolWriteBytes, uint64_t(n));
             }
             Crash("payload_written");
-            Sync(fd.value, false);
+            if (!batched)
+                Sync(fd.value, false);
             directories.insert(folder.string());
         }
+#ifdef __linux__
+        if (batched)
+            SyncFileSystem(directory); // every staged file's data, before any name refers to it
+#endif
         Crash("payload_synced");
         for (auto &item : staged) {
             // link is atomic and cannot replace an immutable name.
@@ -298,9 +316,16 @@ void LocalPool::PutBatch(const std::vector<std::pair<std::string, const std::vec
             directories.insert(directory);
         // Name publication, then one device-cache flush covering every file and directory
         // of the batch before the caller commits mappings.
-        for (auto &folder : directories)
-            SyncDirectory(folder, false);
-        SyncDirectory(directory, true);
+#ifdef __linux__
+        if (batched)
+            SyncFileSystem(directory);
+        else
+#endif
+        {
+            for (auto &folder : directories)
+                SyncDirectory(folder, false);
+            SyncDirectory(directory, true);
+        }
         Crash("payload_durable");
     } catch (...) {
         for (auto &item : staged)

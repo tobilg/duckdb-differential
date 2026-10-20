@@ -21,6 +21,8 @@ class Host:
             'duckdb_row_count':([C.POINTER(Result)],C.c_uint64),
             'duckdb_value_int64':([C.POINTER(Result),C.c_uint64,C.c_uint64],C.c_int64),
             'duckdb_interrupt':([p],None),
+            'duckdb_value_varchar':([C.POINTER(Result),C.c_uint64,C.c_uint64],C.c_void_p),
+            'duckdb_free':([p],None),
         }
         for name,(args,result) in signatures.items():
             f=getattr(self.lib,name);f.argtypes=args;f.restype=result
@@ -41,6 +43,18 @@ class Host:
             if self.lib.duckdb_query(conn,sql.encode(),C.byref(result)):
                 raise RuntimeError(self.lib.duckdb_result_error(C.byref(result)).decode())
             return self.lib.duckdb_value_int64(C.byref(result),0,0) if self.lib.duckdb_row_count(C.byref(result)) else None
+        finally:self.lib.duckdb_destroy_result(C.byref(result))
+    def text(self,conn,sql):
+        """First cell of the result as text (None for no rows or NULL)."""
+        result=Result()
+        try:
+            if self.lib.duckdb_query(conn,sql.encode(),C.byref(result)):
+                raise RuntimeError(self.lib.duckdb_result_error(C.byref(result)).decode())
+            if not self.lib.duckdb_row_count(C.byref(result)):return None
+            value=self.lib.duckdb_value_varchar(C.byref(result),0,0)
+            if not value:return None
+            try:return C.string_at(value).decode()
+            finally:self.lib.duckdb_free(value)
         finally:self.lib.duckdb_destroy_result(C.byref(result))
     def close(self):
         for conn in self.connections:self.lib.duckdb_disconnect(C.byref(conn))

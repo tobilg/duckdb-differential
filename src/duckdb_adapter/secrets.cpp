@@ -32,7 +32,7 @@ unique_ptr<BaseSecret> CreateDifferentialSecret(ClientContext &, CreateSecretInp
         auto name = StringUtil::Lower(option.first);
         if (!validate.Take(name, option.second))
             throw InvalidInputException("Unknown option %s for a TYPE differential secret", name);
-        secret->secret_map[name] = option.second;
+        secret->secret_map[Identifier(name)] = option.second;
     }
     if (!validate.data_path.empty() && differential::S3Location::Is(validate.data_path))
         validate.ConfigFor(validate.data_path); // bucket, prefix and S3 option bounds
@@ -51,7 +51,7 @@ unique_ptr<KeyValueSecret> S3Secret(ClientContext &context, const string &locati
 }
 string Text(const KeyValueSecret &secret, const string &key) {
     Value value;
-    return secret.TryGetValue(key, value) && !value.IsNull() ? value.ToString() : string();
+    return secret.TryGetValue(Identifier(key), value) && !value.IsNull() ? value.ToString() : string();
 }
 // The s3 secret's connection settings, as defaults: REGION, ENDPOINT (+ USE_SSL), URL_STYLE.
 void ApplyS3Secret(ClientContext &context, DataPathOptions &options, const string &location) {
@@ -89,7 +89,7 @@ void UseS3Secret(ClientContext &context, const differential::S3Config &config) {
     std::optional<differential::SecretCredentials> credentials;
     if (secret) {
         differential::SecretCredentials found;
-        found.secret_name = secret->GetName();
+        found.secret_name = secret->GetName().GetIdentifierName();
         Value refresh;
         if (secret->GetProvider() == "credential_chain" && secret->TryGetValue("refresh_info", refresh) &&
             !refresh.IsNull()) {
@@ -99,7 +99,7 @@ void UseS3Secret(ClientContext &context, const differential::S3Config &config) {
                 auto &names = StructType::GetChildTypes(refresh.type());
                 auto &values = StructValue::GetChildren(refresh);
                 for (idx_t i = 0; i < names.size(); i++)
-                    if (StringUtil::Lower(names[i].first) == "profile" && !values[i].IsNull())
+                    if (names[i].first == "profile" && !values[i].IsNull())
                         found.profile = values[i].ToString();
             }
             credentials = found;
@@ -151,7 +151,7 @@ void ApplyDifferentialSecret(ClientContext &context, DataPathOptions &options) {
     if (!secret)
         return;
     for (auto &option : secret->secret_map)
-        options.Default(option.first, option.second);
+        options.Default(StringUtil::Lower(option.first.GetIdentifierName()), option.second);
 }
 string EnsureS3(ClientContext &context, differential::Control &control, const DataPathOptions &options,
                 const string &location) {

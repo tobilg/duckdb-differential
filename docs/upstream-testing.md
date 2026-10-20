@@ -73,14 +73,14 @@ database fixtures and their WAL sidecars are copied before use. Other input fixt
 shared from the pinned checkout.
 
 The initial host has a file path, so DuckDB's own `require noforcestorage` guards work.
-Default execution uses two DuckDB query threads, a 1 GB memory limit and two concurrent
-test pairs. Individual configurations enable the upstream 16 KiB block-size variants,
+Default execution uses two DuckDB query threads, a 3 GB memory limit (`--memory-limit`) and two
+concurrent test pairs; DuckDB 2.0's SF1 workloads and some CSV/Parquet tests exceed 1 GB. Individual configurations enable the upstream 16 KiB block-size variants,
 500000-row vacuum-rebuild threshold, latest storage for VARIANT/geometry, and larger memory
 allowances for ART, very wide joins, large CSV/Parquet buffers, giant strings and TPC-H generator
 comparisons where required. These configurations apply equally to both backends. Tests can
 also set their own SQL settings. SQL extension autoload and autoinstall
 are disabled; extension installation tests may explicitly attempt downloads. The runner
-installs required official HTTP, INET and SQLite extensions into `build/upstream_extensions`,
+installs required official HTTP, INET, SQLite, Quack and Encodings extensions into `build/upstream_extensions`,
 then copies only the required artifacts into each test's disposable extension directory.
 Installation and public remote fixture tests require network access; missing dependencies
 fail setup instead of silently reducing coverage. Tests requiring `LOCAL_EXTENSION_REPO`

@@ -5,8 +5,8 @@
 #include <mutex>
 
 namespace differential {
-// Remote snapshot descriptor ("differential-export-v1"). Index pages carry a table of the
-// immutable packs they reference and map each 64 KiB chunk to (identity, pack, slot).
+// Remote snapshot descriptor ("differential-export-v2"). Index pages carry a table of the
+// immutable packs they reference and map each 256 KiB chunk to (identity, pack, slot).
 struct Descriptor {
     // "duckdb-<version>" of the writer. Recorded, not enforced: DuckDB itself decides at open
     // whether it can read the stored native file.
@@ -25,6 +25,13 @@ struct Descriptor {
 std::string ExportSnapshot(Control &, const std::string &database, int64_t &snapshot,
                            std::function<bool()> cancelled = {});
 std::vector<std::pair<std::string, uint64_t>> ExportMetrics();
+// Export settings, process-wide (the last value set applies): verify each upload by reading it back
+// (differential_export_verification = 'read_back'; default: the service verifies its checksum), and
+// upload from memory instead of staging files (differential_export_staging = 'memory').
+void SetExportVerification(bool read_back);
+void SetExportStaging(bool in_memory);
+bool ExportReadsBack();
+bool ExportStagesInMemory();
 
 // Branch heads: a small mutable object per exported branch, dbs/<database uuid>/branches/<branch
 // name>, naming the latest exported snapshot in the branch's history and its descriptor, so remote
@@ -116,14 +123,33 @@ struct ExplicitSnapshot {
 };
 bool ExplicitSnapshotInProgress(Control &, const std::string &branch);
 // Shared databases: cache the commit records (and expiries) published in S3 that are not cached
-// yet: one listing of the commit index and of the expiry records, then one GET per new record.
-// `throttled`: skip when this process synced the database in the last 5 seconds.
-void SyncHistory(Control &, const std::string &database, bool throttled = false);
+// yet: listings, then one GET per new commit record.
+// `throttled`: skip when this process synced the database in the last 5 seconds. Incremental: commit
+// records are listed newest first down to a cached one older than 15 minutes, expiries from the
+// time-ordered log (dbs/<uuid>/expiries/) since the last read; `full` (and at most a day after the last
+// full listing) lists every commit and expiry record.
+void SyncHistory(Control &, const std::string &database, bool throttled = false, bool full = false);
 // SyncHistory on the background publisher (after a writable ATTACH), errors recorded.
 void ScheduleHistorySync(const std::shared_ptr<Control> &, const std::string &database);
 // Shared databases: expire published snapshots for every writer (create-only records at
 // dbs/<uuid>/expired/<9999999999 - n>). A snapshot that is a branch head in S3 cannot expire.
 void ExpireShared(Control &, const std::string &database, const std::vector<int64_t> &snapshots);
+// Any S3 database: record the expiry of exported snapshots in S3 (create-only
+// dbs/<uuid>/expired/<9999999999 - n>), so remote collection may reclaim what only they reference.
+void ExpireExported(Control &, const std::string &database, const std::vector<int64_t> &snapshots);
+// Remote garbage collection of one S3 location (every database in it). Roots: branch heads, commit
+// records without an expiry record, and this repository's retained exports and S3-only objects.
+// Unreachable data objects older than `older_than` (microseconds) are condemned (gc/condemned/
+// records); objects condemned before `older_than` and still unreachable are deleted: packs, index
+// pages whose packs are all deleted, and descriptors with such a page. Exports never reference a
+// condemned object, so the grace period only has to cover an export's last seconds.
+struct RemoteCollection {
+    int64_t roots = 0, live_objects = 0, unreachable_objects = 0, unreachable_bytes = 0, condemned_objects = 0,
+            deleted_objects = 0, deleted_bytes = 0;
+};
+RemoteCollection CollectRemote(Control &, const std::string &provider, int64_t older_than, bool dry_run);
+// The last failure to copy S3-only local objects out of condemned packs ("" when none).
+std::string LastRemoteCollectionError();
 // Shared databases, dropping a branch: before (the S3 head must still be this repository's base;
 // returns its version, "" when the branch was never published) and after the local drop (the head
 // becomes a tombstone, conditionally on that version; the name is free again).
@@ -138,7 +164,7 @@ int64_t RemoteHeadSnapshot(Control &, const std::string &database, const std::st
 bool RemoteBranchExists(Control &, const std::string &database, const std::string &branch);
 class RemoteMemoryCache;
 struct RemoteCaching;
-// The store's reader of remote-only objects: verified 64 KiB chunks from the packs recorded for them,
+// The store's reader of remote-only objects: verified 256 KiB chunks from the packs recorded for them,
 // through the reader's caches when given (memory cache keyed like export reads, so they share
 // entries; the disk cache), else the disk cache at SetRemoteObjectCacheLimit.
 std::map<std::string, SharedBytes> FetchRemoteObjects(Control &, const std::vector<std::string> &hashes,
@@ -162,6 +188,10 @@ class RemoteMemoryCache {
     // Copy [offset, offset + length) of `object` into `out`; false unless fully cached.
     virtual bool Read(const std::string &object, uint64_t offset, uint64_t length, unsigned char *out) = 0;
     virtual void Insert(const std::string &object, uint64_t offset, const unsigned char *data, uint64_t length) = 0;
+    // Brackets the life of each file handle that reads through this cache; inserts are kept only
+    // while one is open, and the last Release discards what is still pending.
+    virtual void Retain() {}
+    virtual void Release() {}
 };
 class DiskCache;
 // How a remote snapshot caches what it reads.
@@ -190,9 +220,10 @@ class RemoteSnapshot {
     RemoteCaching caching;
     std::shared_ptr<DiskCache> disk;
     std::string pending_namespace, object_prefix;
+    // Recently used index pages, most recent first (parallel scans touch several at once).
+    static constexpr size_t INDEX_CACHE_PAGES = 16;
     std::mutex index_mutex;
-    uint64_t last_index_page = 0;
-    SharedBytes last_index;
+    std::list<std::pair<uint64_t, SharedBytes>> indexes;
     // Sequential read streams, one per scanning thread (a file handle is shared by DuckDB's
     // threads, whose reads interleave). Most recently used first out when more than 16.
     struct Stream {

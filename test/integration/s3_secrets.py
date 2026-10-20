@@ -6,6 +6,7 @@ disposable MinIO bucket initialized by minio.py and network access for the offic
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from urllib.parse import urlparse
@@ -22,7 +23,7 @@ LOCATION = 's3://differential-sdk-test/secrets-test/'
 ENV = {k: v for k, v in os.environ.items() if not k.startswith('AWS_')}
 ENV.update(AWS_EC2_METADATA_DISABLED='true', AWS_CONFIG_FILE=str(base / 'none'),
            AWS_SHARED_CREDENTIALS_FILE=str(base / 'none'))
-PRELUDE = (f"SET extension_directory='{base / 'extensions'}'; SET secret_directory='{base / 'stored'}';"
+PRELUDE = (f"SET extension_directories=['{base / 'extensions'}']; SET secret_directory='{base / 'stored'}';"
            f"LOAD '{EXTENSION}';")
 MINIO = (f"CREATE SECRET minio (TYPE s3, KEY_ID '{KEY}', SECRET '{PASSWORD}', ENDPOINT '{host}', "
          f"URL_STYLE 'path', USE_SSL false, SCOPE '{LOCATION}');")
@@ -41,8 +42,12 @@ def run(repository, sql, expected=0, httpfs=True, env=None):
     assert r.returncode == expected, (sql, r.stdout, r.stderr)
     if expected:
         return r.stderr
-    out, text, decoder = [], r.stdout.strip(), json.JSONDecoder()
+    out, text, decoder = [], re.sub(r'\x1b\[[0-9;]*m', '', r.stdout).strip(), json.JSONDecoder()
     while text:
+        if text[0] not in '[{':
+            # CLI warnings (e.g. the aws extension's credential refresh) are printed to stdout
+            text = text.split('\n', 1)[1].lstrip() if '\n' in text else ''
+            continue
         value, end = decoder.raw_decode(text)
         out.append(value)
         text = text[end:].lstrip()
@@ -105,7 +110,7 @@ profiles.mkdir()
 (profiles / 'credentials').write_text(f'[minio-test]\naws_access_key_id = {KEY}\naws_secret_access_key = {PASSWORD}\n')
 (profiles / 'config').write_text('[profile minio-test]\nregion = us-east-1\n')
 rows = run('chain', f"""LOAD aws;
-    CREATE SECRET chain (TYPE s3, PROVIDER credential_chain, CHAIN 'config', PROFILE 'minio-test', REFRESH auto,
+    CREATE SECRET chain (TYPE s3, PROVIDER credential_chain, CHAIN 'config', PROFILE 'minio-test', REFRESH auto, REGION 'us-east-1',
                          ENDPOINT '{host}', URL_STYLE 'path', USE_SSL false, SCOPE '{LOCATION}');
     ATTACH 'differential:chained' AS chained (DATA_PATH '{LOCATION}chain/');
     CREATE TABLE chained.t AS SELECT 1 AS v;
@@ -166,7 +171,7 @@ passed('persistent TYPE differential secrets work across sessions and do not bre
 # Errors.
 assert 'does not exist' in run('errors', "ATTACH 'differential:x' AS x (SECRET missing);", 1)
 assert 'SECRET takes a TYPE differential secret' in run('errors', MINIO + "ATTACH 'differential:x' AS x (SECRET minio);", 1)
-assert "Unknown parameter 'key_id'" in run('errors', "CREATE SECRET bad (TYPE differential, KEY_ID 'x');", 1)
+assert 'Unknown parameter "key_id"' in run('errors', "CREATE SECRET bad (TYPE differential, KEY_ID 'x');", 1)
 assert 'take no SCOPE' in run('errors', "CREATE SECRET bad (TYPE differential, DATA_PATH '/x', SCOPE 'a');", 1)
 passed('unknown or wrong-type SECRET, credentials and SCOPE in TYPE differential secrets are refused')
 

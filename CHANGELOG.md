@@ -5,6 +5,98 @@ All notable changes to the DuckDB differential extension are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Continuous WAL shipping, opt-in per single-writer S3 database: `ATTACH … (SHIP_WAL 'async' | 'sync',
+  SHIP_INTERVAL seconds)`. Published states of writable branches ship to S3 as create-only, hash-chained
+  epochs (`dbs/<uuid>/log/…`, format `differential-epoch-v1`) with WAL bytes and changed chunks inline;
+  chains restart from an internal base export after each checkpoint (or 256 epochs / 64 MiB). `sync`
+  makes a commit wait until it is in S3. `differential_recover_branch(location, name, same_identity =>)`
+  recovers a branch on another host (lazily; `same_identity` for a failover). `differential_branches`
+  reports `ship_wal`, `shipped_chain`, `shipped_epoch`, `shipped_at`, `ship_pending`; remote collection
+  keeps each branch's newest chain.
+- Followers: `ATTACH 'differential:s3://…/heads/…' (FOLLOW true, FOLLOW_INTERVAL seconds)` moves to every
+  shipped commit (or exported snapshot) on its own; one request per interval while nothing changes, one
+  state per transaction, no S3 request while binding. `differential_followers()` lists them.
+- Latency distributions for every timing (`_stddev`, `_p50`, `_p95`, `_p99`), S3 requests timed per
+  operation type (`s3_request_*`), and the segment and metadata halves of a durable sync.
+- `benchmarks/disk_cache.py` (disk cache versus local reads) and a `ship_latency` workload in `scale.py`.
+
+- Remote garbage collection: `differential_cleanup_remote_files(location)` condemns S3 data that no
+  branch head or unexpired snapshot reaches and deletes it in a later run after a grace period
+  (default a week). Exports never reference condemned data. Expiry now records exported snapshots
+  of every S3 database (not only shared ones) as expired in S3.
+- Shared databases read history incrementally: commit records newest first down to known ones,
+  expiries from a new time-ordered log (`dbs/<uuid>/expiries/`); a full listing runs at most daily
+  or with `differential_snapshots(..., refresh => 'full')`.
+- Remote collection caches what index pages, descriptors and commit records reference (they are
+  immutable), so repeated runs read only branch heads and new objects.
+- `differential_cleanup_metadata(older_than => …)` deletes old completed operation records and
+  history entries of expired snapshots.
+
+### Changed
+
+- Targets DuckDB 2.0 (submodule pinned to commit `d54cbbe3df`, which the community repository builds as
+  `v2.0.0`, until the `v2.0.0` tag exists; `extension-ci-tools` `v2.0-cyanoptera`); DuckDB 1.5.6 is
+  no longer built. Store, control and export formats are unchanged. `duckdb_functions()` lists the
+  named parameters of `differential_*` functions in declaration order.
+- Store format 2 (repositories and exports of format 1 are refused; there are no migrations):
+  - payload moved out of SQLite into append-only segment files (`journal/` while active,
+    `segments/` once retired), which are also the write journal: a native block is written once
+    and published where it was written, and SQLite holds only metadata;
+  - 256 KiB chunks, one per native data block (12 KiB header chunk unchanged); exports are
+    `differential-export-v2` with `DIX2` index pages and 8 MiB packs of 32 chunks;
+  - WAL sidecars are log files stored as byte ranges, so an append stores only its bytes;
+  - local reads are verified with CRC32C (hardware-accelerated) instead of SHA-256, which stays the
+    content identity; whole-chunk reads go straight into DuckDB's buffer;
+  - retired segments are deleted once unreferenced and compacted when sparse, as part of collection;
+    a segment no publication references (external-pool databases) is deleted as soon as it is
+    retired (beyond 4 MiB), so pool writes do not leave a second copy awaiting collection.
+- Buffered writes are published in the background beyond 16 MiB per database (the writer itself
+  publishes only beyond 64 MiB); chunk maps, root pages and object locations are cached in memory.
+- Exports stage pack files without holding the staging lock while writing, upload them without
+  hashing them again, and record pack and verification metadata without a sync of their own.
+  Remote reads keep the 16 most recently used index pages and load up to 16 pages in parallel at
+  attach.
+- Sync points use `fsync` on every OS, as native DuckDB (macOS no longer uses `F_FULLFSYNC`, which
+  also flushed the device's write cache and cost several milliseconds per commit).
+- Group commit: concurrent native syncs of different databases in one process share one durable
+  SQLite transaction and device flush (up to 16 MiB of new data per transaction; a larger sync
+  commits alone; a failed batch is retried one sync at a time). Durability per sync is unchanged.
+  `SET differential_group_commit = false` commits every sync on its own. New counters
+  `local_sync_requests`, `local_sync_transactions`, `local_sync_batch_max`, `local_sync_batch_fallbacks`.
+- Exports no longer download every uploaded object again to verify it: the S3 service verifies its
+  SHA-256 (`x-amz-checksum-sha256`). `SET differential_export_verification = 'read_back'` restores
+  read-back verification; `SET differential_export_staging = 'memory'` uploads without staging
+  files on disk (default `'disk'`).
+- `AT (...)` opens snapshots outside the lock of the hidden-attachment cache, so binds of other
+  snapshots no longer wait for S3 reads of an evicted one.
+- Writes are published per file group (a database file and its WAL sidecars): a native sync
+  commits only its own group's buffered writes, and other databases keep writing meanwhile. Each
+  group has its own journal and a 64 MiB overlay bound (256 MiB for all groups together).
+- On Linux, local pools (`DATA_PATH '/directory'`) make batches of 8 or more files durable with
+  two `syncfs` calls instead of one fsync per 64 KiB file.
+- Errors that callers act on (writer busy, head and branch conflicts, S3 object conflicts) carry a
+  typed code instead of being recognised by their message text. Messages are unchanged.
+- `SnapshotAt` (`SNAPSHOT_TIME`, `AT (TIMESTAMP => …)`) reads under a read transaction instead of
+  the metadata store's write lock.
+
+### Fixed
+
+- Reads of S3 exports under memory pressure could hang: the memory cache pinned and allocated buffers
+  while DuckDB held the lock of the block being loaded, and eviction could then wait on that same lock.
+  Reads now use only resident cache blocks, and a worker thread fills the cache.
+- A transaction reading an `AT (...)` snapshot that another connection evicted from the hidden
+  attachment cache, then reading it again, failed with a DuckDB internal error ("Database name …
+  was already used by a different database for this meta transaction"); it now keeps using its
+  attachment.
+- Dropping a branch of a single-writer database leaves a tombstone at its S3 head (also repaired by
+  `differential_retry_export`); before, the head stayed and kept the branch's data reachable.
+- A shared database's advisory writer marker is withdrawn when opening the database file fails
+  after the marker was written; it was renewed for the life of the process.
+
 ## [0.1.0] - 2026-10-12
 
 ### Added

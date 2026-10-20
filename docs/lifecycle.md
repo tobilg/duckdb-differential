@@ -16,7 +16,7 @@ ones you get. The S3 section needs an existing bucket. Function and option detai
 | [7. Detach](#7-detach) | Release a writer, its pins and its AT snapshots | `DETACH` |
 | [8. Restore](#8-restore-a-branch) | Reset a branch to an earlier snapshot | `differential_restore` |
 | [9. Delete](#9-delete-branches-and-expire-snapshots) | Drop branches, expire snapshots | `differential_drop_branch`, `differential_expire_snapshots` |
-| [10. Reclaim space](#10-reclaim-space) | Collect unreferenced data, compact the metadata store | `differential_cleanup_old_files`, `differential_compact` |
+| [10. Reclaim space](#10-reclaim-space) | Collect unreferenced data (local and in S3), compact the metadata store | `differential_cleanup_old_files`, `differential_compact`, `differential_cleanup_remote_files` |
 | [11. S3](#11-publish-to-s3) | Export snapshots, read them anywhere, follow branch heads, recover them | `DATA_PATH 's3://…'`, `differential_evict_snapshots`, `differential_recover_export` |
 | [12. Operate](#12-operate-and-recover) | Retry safely, inspect operations and storage | `request_id`, `differential_operations()`, `differential_storage_stats()` |
 
@@ -28,7 +28,7 @@ LOAD differential;                     -- every session
 SET differential_repository = '/absolute/path/repository';
 ```
 
-The extension targets DuckDB 1.5.6.
+The extension targets DuckDB 2.0.
 
 The repository is a local directory holding the extension's metadata store and, by default,
 the data. The metadata store is an embedded SQLite database, the setup DuckLake recommends when
@@ -55,7 +55,7 @@ Payload placement is chosen once, at creation, with `DATA_PATH`:
 
 | `DATA_PATH` | Payload stored in |
 | --- | --- |
-| omitted | the repository's metadata store (as SQLite blobs) |
+| omitted | the repository's segment files (metadata in its SQLite store) |
 | `'/absolute/directory'` | an immutable-file local pool in that directory |
 | `'s3://bucket/prefix/'` | locally, plus S3 exports of every published snapshot ([§11](#11-publish-to-s3)) |
 
@@ -78,8 +78,8 @@ CHECKPOINT sales;
 ```
 
 Everything is native DuckDB: catalog, transactions, constraints, indexes, WAL and
-checkpoints. Commits are durable at DuckDB's sync points; durability matches native DuckDB,
-with a full device flush. One process at a time may write a branch; a second writer is
+checkpoints. Commits are durable at DuckDB's sync points (`fsync`); durability matches native
+DuckDB. One process at a time may write a branch; a second writer is
 rejected.
 
 Checkpoints do not create public snapshots, unless you opt in for databases attached after
@@ -219,6 +219,11 @@ with `SET differential_auto_gc = false`.
   nothing is queued with `cleanup_all => true`. `dry_run => true` counts exactly what would go.
 - `differential_delete_orphaned_files` removes local-pool files that crashes left unreferenced.
 - `differential_compact` returns free pages of the metadata store to the file system.
+- `differential_cleanup_remote_files('s3://bucket/prefix/')` collects an S3 location in two
+  phases: it condemns data no branch head or unexpired snapshot reaches, and a later run deletes
+  what stayed condemned and unreachable for the grace period (`older_than`, default a week).
+- `differential_cleanup_metadata(older_than => …)` deletes old completed operation records (their
+  request IDs stop replaying) and history entries of expired snapshots.
 
 ## 11. Publish to S3
 
@@ -230,7 +235,7 @@ First tell DuckDB how to reach the bucket, with the same `TYPE s3` secret httpfs
 ```sql
 CREATE SECRET (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-east-1', SCOPE 's3://my-bucket/differential/');
 -- or use your AWS environment (SSO, profiles, roles):
--- CREATE SECRET (TYPE s3, PROVIDER credential_chain, REFRESH auto, SCOPE 's3://my-bucket/differential/');
+-- CREATE SECRET (TYPE s3, PROVIDER credential_chain, REFRESH auto, REGION 'us-east-1', SCOPE 's3://my-bucket/differential/');
 ```
 
 Without a secret, the AWS SDK finds credentials in the environment, `~/.aws` or instance roles,
@@ -275,7 +280,30 @@ SELECT database_name, branch_name, snapshot_id
 FROM differential_remote_heads('s3://my-bucket/differential/');
 ```
 
-Re-attach to see newer snapshots ([deployment.md](deployment.md#branch-heads) has the details).
+Re-attach to see newer snapshots ([deployment.md](deployment.md#branch-heads) has the details), or
+attach a **follower** that moves on by itself (one S3 request per interval while nothing changes):
+
+```sql
+ATTACH 'differential:s3://my-bucket/differential/heads/archive/main' AS archive_live (FOLLOW true, FOLLOW_INTERVAL 10);
+```
+
+Snapshots are the unit of S3 durability. To ship every commit as well, so that another host can
+recover the database if this one is lost, turn on **WAL shipping** for the database (stored: later
+attachments ship too):
+
+```sql
+ATTACH 'differential:archive' AS archive (SHIP_WAL 'async', SHIP_INTERVAL 1);   -- or 'sync': commits wait for S3
+SELECT branch_name, ship_wal, shipped_at, ship_pending FROM differential_branches('archive');
+-- on another host, after losing this one:
+CALL differential_recover_branch('s3://my-bucket/differential/heads/archive/main', 'archive',
+    same_identity => true);
+```
+
+Followers of a shipping database see every shipped commit, not only snapshots. The
+[SQL reference](sql-reference.md#wal-shipping) has the details; the
+[cost table](api.md#s3-request-costs) shows the S3 request costs per interval (for example, an
+`async` branch committing continuously with `SHIP_INTERVAL 1` costs about $13 a month in requests;
+a follower polling every 10 s about $0.10).
 For several hosts *writing* one database through S3, see [shared databases](shared-databases.md).
 Data read from S3 stays cached in memory for the session; to reuse it across sessions, set
 `SET differential_remote_cache_size = '4GB'` ([caching](api.md#caching-s3-reads)).

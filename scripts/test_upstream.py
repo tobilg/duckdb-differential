@@ -23,7 +23,10 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 DUCKDB = ROOT / 'duckdb'
-OFFICIAL_EXTENSIONS = {'httpfs', 'inet', 'sqlite_scanner'}
+# Memory limit of every test (both backends) unless its configuration sets one. Two concurrent pairs
+# at 3GB fit an 8 GB machine; DuckDB's own runner uses its default (80% of RAM).
+MEMORY_LIMIT = '3GB'
+OFFICIAL_EXTENSIONS = {'encodings', 'httpfs', 'inet', 'quack', 'sqlite_scanner'}
 sys.path.insert(0, str(ROOT / 'test/integration'))
 from evidence import evidence_path
 
@@ -33,14 +36,14 @@ def quote(value):
 
 
 def required_extensions(test):
-    return set(re.findall(r'^require (\w+)\s*$', (DUCKDB / test).read_text(), re.MULTILINE)) & OFFICIAL_EXTENSIONS
+    return set(re.findall(r'^require (\w+)\s*$', (DUCKDB / test).read_text(errors='surrogateescape'), re.MULTILINE)) & OFFICIAL_EXTENSIONS
 
 
 def prepare_extensions(cli, cache, required, output):
     if not required:
         return {}
     cache.mkdir(parents=True, exist_ok=True)
-    sql = f'SET extension_directory={quote(cache)}; '
+    sql = f'SET extension_directories=[{quote(cache)}]; '
     # INSTALL is idempotent and uses the CLI's exact version/platform directory.
     sql += ''.join(f'INSTALL {name}; LOAD {name}; ' for name in sorted(required))
     result = subprocess.run([str(cli), '-init', '/dev/null', '-batch', '-c', sql],
@@ -61,7 +64,7 @@ def working_tree(work, test, fixtures=()):
     # Some upstream ATTACH tests open checked-in database fixtures read/write.
     # Give each backend its own copies, while keeping large read-only CSV/Parquet
     # inputs shared. Materialize just the directory ancestors of copied files.
-    source = (DUCKDB / test).read_text()
+    source = (DUCKDB / test).read_text(errors='surrogateescape')
     references = set(re.findall(r"['\"]((?:data|test|\{DATA_DIR\})/[^'\"\n]+\.(?:db|duckdb))['\"]", source))
     references.update(re.findall(r'^load ((?:data|test|\{DATA_DIR\})/\S+\.(?:db|duckdb))(?:\s|$)',
                                  source, re.MULTILINE))
@@ -103,12 +106,12 @@ def run_test(runner, extension, bridge, test, mode, timeout, output, trace_empty
              extension_cache=None):
     with tempfile.TemporaryDirectory(prefix='differential-upstream-') as tmp:
         work = Path(tmp)
-        # Keep DuckDB's default PID-scoped temp directory inside a disposable
-        # working tree. --test-temp-dir disables DeleteDatabase in 1.5.6, breaking
-        # the fresh-database semantics of repeated `load` commands.
+        # Keep DuckDB's default cwd-relative test directory ({TEST_DIR}) inside a
+        # disposable working tree, so repeated `load` commands still delete and
+        # recreate their databases (fresh-database semantics).
         tree = working_tree(work, test, (test_config or {}).get('fixtures', ()))
         if re.search(r'^require-env TEST_PERSISTENT_SECRETS_AVAILABLE\s*$',
-                     (DUCKDB / test).read_text(), re.MULTILINE):
+                     (DUCKDB / test).read_text(errors='surrogateescape'), re.MULTILINE):
             # These are public upstream fixtures, never the user's secret files.
             for fixture in (tree / 'data/secrets/http').glob('*.duckdb_secret'):
                 if fixture.is_symlink() or not fixture.resolve().is_relative_to(work.resolve()):
@@ -117,22 +120,22 @@ def run_test(runner, extension, bridge, test, mode, timeout, output, trace_empty
         if extension_cache:
             # Tests may INSTALL/UPDATE extensions: never share their writable
             # directory with another test or with the prepared download cache.
-            for name in required_extensions(test):
+            for name in required_extensions(test) | set((test_config or {}).get('preload', ())):
                 for source in extension_cache.rglob(name + '.duckdb_extension*'):
                     target = work / 'extensions' / source.relative_to(extension_cache)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, target)
-        attach = (f"LOAD {quote(extension)}; SET differential_repository='__TEST_DIR__/repository'; "
+        attach = (f"LOAD {quote(extension)}; SET differential_repository='{{TEST_DIR}}/repository'; "
                   if mode == 'differential' else '')
         attach += ''.join(f'LOAD {name}; ' for name in (test_config or {}).get('preload', ()))
         query_trace = work / 'queries.sql'
         if trace_empty:
             attach = f'SET log_query_path={quote(query_trace)}; ' + attach
-        setup = "".join(f"PRAGMA upstream_bridge({quote(mode)}, '__TEST_DIR__', {phase});"
+        setup = "".join(f"PRAGMA upstream_bridge({quote(mode)}, '{{TEST_DIR}}', {phase});"
                         for phase in range(8))
         config = {
             'description': f'Differential upstream comparison ({mode})',
-            'initial_db': '__TEST_DIR__/memory',
+            'initial_db': '{TEST_DIR}/memory',
             # DuckDB runs on_new_connection before *every* concurrent-loop
             # statement, including COMMIT/ROLLBACK in an aborted transaction.
             # The bridge sets the instance default; subsequent connections need
@@ -145,17 +148,17 @@ def run_test(runner, extension, bridge, test, mode, timeout, output, trace_empty
             'autoloading': 'available',
             'max_threads': 2,
             'settings': [{'name': 'extension_directory', 'value': str(work / 'extensions')},
-                         {'name': 'memory_limit', 'value': '1GB'},
+                         {'name': 'memory_limit', 'value': MEMORY_LIMIT},
                          {'name': 'autoload_known_extensions', 'value': 'false'},
                          {'name': 'autoinstall_known_extensions', 'value': 'false'}],
         }
-        if re.search(r'^require-env LOCAL_EXTENSION_REPO\s*$', (DUCKDB / test).read_text(), re.MULTILINE):
+        if re.search(r'^require-env LOCAL_EXTENSION_REPO\s*$', (DUCKDB / test).read_text(errors='surrogateescape'), re.MULTILINE):
             repository = runner.parents[1] / 'repository'
             if not repository.is_dir():
                 raise RuntimeError(f'missing built extension repository fixture: {repository}')
             config['test_env'] = [{'env_name': 'LOCAL_EXTENSION_REPO', 'env_value': str(repository)}]
         for name in ('VALIDATE_TAGS', 'TEST_PERSISTENT_SECRETS_AVAILABLE'):
-            if re.search(r'^require-env ' + name + r'\s*$', (DUCKDB / test).read_text(), re.MULTILINE):
+            if re.search(r'^require-env ' + name + r'\s*$', (DUCKDB / test).read_text(errors='surrogateescape'), re.MULTILINE):
                 config.setdefault('test_env', []).append({'env_name': name, 'env_value': '1'})
         if test_config:
             config.update(test_config.get('options', {}))
@@ -194,9 +197,9 @@ def run_test(runner, extension, bridge, test, mode, timeout, output, trace_empty
             if not trace_empty:
                 return run_test(runner, extension, bridge, test, mode, timeout, output,
                                 trace_empty=True, test_config=test_config, extension_cache=extension_cache)
-            trace = query_trace.read_text() if query_trace.exists() else ''
+            trace = query_trace.read_text(errors='replace') if query_trace.exists() else ''
             normalize = lambda sql: ' '.join(sql.split()).rstrip(';')
-            source = (DUCKDB / test).read_text()
+            source = (DUCKDB / test).read_text(errors='surrogateescape')
             queries = []
             skipped = False
             for command in re.finditer(r'^mode (skip|unskip)\s*$|'
@@ -230,6 +233,7 @@ def run_test(runner, extension, bridge, test, mode, timeout, output, trace_empty
 
 
 def main():
+    global MEMORY_LIMIT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('patterns', nargs='*', help='upstream paths/globs, overriding the default selection')
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'build/integration')
@@ -241,11 +245,14 @@ def main():
     actions.add_argument('--survey', action='store_true')
     parser.add_argument('--timeout', type=int, help='optional diagnostic timeout; normal runs have no per-test limit')
     parser.add_argument('--jobs', type=int, default=2, help='concurrent test pairs (default: 2)')
+    parser.add_argument('--memory-limit', default=MEMORY_LIMIT,
+                        help=f'memory_limit of each test unless configured (default: {MEMORY_LIMIT})')
     parser.add_argument('--profile', choices=['full', 'pr'], default='full')
     parser.add_argument('--shard', help='stable shard INDEX/COUNT, zero-based')
     parser.add_argument('--list', action='store_true', help='list selection without executing')
     parser.add_argument('--retry-from', type=Path, help='rerun unsuccessful tests in a results.json')
     args = parser.parse_args()
+    MEMORY_LIMIT = args.memory_limit
     if args.timeout is not None and args.timeout <= 0:
         parser.error('--timeout must be positive')
     if args.jobs < 1 or args.jobs > 32:
@@ -278,7 +285,7 @@ def main():
     for path, requirement in requirements.items():
         if path in skips or not (DUCKDB / path).is_file() or not requirement.get('reason'):
             parser.error(f'invalid conditional requirement: {path}')
-        lines = (DUCKDB / path).read_text().splitlines()
+        lines = (DUCKDB / path).read_text(errors='surrogateescape').splitlines()
         if not requirement.get('directives') or any(line not in lines for line in requirement['directives']):
             parser.error(f'upstream requirement changed: {path}')
     configs = suite.get('configs', {})
@@ -332,10 +339,10 @@ def main():
     output.mkdir(exist_ok=True)
     print(f'Evidence directory: {output}', flush=True)
     extension_cache = build.parent / 'upstream_extensions'
-    required = set().union(*(required_extensions(test) for test in tests
-                             if skips.get(test, {}).get('execution') != 'never'))
+    required = set().union(*(required_extensions(test) | set(configs.get(test, {}).get('preload', []))
+                             for test in tests if skips.get(test, {}).get('execution') != 'never'))
     dependencies = prepare_extensions(build / 'duckdb', extension_cache, required, output)
-    report = {'duckdb_commit': commit, 'build': str(build),
+    report = {'duckdb_commit': commit, 'build': str(build), 'memory_limit': MEMORY_LIMIT,
               'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'suite_sha256': hashlib.sha256(args.suite.read_bytes()).hexdigest(),
               'extension': str(extension),

@@ -46,10 +46,10 @@ TEAM = f"ATTACH 'differential:team' AS team (WRITERS 'shared', DATA_PATH '{LOCAT
 # Changes that stay local: checkpoints of this attachment are not published.
 LOCAL = f"ATTACH 'differential:team' AS team (WRITERS 'shared', DATA_PATH '{LOCATION}', {S3}, PUBLISH_ON_CHECKPOINT false);"
 if AWS:
-    HTTPFS = (f"SET extension_directory='{base / 'extensions'}'; LOAD httpfs; LOAD aws; CREATE SECRET (TYPE s3, "
+    HTTPFS = (f"SET extension_directories=['{base / 'extensions'}']; LOAD httpfs; LOAD aws; CREATE SECRET (TYPE s3, "
               f"PROVIDER credential_chain, REGION '{region}'" + (f", PROFILE '{profile}'" if profile else '') + ");")
 else:
-    HTTPFS = (f"SET extension_directory='{base / 'extensions'}'; LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID "
+    HTTPFS = (f"SET extension_directories=['{base / 'extensions'}']; LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID "
               f"'{os.environ['AWS_ACCESS_KEY_ID']}', SECRET '{os.environ['AWS_SECRET_ACCESS_KEY']}', ENDPOINT "
               f"'{urlparse(endpoint).netloc}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');")
 results = []
@@ -221,7 +221,7 @@ for process in processes:
 assert len(set(numbers)) == 10 and min(numbers) > 5, numbers
 current = heads()
 assert ('team', 'b-dev', max(n for n in numbers[:5])) in current and ('team', 'main', max(numbers[5:])) in current, current
-run('inspect', f"SET extension_directory='{base / 'extensions'}'; INSTALL httpfs;" + (" INSTALL aws;" if AWS else ""))
+run('inspect', f"SET extension_directories=['{base / 'extensions'}']; INSTALL httpfs;" + (" INSTALL aws;" if AWS else ""))
 keys = run('inspect', HTTPFS + f"SELECT file FROM glob('{LOCATION}dbs/{team_id}/snapshots/*');")[-1]
 published = sorted(9999999999 - int(row['file'].rsplit('/', 1)[1]) for row in keys)
 assert set(numbers) <= set(published) and published == sorted(set(published)), (numbers, published)
@@ -456,6 +456,33 @@ error = run('f', f"ATTACH 'differential:team' AS team (WRITERS 'shared', DATA_PA
 assert '[differential:not_found]' in error, error
 passed('a name taken by a single-writer database is refused; claims are refused; a fresh read-only attachment '
        'reads the latest head; unknown branches are not found')
+
+# --- Incremental history ----------------------------------------------------------------------
+def history(repository, refresh='incremental'):
+    rows = run(repository, f"SELECT snapshot_id, retired FROM differential_snapshots('team', refresh => '{refresh}'); "
+                           "SELECT value FROM differential_storage_stats() WHERE metric = 's3_list_calls';")
+    return {r['snapshot_id']: r['retired'] for r in rows[-2]}, int(rows[-1][0]['value'])
+
+
+full, _ = history('e', 'full')
+incremental, lists = history('e')
+assert incremental == full and lists <= 3, (lists, incremental, full)  # commits, expiry log, condemnations
+heads_now = {r['snapshot_id'] for r in run('lister', f"SELECT snapshot_id FROM differential_remote_heads('{LOCATION}', "
+                                                     f"{S3_ARGS}) WHERE database_name = 'team';")[-1]}
+candidates = sorted(n for n, retired in full.items() if not retired and n not in heads_now)
+assert len(candidates) >= 2, (full, heads_now)
+run('a', f"CALL differential_expire_snapshots('team', versions => [{candidates[0]}]);")
+seen, _ = history('e')
+assert seen[candidates[0]], seen  # another host's expiry, through the log
+if not AWS:  # test builds: an expiry record without its log entry (a crash between the two writes)
+    run('a', f"CALL differential_expire_snapshots('team', versions => [{candidates[1]}]);",
+        DIFFERENTIAL_TEST_NO_EXPIRY_LOG='1')
+    seen, _ = history('e')
+    assert not seen[candidates[1]], seen
+    seen, _ = history('e', 'full')
+    assert seen[candidates[1]], seen
+passed('history listings are incremental (one listing each); expiries arrive through the time-ordered log, '
+       'and a full refresh finds one whose log entry is missing')
 
 evidence_path('s3-shared-aws.json' if AWS else 's3-shared.json').write_text(json.dumps({'scope': (f'real AWS ({LOCATION})' if AWS else 'disposable pinned MinIO') + '; one host, one repository per '
                                                                  'simulated host', 'passed': results},

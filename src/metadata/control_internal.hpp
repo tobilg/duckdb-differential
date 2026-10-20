@@ -2,6 +2,7 @@
 // Shared helpers and SQL for the metadata authority (control.cpp, retention.cpp, resolve.cpp).
 #include "differential_control.hpp"
 #include "differential_sql.hpp"
+#include "differential_error.hpp"
 #include <initializer_list>
 #include <string>
 

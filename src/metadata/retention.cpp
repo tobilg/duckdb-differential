@@ -11,6 +11,10 @@
 
 namespace differential {
 using namespace control;
+namespace {
+// Live payload one collection pass rewrites out of sparse retired segments.
+constexpr uint64_t SEGMENT_BUDGET = 64ull * 1024 * 1024;
+} // namespace
 
 struct MetadataCursor::Impl {
     sqlite3 *db = nullptr;
@@ -195,6 +199,7 @@ int64_t Control::CollectStep(int64_t budget, int64_t &deleted) {
                 more.Int(1, id);
                 if (more.Step())
                     continue;
+                work += Query(db, "DELETE FROM ranges WHERE file=?").Int(1, id).Run();
                 Query(db, "DELETE FROM generations WHERE file=?").Int(1, id).Run();
                 Query(db, "DELETE FROM file_pages WHERE file=?").Int(1, id).Run();
                 Query(db, "DELETE FROM file_pools WHERE file=?").Int(1, id).Run();
@@ -261,7 +266,7 @@ int64_t Control::CollectStep(int64_t budget, int64_t &deleted) {
 // payload fence, so it never stalls writers or readers.
 int64_t Control::DryRun(Collection &result) {
     store->WithReader([&](Reader &reader) {
-        Query candidates(reader.db, (std::string(LIVE_CTE) + R"SQL(SELECT count(*),coalesce(sum(coalesce(length(data),0)+(SELECT count(*)*65536 FROM local_objects x WHERE x.hash=o.hash)),0) FROM objects o WHERE
+        Query candidates(reader.db, (std::string(LIVE_CTE) + R"SQL(SELECT count(*),coalesce(sum((o.segment IS NOT NULL)*262144+(SELECT count(*)*262144 FROM local_objects x WHERE x.hash=o.hash)),0) FROM objects o WHERE
 NOT EXISTS(SELECT 1 FROM extents e WHERE e.object=o.hash AND e.file IN (SELECT id FROM live_files)) AND
 NOT EXISTS(SELECT 1 FROM page_entries e WHERE e.object=o.hash AND e.page IN (SELECT page FROM live_pages)))SQL")
                                                  .c_str());
@@ -327,6 +332,7 @@ Collection Control::Collect(bool dry_run, int64_t limit, const std::string &requ
     RemovePinFiles(store->directory, result.released_pins);
     store->DrainLocalDeletions(uint64_t(limit));
     store->SweepLocalOrphans(uint64_t(limit));
+    store->CollectSegments(SEGMENT_BUDGET);
     return result;
 }
 bool Control::Maintain(int64_t budget, int64_t milliseconds) {
@@ -360,10 +366,17 @@ bool Control::Maintain(int64_t budget, int64_t milliseconds) {
         } catch (...) {
             return false;
         }
-        if (remaining == 0)
+        if (remaining == 0 || std::chrono::steady_clock::now() >= deadline) {
+            // The backlog continues after the next checkpoint. Segment collection needs neither the
+            // fence nor the authority beyond its own short transactions.
+            guard.unlock();
+            fence.reset();
+            try {
+                store->CollectSegments(SEGMENT_BUDGET);
+            } catch (...) {
+            }
             return true;
-        if (std::chrono::steady_clock::now() >= deadline)
-            return true; // the backlog continues after the next checkpoint
+        }
         guard.unlock();
         fence.reset();
         std::this_thread::yield();
@@ -458,8 +471,8 @@ Compaction Control::Compact(int64_t pages, const std::string &request) {
     Query retained(store->db, R"SQL(WITH pending AS (SELECT root FROM export_roots WHERE state='pending'),
 needed AS (SELECT DISTINCT e.object AS hash FROM root_pages r JOIN page_entries e ON e.page=r.page WHERE r.root IN (SELECT root FROM pending))
 SELECT (SELECT count(*) FROM roots WHERE hash NOT IN(SELECT root FROM reclaimed_roots)),
- (SELECT count(*) FROM objects WHERE data IS NOT NULL)*65536+(SELECT count(*) FROM local_objects)*65536,
- (SELECT coalesce(sum(coalesce(length(o.data),0)+(SELECT count(*)*65536 FROM local_objects l WHERE l.hash=o.hash)),0)
+ (SELECT count(*) FROM objects WHERE segment IS NOT NULL)*262144+(SELECT count(*) FROM local_objects)*262144,
+ (SELECT coalesce(sum((o.segment IS NOT NULL)*262144+(SELECT count(*)*262144 FROM local_objects l WHERE l.hash=o.hash)),0)
   FROM objects o WHERE o.hash IN (SELECT hash FROM needed)))SQL");
     retained.Step();
     result.roots = retained.Int(0);
@@ -510,9 +523,12 @@ std::unique_ptr<MetadataCursor> Control::List(const std::string &kind, const std
 CASE WHEN d.writers!='shared' OR b.state!='active' THEN NULL WHEN c.branch_id IS NOT NULL AND c.kept_branch!='' THEN 'forked'
  WHEN c.branch_id IS NOT NULL THEN 'diverged' WHEN w.key IS NULL THEN 'unpublished' WHEN b.head>w.snapshot THEN 'ahead' ELSE 'in_sync' END,
 CASE WHEN d.writers='shared' AND b.state='active' THEN coalesce(c.remote_snapshot,w.snapshot) END,
-NULLIF(c.kept_branch,'')
+NULLIF(c.kept_branch,''),
+CASE WHEN d.writers='shared' THEN NULL ELSE coalesce(sc.mode,'off') END,ch.chain,ch.epoch,NULLIF(ch.shipped_at,0),
+CASE WHEN sc.mode IS NULL OR b.state!='active' THEN NULL ELSE EXISTS(SELECT 1 FROM ship_lows l JOIN files f ON f.id=l.file WHERE f.name='managed/'||b.id OR (substr(f.name,1,44)='managed/'||b.id AND substr(f.name,45,1)='.')) END
 FROM branches b JOIN databases d ON d.id=b.database_id LEFT JOIN branch_conflicts c ON c.branch_id=b.id
 LEFT JOIN branch_head_writes w ON w.key='dbs/'||b.database_id||'/branches/'||b.name AND w.provider_id=(SELECT provider_id FROM database_profiles p WHERE p.database_id=b.database_id)
+LEFT JOIN ship_config sc ON sc.database_id=b.database_id LEFT JOIN ship_chains ch ON ch.branch_id=b.id
 WHERE b.database_id=? ORDER BY b.created_at,b.id)SQL";
     } else if (kind == "operations") {
         sql = R"SQL(SELECT o.id,o.request,o.kind,CASE WHEN o.state='complete' AND o.kind NOT IN ('retire','evict') AND EXISTS(
@@ -540,12 +556,15 @@ std::vector<std::pair<std::string, uint64_t>> Control::Statistics() {
     std::vector<std::pair<std::string, uint64_t>> result;
     store->WithReader([&](Reader &reader) {
         Query q(reader.db, R"SQL(
-SELECT 'local_payload_bytes',(SELECT count(*) FROM objects WHERE data IS NOT NULL)*65536+(SELECT count(*) FROM local_objects)*65536
+SELECT 'local_payload_bytes',(SELECT count(*) FROM objects WHERE segment IS NOT NULL)*262144+(SELECT count(*) FROM local_objects)*262144
+ +(SELECT coalesce(sum(length),0) FROM ranges)
+UNION ALL SELECT 'local_log_range_entries',count(*) FROM ranges
+UNION ALL SELECT 'local_segments',count(*) FROM segments
 UNION ALL SELECT 'external_local_payload_objects',count(*) FROM local_objects
 UNION ALL SELECT 'external_local_pending_deletions',count(*) FROM local_deletions
 UNION ALL SELECT 'local_live_extent_entries',count(*) FROM extents
 UNION ALL SELECT 'local_logical_extent_runs',count(*) FROM extents e WHERE NOT EXISTS(SELECT 1 FROM extents prior WHERE prior.file=e.file AND prior.chunk=e.chunk-1)
-UNION ALL SELECT 'local_chunk_size_bytes',65536
+UNION ALL SELECT 'local_chunk_size_bytes',262144
 UNION ALL SELECT 'local_manifest_page_chunks',256
 UNION ALL SELECT 'local_manifest_entries',count(*) FROM page_entries
 UNION ALL SELECT 'local_manifest_pages',count(*) FROM manifest_pages
@@ -592,7 +611,9 @@ JOIN exports e ON e.database_id=s.database_id AND e.snapshot_id=s.id JOIN export
         return total;
     };
     result.emplace_back("local_derived_staging_bytes", folder_bytes(directory / "staging" / RepositoryID(), "upload-", 13));
-    result.emplace_back("local_journal_bytes", folder_bytes(directory / "journal", nullptr, 36));
+    // Active segments (unpublished writes and the payload they already hold), then retired ones.
+    result.emplace_back("local_journal_bytes", folder_bytes(directory / "journal", nullptr, 16));
+    result.emplace_back("local_segment_bytes", folder_bytes(directory / "segments", nullptr, 16));
     Collection pins;
     ReconcilePins(pins, 1, false);
     result.emplace_back("local_live_reader_pins", pins.live_pins);

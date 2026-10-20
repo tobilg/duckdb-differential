@@ -107,7 +107,7 @@ int main() {
                               [&](const Branch &b) { return b.id == local.id && b.state == "deleted"; }),
               "the unchanged local branch was replaced by the published one");
         Check(store->RootSize(root.id) == root.size, "adopted root identity");
-        Check(Scalar(target_path, "SELECT count(*) FROM objects WHERE data IS NOT NULL") == 0, "nothing downloaded");
+        Check(Scalar(target_path, "SELECT count(*) FROM objects WHERE segment IS NOT NULL") == 0, "nothing downloaded");
         auto base = control.HeadWriteFor(provider, head.key);
         Check(base && base->etag == head.etag && base->snapshot == 5, "head version recorded as the base");
         auto adopted = control.GetSnapshot(id, 5, false);
@@ -137,7 +137,7 @@ int main() {
         std::vector<unsigned char> first(200);
         store->Read(file.id, first.data(), first.size(), 0);
         Check(first[0] == 'z' && first[99] == 'z' && first[100] == 'a', "partial overwrite of a remote chunk");
-        Check(Scalar(target_path, "SELECT count(*) FROM objects WHERE data IS NOT NULL") == 1, "one local object");
+        Check(Scalar(target_path, "SELECT count(*) FROM objects WHERE segment IS NOT NULL") == 1, "one local object");
         store->Verify();
 
         // Another writer published 6..9: the unexported snapshot moves above them.

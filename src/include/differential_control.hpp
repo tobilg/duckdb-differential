@@ -162,6 +162,24 @@ class Control {
     void CreateSharedDatabase(const std::string &id, const std::string &name, const std::string &provider);
     // "single" or "shared".
     std::string Writers(const std::string &database);
+    // Continuous WAL shipping recovery: a new single-writer database `name` in S3 location `provider`
+    // (with `database_id`/`branch_id` when not empty: the original identities, a failover) whose
+    // branch `branch_name` starts from the shipped base `base` (its map imported without downloading;
+    // not a snapshot, so the branch has no root until its first checkpoint).
+    Branch CreateFromShippedBase(const std::string &name, const std::string &provider,
+                                 const std::string &database_id, const std::string &branch_id,
+                                 const std::string &branch_name, const RemoteHead &base);
+    // Continuous WAL shipping metadata (formats owned by differential_shipping.hpp).
+    struct ShipChainRow {
+        int64_t chain = 0, epoch = -1, sequence = 0, bytes = 0, shipped_at = 0;
+        std::string hash, base, known, pending;
+    };
+    // {mode, interval_ms} of a shipping database, or nothing.
+    std::optional<std::pair<std::string, int64_t>> ShipConfigOf(const std::string &database);
+    void SetShipConfigOf(const std::string &database, const std::string &mode, int64_t interval_ms);
+    std::optional<ShipChainRow> ShipChainOf(const std::string &branch);
+    void SetShipChainOf(const std::string &database, const std::string &branch, const ShipChainRow &);
+    int64_t Clock() const { return Timestamp(); }
     // An empty local branch of a shared database (its S3 head is created by its first export).
     Branch CreateEmptyBranch(const std::string &database, const std::string &name);
     // Make a branch head published in S3 the local branch `head.branch_name` (shared databases):
@@ -182,6 +200,14 @@ class Control {
     // Shared databases: the cache of S3 commit records (other writers' history).
     std::set<int64_t> CachedCommits(const std::string &database);
     void CacheCommits(const std::string &database, const std::vector<RemoteCommit> &commits);
+    // How far this repository has read a shared database's history in S3: the last full listings of
+    // its commit records and expiry records (microseconds), and the newest expiry log key read.
+    struct RemoteSyncState {
+        int64_t commits_full_at = 0, expiries_full_at = 0;
+        std::string expiries_watermark;
+    };
+    RemoteSyncState GetRemoteSyncState(const std::string &database);
+    void SetRemoteSyncState(const std::string &database, const RemoteSyncState &);
     // Snapshots expired in S3: marked in the cache, and retired here when they exist locally.
     void ExpireCommits(const std::string &database, const std::vector<int64_t> &snapshots);
     // A public snapshot of the database: local, or (shared databases) known from its commit record.
@@ -275,10 +301,46 @@ class Control {
     void RecordRemoteVerified(const std::string &provider, const std::string &key, const std::string &hash,
                               uint64_t size);
     // Recorded remote locations for the given chunk identities (absent when not yet exported).
+    // `reusable`: only locations an export may reference (packs not condemned by remote collection).
     std::map<std::string, RemoteChunk> FindRemoteChunks(const std::string &provider,
-                                                        const std::vector<std::string> &hashes);
+                                                        const std::vector<std::string> &hashes, bool reusable = false);
+    // Locations of a newly uploaded pack; they replace earlier locations of the same chunks.
     void RecordPack(const std::string &provider, const std::string &pool, const std::string &pack, uint64_t size,
                     const std::vector<std::string> &chunks);
+    // Remote garbage collection (S3). Condemnation records (gc/condemned/...) name unreachable objects
+    // that a later collection deletes once they stayed condemned for its grace period.
+    bool KnownCondemnation(const std::string &provider, const std::string &record);
+    // Apply a record (S3 LastModified `at`, microseconds): exports stop reusing its objects, their
+    // upload verifications are forgotten, and pack locations no local object still reads are dropped.
+    // `learned`: the record is done (its S3-only local objects were copied) and is not read again.
+    void RecordCondemnation(const std::string &provider, const std::string &record, int64_t at,
+                            const std::vector<std::string> &keys, bool learned);
+    // Every condemned key of the location, with its earliest condemnation time.
+    std::map<std::string, int64_t> Condemnations(const std::string &provider);
+    bool Condemned(const std::string &provider, const std::string &key);
+    // Collection roots this repository holds: descriptors of its retained completed exports, and the
+    // packs of local objects stored only in S3 (read on demand).
+    std::vector<std::string> LiveExportDescriptors(const std::string &provider);
+    std::set<std::string> RemoteOnlyPacks(const std::string &provider);
+    // Local objects stored only in S3 whose recorded pack is one of `packs` (pack keys).
+    std::vector<std::string> RemoteOnlyObjectsIn(const std::string &provider, const std::set<std::string> &packs);
+    // Store the verified bytes of remote-only objects locally (they stop depending on S3).
+    void MaterializeRemoteObjects(const std::map<std::string, SharedBytes> &objects);
+    // Objects this collection deleted from S3: forget their verifications and pack locations.
+    void ForgetRemoteObjects(const std::string &provider, const std::vector<std::string> &keys);
+    // What immutable S3 objects reference, cached for remote collection (they never change, so entries
+    // are only removed with their objects): index page -> packs, descriptor -> index pages (with sizes),
+    // commit record -> descriptor.
+    struct RemoteReferences {
+        std::map<std::string, std::vector<std::string>> index_packs;
+        std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> descriptor_pages;
+        std::map<std::string, std::string> commit_descriptors;
+    };
+    RemoteReferences LoadRemoteReferences(const std::string &provider);
+    void StoreRemoteReferences(const std::string &provider, const RemoteReferences &references);
+    // Delete completed operation records created before `older_than` (request IDs stop replaying)
+    // and history entries of retired snapshots that took effect before it. Returns rows per table.
+    std::vector<std::pair<std::string, int64_t>> PruneMetadata(int64_t older_than, bool dry_run);
     // The snapshot before `snapshot` in the history of the branch that published it (0: none).
     int64_t ParentSnapshot(const std::string &database, int64_t snapshot);
     // Name of a branch by UUID, also for dropped branches ("" when unknown).

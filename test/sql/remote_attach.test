@@ -5,11 +5,11 @@
 require differential
 
 statement ok
-SET differential_repository = '__TEST_DIR__/differential_remote_attach'
+SET differential_repository = '{TEST_DIR}/differential_remote_attach'
 
 # A cached httpfs masks the bug even when autoload_known_extensions is false.
 statement ok
-SET extension_directory = '__TEST_DIR__/differential_remote_attach_extensions'
+SET extension_directories=['{TEST_DIR}/differential_remote_attach_extensions']
 
 statement ok
 SET autoinstall_known_extensions = false

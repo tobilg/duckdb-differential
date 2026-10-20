@@ -5,7 +5,7 @@
 require differential
 
 statement ok
-SET differential_repository = '__TEST_DIR__/differential_maintenance'
+SET differential_repository = '{TEST_DIR}/differential_maintenance'
 
 statement ok
 ATTACH 'differential:m' AS m
@@ -55,6 +55,37 @@ query I
 SELECT roots_unchanged FROM differential_compact()
 ----
 true
+
+# Metadata pruning: old completed operations and history of expired snapshots
+query II
+SELECT table_name, rows FROM differential_cleanup_metadata(older_than => TIMESTAMPTZ '2000-01-01', dry_run => true) ORDER BY 1
+----
+history	0
+operations	0
+
+query I
+SELECT rows > 0 FROM differential_cleanup_metadata(older_than => TIMESTAMPTZ '2999-01-01', dry_run => true) WHERE table_name = 'operations'
+----
+true
+
+statement ok
+CALL differential_cleanup_metadata(older_than => TIMESTAMPTZ '2999-01-01')
+
+query I
+SELECT count(*) FROM differential_operations() WHERE state = 'complete'
+----
+0
+
+# A pruned request ID is a new request: it publishes a new snapshot
+query I
+SELECT snapshot_id FROM differential_create_snapshot('m', request_id => 'snap-1')
+----
+3
+
+statement error
+SELECT * FROM differential_cleanup_metadata(dry_run => true)
+----
+needs older_than
 
 # Management functions run only in autocommit mode
 statement ok

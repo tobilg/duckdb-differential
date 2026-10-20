@@ -4,7 +4,7 @@ import json
 import os
 import secrets
 from pathlib import Path
-import sqlite3
+import metadata_store
 import tempfile
 import threading
 import time
@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='differential-cancel-') as tmp:
         assert host.query(observer,"SELECT count(*) FROM differential_operations() WHERE state='local_complete_export_pending';")==1
         assert host.query(observer,"SELECT count(*) FROM differential_snapshots('sales') WHERE export_state='pending';")==1
         assert host.query(observer,"SELECT value FROM differential_storage_stats() WHERE metric='s3_put_calls';")==0
-        with sqlite3.connect(root/'engine.sqlite') as db:
+        with metadata_store.connect(root/'engine.sqlite') as db:
             assert db.execute("SELECT count(*) FROM export_roots WHERE state='pending'").fetchone()[0]==1
         evidence_path('cancellation.json').write_text(json.dumps({'status':'passed','native_committed_value':42,'pending_export_roots':1,'network_put_calls':0},indent=2)+'\n')
     finally:

@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import metadata_store
 import sqlite3
 import subprocess
 import tempfile
@@ -34,7 +35,7 @@ def metrics(run):
     out=run("SELECT metric,value FROM differential_storage_stats();")
     return {r['metric']:int(r['value']) for r in rows(out)}
 def scalar(root,sql):
-    with sqlite3.connect(Path(root)/'engine.sqlite') as db:return db.execute(sql).fetchone()[0]
+    with metadata_store.connect(Path(root)/'engine.sqlite') as db:return db.execute(sql).fetchone()[0]
 def passed(name):
     results.append(name);print('PASS',name,flush=True)
 with tempfile.TemporaryDirectory(prefix='differential-write-path-') as tmp:
@@ -45,14 +46,15 @@ with tempfile.TemporaryDirectory(prefix='differential-write-path-') as tmp:
     assert run("ATTACH 'differential:plain' AS old (SNAPSHOT_VERSION 1); SELECT v FROM old.t;").endswith('v\n42\n')
     assert scalar(root,"SELECT count(*) FROM generations")>=1
     passed('plain ATTACH publishes snapshots and internal generations without TYPE differential')
-    # Small commits: overwritten journal-tail chunks are reclaimed at publication.
+    # Small commits: overwritten tail chunks of the main file are reclaimed at publication (the WAL
+    # stores byte ranges, not chunks).
     attach="ATTACH 'differential:plain' AS p;"
     before=scalar(root,"SELECT count(*) FROM objects")
     run("SET differential_auto_gc=false;"+attach+''.join(f"INSERT INTO p.t VALUES({i});" for i in range(200)))
     after=scalar(root,"SELECT count(*) FROM objects")
     assert after-before<=8,(before,after)
-    assert not any((root/'journal').iterdir()),'clean close left a write journal'
-    passed(f'200 single-row commits retain {after-before} new payload objects; clean close removes the journal')
+    assert not any((root/'journal').iterdir()),'clean close left an active segment'
+    passed(f'200 single-row commits retain {after-before} new payload objects; clean close retires its segments')
     # With automatic GC disabled, superseded generations remain queued for explicit collection.
     run(attach+"CREATE TABLE p.big AS SELECT range AS id, md5(range::VARCHAR) AS s FROM range(200000); CHECKPOINT p;")
     run("SET differential_auto_gc=false;"+attach+''.join(f"UPDATE p.big SET s=s||'x' WHERE id%7={i}; CHECKPOINT p;" for i in range(6)))
@@ -102,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix='differential-write-path-') as tmp:
     assert elapsed<20 and 'local_payload_bytes' in stats and dry['dry_run']=='true',elapsed
     passed('storage stats and GC dry run complete while another process holds the exclusive payload fence')
     status={r['capability']:r['status'] for r in rows(run("SELECT * FROM differential_status();"))}
-    assert status['local_store_format'].startswith('1') and 'test_hooks' in status
+    assert status['local_store_format'].startswith('2') and 'test_hooks' in status
     passed('status reports store format 1 and test-hook build mode')
     # Exactly one store format: a differential repository with any other version is refused.
     other=Path(tmp)/'other-format';other.mkdir()

@@ -1,10 +1,17 @@
 # Benchmark observations
 
+> **These measurements were made with DuckDB 1.5.6** and predate the move to DuckDB 2.0. For
+> current numbers on 2.0, with 1.5.6 as the baseline, see [the TPC-H comparison](benchmarks-tpch.md).
+
+Gigabyte-scale runs (concurrent commits, bulk load, cold scans, S3 export settings, remote
+garbage collection, shared history) are in [benchmarks-scale.md](benchmarks-scale.md).
+
 Measured on macOS 26.7 arm64 with stock DuckDB 1.5.6 and a release build without
 test hooks. These are development measurements, not release performance promises.
 The baseline sections below predate the header-alignment change unless explicitly dated.
-Native sync points remain durability boundaries: every native FileSync commits the
-buffered writes with SQLite FULL + fullfsync (F_FULLFSYNC), which is stronger than
+These measurements predate 2026-10-19, when sync points still used F_FULLFSYNC on macOS
+(they now use fsync, as native DuckDB). Native sync points remain durability boundaries:
+every native FileSync committed the buffered writes with SQLite FULL + fullfsync, which is stronger than
 stock DuckDB 1.5.6 on macOS (plain fsync). External payload files use
 per-file fsync plus one full device flush per published batch.
 
@@ -21,8 +28,8 @@ recorded by macOS time(1) in `benchmarks/local-results.json`.
 | fresh_process_selective_query | 19.317 | 54.341 | 43.833 |
 | repeat_fresh_process_selective_query | 18.700 | 42.079 | 43.945 |
 
-Writes are buffered as whole 64 KiB chunks plus an unsynced journal and published
-at native sync points. The remaining small-commit cost is dominated by
+At the time of these measurements (store format 1), writes were buffered as whole 64 KiB chunks
+plus an unsynced journal and published at native sync points. The remaining small-commit cost is dominated by
 the full device flush per native sync (about 3.5 ms on this host).
 
 ## Same-pool lifecycle
@@ -114,8 +121,8 @@ Per-instance milliseconds of the sequential workload: 102.8, 18.0, 13.5, 14.2.
 Request counts are SDK API calls and bytes are successfully verified payload
 bytes. HTTP/TLS overhead, retry wire traffic and underlying disk I/O are not
 captured. Raw records include retry decisions, publication latency and remote
-manifest lookup duration (including index fetch/wait). A separate 900000-row
-resource test reads more than memory_limit (16 MB); the external file cache
+manifest lookup duration (including index fetch/wait). A separate 3000000-row
+resource test reads more than memory_limit (64 MB); the external file cache
 stays within it.
 
 ## Reproduce
@@ -175,3 +182,64 @@ of 512 KiB (57 data reads total). All scan results match. A local snapshot still
 65 reads; `ALWAYS_PREFETCH` produces the same batching on either backend. These are observed
 native read calls, not S3 request counts or an AWS throughput claim. Cache, transport range
 coalescing and the extension's own read-ahead are separate layers.
+
+## TPC-H
+
+TPC-H Q1–Q22 on native files, Differential's local backends and every S3 read path, with writes:
+[benchmarks-tpch.md](benchmarks-tpch.md), produced by `make bench-tpch` (repeatable; compare two runs
+with `benchmarks/tpch_report.py baseline.json after.json`).
+
+First run (2026-10-20, SF1, 4 threads, macOS x86_64, 8 CPUs, 8 GiB RAM, release extension, MinIO in
+Docker on the same machine; geometric means of per-query median ratios):
+
+- **Local, warm:** default store 0.94× native, local pool 1.06×. Per query 0.44× (Q18) to 1.22× (Q3).
+- **Local, new process per query:** default store 1.20×, local pool 1.85× (one file open and SHA-256
+  check per 256 KiB chunk). Worst Q15 2.58×: short queries pay the attach (metadata store, catalog)
+  more than native's single file open.
+- **S3, new process per query:** export from a branch head 1.39× native through httpfs (Q1 0.78×,
+  Q21 2.55×); evicted snapshot 1.16×; follower 1.27×; recovered branch 1.30×; shared database 1.28×;
+  a warm repository disk cache 0.17×. About 180 S3 GET/HEAD requests per query.
+- **Writes (`lineitem`, 6M rows):** default store 0.89× native rows/s. To S3 durably: write + snapshot
+  export 7.5 s against native write + upload 6.0 s (0.80×). `SHIP_WAL 'async'` costs nothing at write
+  time (4.7 s to drain at DETACH); `'sync'` makes the bulk load 3.4× slower, because every sync of the
+  load waits for its epoch: use `async` for bulk loads.
+- **Compared with the objfs article** (different machine and S3 over the internet, so ratios only):
+  local reads 0.94× here against 1.08× there; S3 cold 1.39× against 1.20× (over MinIO, request
+  overhead is not hidden behind network latency); writes to S3 0.80× against 0.95×; local writes 0.89×
+  against 0.19×.
+
+## WAL shipping commit latency (2026-10-20)
+
+`benchmarks/scale.py --workloads ship_latency` (macOS x86_64, 8 CPUs, local disk-backed MinIO in
+Docker, 200 single-row commits of an S3 database, `SHIP_INTERVAL 1`; evidence
+`build/evidence/ship-latency-macos.json`):
+
+| `SHIP_WAL` | p50 ms | p99 ms | PUTs per commit | Epochs | Shipped bytes per commit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `off` | 1.28 | 3.62 | 0 | 0 | 0 |
+| `async` | 2.03 | 7.79 | 0.03 | 2 | 1,520 |
+| `sync` | 13.70 | 27.36 | 1.00 | 200 | 638 |
+
+`async` adds change tracking to each commit and ships the 200 commits as 2 epochs (the first one,
+the chain start, includes the base export's packs). `sync` costs one PUT per commit; a commit waits
+for the round trip to MinIO, which dominates here. On real S3 expect that round trip to be tens of
+milliseconds. A local MinIO is not an AWS latency or cost measurement.
+
+## Disk cache gate (2026-10-20)
+
+`benchmarks/disk_cache.py --scale-gib 1` (same host; 8.9M rows; memory cache off; every measured
+scan in a fresh instance; evidence `build/evidence/disk-cache.json`):
+
+| Read path | 1 thread ms | 8 threads ms |
+| --- | ---: | ---: |
+| Local segments (page cache warm) | 871 | 309 |
+| S3 export, cold (fills the disk cache) | 12,974 | 10,319 |
+| S3 export, warm disk cache | 2,803 | 1,649 |
+
+Warm disk-cache reads are 3–5× slower than local segments, but not because of its one-file-per-chunk
+layout: the scan read each cached chunk about twice (2,256 hits for 1,172 files: read-ahead fetches a
+chunk, the read itself fetches it again, since nothing in memory keeps it with the memory cache off),
+and every hit re-verifies 256 KiB with SHA-256 (about half of the single-threaded time). Opening the
+files costs roughly 0.1 s of the 2.8 s. Larger cache files would therefore save under 5%, so they
+were not implemented. The cheaper gains are a CRC32C check for cache entries (SHA-256 when filling)
+and keeping read-ahead data for the read that follows.

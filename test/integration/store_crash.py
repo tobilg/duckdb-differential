@@ -16,6 +16,8 @@ for operation,boundary in [('rename','namespace_updated'),('remove','namespace_u
 # Completed writes survive process death through the journal; a torn journal replays only
 # the valid prefix; a lost (unsynced) journal falls back to the last published generation.
 points+=['unsynced','torn']+['lost:'+p for p in ('before_commit','after_commit','truncate:before_commit','truncate:after_commit')]
+# Two databases committed in one group-commit transaction: both or neither.
+points+=['group:group_applied','group:after_commit','lost:group:group_applied','lost:group:after_commit']
 for point in points:
     with tempfile.TemporaryDirectory(prefix='differential-map-crash-') as folder:
         result=subprocess.run([str(exe),'--crash',folder,point],timeout=20)

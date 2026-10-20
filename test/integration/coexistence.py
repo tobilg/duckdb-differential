@@ -23,7 +23,7 @@ results = []
 
 def run(sql, repository):
     r = subprocess.run([DUCKDB_CLI, '-init', '/dev/null', '-unsigned', '-batch', '-bail', '-json'],
-                       input=f"SET extension_directory='{folder / 'extensions'}';" + sql, text=True,
+                       input=f"SET extension_directories=['{folder / 'extensions'}'];" + sql, text=True,
                        capture_output=True, env=dict(os.environ, DIFFERENTIAL_STORE_ROOT=str(repository)), timeout=300)
     assert r.returncode == 0, (sql, r.stdout, r.stderr)
     out, text, decoder = [], r.stdout.strip(), json.JSONDecoder()

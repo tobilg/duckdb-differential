@@ -23,7 +23,7 @@ base = Path(base) / 'layout'
 base.mkdir()
 LOCATION = 's3://differential-sdk-test/layout-test/'
 S3 = f"ENDPOINT '{endpoint}', PATH_STYLE true, ALLOW_HTTP true"
-HTTPFS = (f"SET extension_directory='{base / 'extensions'}'; LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID "
+HTTPFS = (f"SET extension_directories=['{base / 'extensions'}']; LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID "
           f"'{os.environ['AWS_ACCESS_KEY_ID']}', SECRET '{os.environ['AWS_SECRET_ACCESS_KEY']}', ENDPOINT "
           f"'{urlparse(endpoint).netloc}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1');")
 results = []
@@ -56,7 +56,7 @@ def text(key):
     return run('inspect', HTTPFS + f"SELECT content FROM read_text('{LOCATION}{key}');")[-1][0]['content']
 
 
-run('install', "SET extension_directory='" + str(base / 'extensions') + "'; INSTALL httpfs;")
+run('install', "SET extension_directories=['" + str(base / 'extensions') + "']; INSTALL httpfs;")
 rows = run('writer', f"""
     ATTACH 'differential:sales' AS sales (DATA_PATH '{LOCATION}', {S3});
     CREATE TABLE sales.t AS SELECT range AS id, sha256(range::VARCHAR) AS payload FROM range(100000);
@@ -89,6 +89,17 @@ def blob(key):
     return bytes.fromhex(run('inspect', HTTPFS + f"SELECT hex(content) AS bytes FROM read_blob('{LOCATION}{key}');")[-1][0]['bytes'])
 
 
+CHUNK = 262144
+def segment_bytes(segment, position):
+    # Local payload: CHUNK bytes at `position` of the segment file (retired or still active).
+    name = f'{segment:016x}'
+    for folder in ('segments', 'journal'):
+        path = base / 'writer' / folder / name
+        if path.exists():
+            with open(path, 'rb') as handle:
+                handle.seek(position)
+                return handle.read(CHUNK)
+    raise AssertionError(f'segment {name} missing')
 packs = {}
 with sqlite3.connect(f'file:{base / "writer/engine.sqlite"}?mode=ro', uri=True) as metadata:
     for snapshot in snapshots:
@@ -96,9 +107,9 @@ with sqlite3.connect(f'file:{base / "writer/engine.sqlite"}?mode=ro', uri=True) 
         assert hashlib.sha256(descriptor).hexdigest() == snapshot['export_locator'].split('/')[-1]
         stream = io.BytesIO(descriptor)
         lines = [stream.readline().decode().rstrip('\n') for _ in range(10)]
-        assert lines[0] == 'differential-export-v1'
+        assert lines[0] == 'differential-export-v2'
         size, count = int(lines[7]), int(lines[9])
-        chunk_count = 0 if not size else 1 if size <= 12288 else 2 + (size - 12289) // 65536
+        chunk_count = 0 if not size else 1 if size <= 12288 else 2 + (size - 12289) // CHUNK
         assert count == (chunk_count + 4095) // 4096
         pages = [stream.readline().decode().split() for _ in range(count)]
         assert stream.readline() == b'first-index\n'
@@ -109,7 +120,7 @@ with sqlite3.connect(f'file:{base / "writer/engine.sqlite"}?mode=ro', uri=True) 
             assert len(index) == int(length) and hashlib.sha256(index).hexdigest() == digest
             if page == 0:
                 assert index == first_index
-            assert index[:4] == b'DIX1'
+            assert index[:4] == b'DIX2'
             pack_count = struct.unpack_from('<I', index, 4)[0]
             entries = 8 + 48 * pack_count
             assert len(index) == entries + 36 * 4096
@@ -130,17 +141,18 @@ with sqlite3.connect(f'file:{base / "writer/engine.sqlite"}?mode=ro', uri=True) 
                 if key not in packs:
                     packs[key] = blob(key)
                     assert hashlib.sha256(packs[key]).hexdigest() == pack_hash
-                payload = packs[key][packed_slot * 65536:(packed_slot + 1) * 65536]
-                assert len(payload) == 65536 and hashlib.sha256(payload).hexdigest() == expected
-                start = 0 if chunk == 0 else 12288 + (chunk - 1) * 65536
-                length = min(12288 if chunk == 0 else 65536, size - start)
+                payload = packs[key][packed_slot * CHUNK:(packed_slot + 1) * CHUNK]
+                assert len(payload) == CHUNK and hashlib.sha256(payload).hexdigest() == expected
+                start = 0 if chunk == 0 else 12288 + (chunk - 1) * CHUNK
+                length = min(12288 if chunk == 0 else CHUNK, size - start)
                 assert not any(payload[length:]), 'object padding must be zero'
                 remote[start:start + length] = payload[:length]
         local = bytearray(size)
-        for chunk, payload in metadata.execute('''SELECT r.page_no*256+e.slot,o.data FROM root_pages r
-                JOIN page_entries e ON e.page=r.page JOIN objects o ON o.hash=e.object WHERE r.root=?''', (lines[6],)):
-            start = 0 if chunk == 0 else 12288 + (chunk - 1) * 65536
-            length = min(12288 if chunk == 0 else 65536, size - start)
+        for chunk, payload in ((chunk, segment_bytes(segment, position)) for chunk, segment, position in metadata.execute(
+                '''SELECT r.page_no*256+e.slot,o.segment,o.position FROM root_pages r
+                JOIN page_entries e ON e.page=r.page JOIN objects o ON o.hash=e.object WHERE r.root=?''', (lines[6],))):
+            start = 0 if chunk == 0 else 12288 + (chunk - 1) * CHUNK
+            length = min(12288 if chunk == 0 else CHUNK, size - start)
             local[start:start + length] = payload[:length]
         assert remote == local and remote[8:12] == b'DUCK'
 passed('independent descriptor/index/pack decoder reconstructs both snapshots byte-for-byte, including header alignment')

@@ -110,4 +110,16 @@ struct Transaction {
             sqlite3_exec(db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
     }
 };
+// A deferred read transaction on the authority connection: one consistent snapshot for several
+// lookups, without the write lock BEGIN IMMEDIATE takes (WAL readers never wait for writers).
+struct ReadTransaction {
+    sqlite3 *db;
+    explicit ReadTransaction(sqlite3 *db) : db(db) { Execute(db, "BEGIN DEFERRED"); }
+    ReadTransaction(const ReadTransaction &) = delete;
+    ReadTransaction &operator=(const ReadTransaction &) = delete;
+    ~ReadTransaction() {
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+};
 } // namespace differential

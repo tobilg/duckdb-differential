@@ -1,30 +1,31 @@
 # Architecture
 
-One loadable C++ extension uses stock DuckDB 1.5.6's exported native `DuckCatalog` and
+One loadable C++ extension uses stock DuckDB 2.0's exported native `DuckCatalog` and
 `DuckTransactionManager`. DuckDB constructs its native single-file storage manager. The
 filesystem adapter routes main-file and WAL/recovery operations through a durable
 differential byte store. Native SQL, catalog, compression, indexes and transactions stay
 upstream. No engine implementation is copied and no patched host, FUSE layer or daemon
 is required.
 
-Byte-level formats (repository layout, metadata schema, identities, journal, pools and S3
+Byte-level formats (repository layout, metadata schema, identities, segments, pools and S3
 objects) are specified in [storage-format.md](storage-format.md).
 
 | Boundary | Implementation |
 | --- | --- |
 | DuckDB integration | `src/duckdb_adapter/`: URI routing, branch leases, sync boundaries, header-sync generations, flush on close, native recovery connections, execution-only SQL functions, DuckDB secrets (`secrets.cpp`) |
-| Differential byte store | `src/storage/store.cpp`, `journal.cpp`: chunk overlay, write journal, publication at native sync, paged manifests, pooled readers, verified chunk cache, background WAL checkpoints |
+| Differential byte store | `src/storage/store.cpp`, `segment.cpp`: chunk and log-range overlay, append-only segments (write journal and payload), publication at native sync, background publication, paged manifests, pooled readers, CRC32C-verified zero-copy reads, map and chunk caches, segment collection, background WAL checkpoints |
 | Metadata store (SQLite) | `src/metadata/control.cpp` (identities, lifecycle, providers, exports), `retention.cpp` (pins, incremental GC, maintenance, compaction, statistics), `resolve.cpp` (URIs) |
 | Additional local pools | `src/providers/local/local_provider.cpp`: immutable fan-out files, batched durable publication, owned namespaces, process-wide payload fence |
 | S3 transport | `src/providers/s3/s3_provider.cpp`: AWS SDK credentials, signing, retries, conditional PUT, multipart, HEAD/ranges, listing and deletion |
-| Export and remote reads | `src/providers/s3/snapshot.cpp`: packed exports, verified publication, parallel coalesced range reads with in-flight dedupe, rehydration and writable import; `disk_cache.cpp` (repository disk cache); `src/duckdb_adapter/remote_cache.cpp` (DuckDB's external file cache as the memory layer) |
+| WAL shipping and followers | `src/providers/s3/shipping.cpp`: epochs and chains, the shipping worker, recovery, follower images; `src/duckdb_adapter/follow.cpp`: follower polling and per-transaction state choice |
+| Export and remote reads | `src/providers/s3/snapshot.cpp`: packed exports, verified publication, parallel coalesced range reads with in-flight dedupe, rehydration and writable import; `remote_gc.cpp` (two-phase remote garbage collection); `disk_cache.cpp` (repository disk cache); `src/duckdb_adapter/remote_cache.cpp` (DuckDB's external file cache as the memory layer) |
 
 ## Why SQLite for metadata
 
 Your databases stay ordinary DuckDB databases: native file format, catalog, SQL and
 transactions. Around them the extension keeps its own bookkeeping: databases, branches,
 snapshots, operations, pins, exports, and the chunk maps that tie each version to its stored
-64 KiB objects. That bookkeeping lives in an embedded SQLite database in the repository, the same
+256 KiB objects. That bookkeeping lives in an embedded SQLite database in the repository, the same
 choice DuckLake makes. DuckLake's
 [catalog guide](https://ducklake.select/docs/stable/duckdb/usage/choosing_a_catalog_database)
 recommends SQLite "for local data warehousing using multiple local clients" and notes that a
@@ -35,41 +36,52 @@ branch, readers of snapshots in other processes, and maintenance or restore runn
 A DuckDB database file has one read-write process at a time. The metadata workload also suits
 SQLite:
 - many tiny transactions, one at every DuckDB sync point;
-- point lookups by hash;
-- a full device flush on commit (`fullfsync` on macOS);
+- point lookups by hash and range lookups by offset;
+- a synced commit (`fsync`, as native DuckDB);
 - triggers that keep the garbage-collection queues current;
 - incremental vacuum to return freed space.
 
 DuckDB is optimised for analytics, so it would add overhead on the commit path.
 
 SQLite is linked statically into the extension and is invisible to users: nothing to install,
-configure or connect to. By default the chunks of your DuckDB files are stored in the same
-SQLite database as blobs; with `DATA_PATH '/directory'` they are plain files and SQLite holds
-only metadata.
+configure or connect to. It holds only metadata. The bytes of your DuckDB files live in
+append-only segment files in the repository (with `DATA_PATH '/directory'`, as plain files per
+chunk), so payload is written once, read with `pread` straight into DuckDB's buffers, and never
+copied through SQLite's page cache or WAL.
 
 ## Write path
 
 The first logical chunk covers DuckDB's 12 KiB header region; subsequent chunks cover
-64 KiB each. All objects remain 64 KiB, with zero padding. This aligns the data chunks with
-native blocks while retaining byte-granular WAL, truncation and recovery behavior. See the
-[exact geometry](storage-format.md#core-idea).
+256 KiB each, so each native data block is one chunk. All objects are 256 KiB, with zero
+padding. WAL sidecars are log files: byte ranges, so a WAL append stores only its bytes and
+truncation and recovery stay byte-granular. See the [exact geometry](storage-format.md#core-idea).
 
-Native writes modify an in-process overlay of whole 64 KiB chunks per inode and are
-appended to an unsynced per-process journal before returning. A completed write
-therefore survives process death, the same as native writes into the page cache. A
-native `FileSync` publishes the whole overlay in one SQLite `FULL` + `fullfsync`
-transaction: payload records (or external pool files, synced first), chunk maps,
-lengths and the journal's committed sequence. Overlay pressure (64 MiB) and handle close
-publish with `synchronous=NORMAL`; the next FULL commit makes that durable. A dead
-process's journal is replayed as a valid prefix before its branch is reused. Overwritten
-chunks with no other reference are deleted in the publishing transaction. SQLite WAL
+Native writes modify an in-process overlay per inode (whole chunks, or byte pieces of a log
+file) and are appended to the group's unsynced segment before returning. A completed write
+therefore survives process death, the same as native writes into the page cache. Files publish
+in groups: a database file and its WAL sidecars share a write gate, segment and overlay bound. A
+native `FileSync` publishes its group's overlay: a chunk that one write covered whole (a native
+block) is referenced where that write stored it; other chunks are appended once as object
+records; WAL pieces are ranges of their write records. The segment is synced, then one SQLite
+`FULL` (`fsync`) transaction (group commit: concurrent syncs of different groups share it, up
+to 16 MiB of new data) records object locations, chunk maps, ranges, lengths and the segment's
+published watermark; other databases keep writing meanwhile. A group with more than 16 MiB
+buffered is published by a background thread with `synchronous=NORMAL` (the writer itself only
+beyond 64 MiB; everything beyond 256 MiB in all); handle close publishes with NORMAL too, and
+the next FULL commit makes it durable. Segments are synced before any transaction that
+references them. A dead process's segment is replayed as a valid prefix before its branch is
+reused. Overwritten chunks with no other reference are deleted in the publishing transaction;
+retired segments are collected or compacted once little of them is referenced. SQLite WAL
 checkpoints run on a background connection, and the WAL file is truncated to 64 MiB after one.
 
 ## Read path
 
 Reads take only a shared per-inode lock and use a pooled, memory-mapped read-only SQLite
-connection: one read snapshot per native read, with range lookups for the chunk map.
-Verified chunks are cached process-wide (32 MiB, by SHA-256 identity). The payload fence,
+connection: one read snapshot per native read. Chunk maps are cached per inode (keyed by the
+file's map version) and per immutable root page; object locations are cached per repository.
+A whole-chunk read is a single `pread` into DuckDB's buffer, verified by CRC32C; partial reads,
+log records and remote chunks go through a process-wide 64 MiB verified cache. A read that finds
+a segment moved by compaction retries on fresh metadata. The payload fence,
 which protects old SQLite snapshots of external-pool mappings from physical deletion, is
 taken only for external pools.
 
@@ -134,7 +146,7 @@ the request resumes them.
 All of this coordination uses file locks and SQLite transactions inside one repository, so it
 works between processes and, for repositories created with `differential_repository_shared`,
 between local users. A `Permissions` value owned by the store (private `0700`/`0600`, or shared
-setgid `02770`/`0660`) is applied to every directory and file the repository creates: journal,
+setgid `02770`/`0660`) is applied to every directory and file the repository creates: segments,
 locks, pins, staging and local pools. See [deployment.md](deployment.md).
 
 ## Retention and collection
@@ -152,14 +164,16 @@ object identities or reader roots.
 ## S3 profile
 
 Publication first persists export retention, then uploads the chunks no export has stored
-yet in content-addressed 8 MiB packs (concurrently, conditional PUT, read-back verified),
+yet in content-addressed 8 MiB packs (concurrently, conditional PUT, checksum verified by the service),
 then the paged indexes, and the self-contained descriptor last. Verified objects are
 trusted by their local record in the owned, immutable namespace. The descriptor includes
 engine/format identity, database/branch/snapshot identity, time, size, root, pool namespace
 and index hashes and sizes. A fresh reader maps the namespace to provider access and fetches
 the native ranges it needs. Misses of one read are coalesced per pack and fetched
 concurrently, and concurrent readers share in-flight fetches. Verified data is cached in DuckDB's
-external file cache of the reading instance (within `memory_limit`, surviving DETACH) and,
+external file cache of the reading instance (within `memory_limit`, surviving DETACH; filled by a
+worker thread, because DuckDB reads database blocks while holding their locks, so a read must never
+make the buffer manager evict) and,
 when `differential_remote_cache_size` is set, in the repository's content-addressed disk cache,
 shared by every process of the repository. Bulk copies read but never fill these caches.
 Derived upload staging has a quota of one 8 MiB pack per allowed parallel request (64–512 MiB)
@@ -176,9 +190,19 @@ repository ([deployment.md](deployment.md#branch-heads)).
 Pending exports retain their local graph. Completed exports do not, so a retired exported
 snapshot is collectible locally, and `differential_evict_snapshots` drops the local copy of
 a live one, whose reads then go through S3. Branch, clone and restore rehydrate an evicted
-root from its export when it is no longer local. Remote exports are permanent: there is no
-distributed lock authority, remote reader expiry, automatic remote reclamation or
-multi-host writer failover.
+root from its export when it is no longer local. There is no distributed lock authority or remote reader expiry, and remote reclamation is
+explicit (`differential_cleanup_remote_files`).
+
+WAL shipping (`SHIP_WAL`, opt-in, single-writer S3 databases) makes commits durable off-host as
+well: publications of a writable branch are tracked in the publishing transaction and shipped by a
+background worker as create-only, hash-chained epochs. A chain starts from a base (an internal export
+of the main file captured as a root that is not a generation) and carries WAL bytes and changed
+main-file chunks inline, typically one PUT per epoch. `sync` makes a native sync wait for its epoch.
+`differential_recover_branch` imports a chain's base lazily and applies its epochs, so failover takes
+seconds; with `same_identity` the new host continues shipping in a newer chain, and a copied
+repository is detected as a conflict. Followers (`FOLLOW true`) apply epochs (or follow branch heads)
+in a background poller and serve each transaction one immutable state through hidden read-only
+attachments, so no S3 request happens while a query binds.
 
 Shared databases (`WRITERS 'shared'`) let several repositories write one database through S3
 without a lock authority. Each keeps its own local metadata store and publishes optimistically:
@@ -192,7 +216,7 @@ without a lock authority. Each keeps its own local metadata store and publishes 
 
 ## Additional local pools
 
-Local pools (`DATA_PATH '/absolute/path'`) store immutable 64 KiB files under
+Local pools (`DATA_PATH '/absolute/path'`) store immutable 256 KiB files under
 `<path>/differential-pools/<repository>/<provider>/<xx>/<hash>`; their mappings stay in the
 repository's metadata store. A publication batch `fsync`s each file, links all names, syncs directories and
 flushes the device once before the mapping commits. Collection commits a durable deletion

@@ -176,6 +176,19 @@ INSERT INTO gc_roots SELECT OLD.root WHERE NOT EXISTS(SELECT 1 FROM gc_roots WHE
 )SQL");
         Query(db, "INSERT INTO control_format VALUES(?,?)").Int(1, CONTROL_FORMAT).Text(2, UUID()).Run();
     }
+    // Remote garbage collection: condemnation records learned per S3 location, and the condemned
+    // objects with their earliest condemnation (S3 LastModified of the record).
+    Execute(db, R"SQL(
+CREATE TABLE IF NOT EXISTS remote_gc_records(provider_id TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(provider_id,key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS remote_condemned(provider_id TEXT NOT NULL, key TEXT NOT NULL, condemned_at INTEGER NOT NULL, PRIMARY KEY(provider_id,key)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS remote_chunks_pack ON remote_chunks(provider_id,pool,pack);
+CREATE TABLE IF NOT EXISTS remote_index_packs(provider_id TEXT NOT NULL, index_key TEXT NOT NULL, pack_key TEXT NOT NULL, PRIMARY KEY(provider_id,index_key,pack_key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS remote_descriptor_pages(provider_id TEXT NOT NULL, descriptor_key TEXT NOT NULL, index_key TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(provider_id,descriptor_key,index_key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS remote_sync_state(database_id TEXT PRIMARY KEY, commits_full_at INTEGER NOT NULL, expiries_full_at INTEGER NOT NULL, expiries_watermark TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS remote_commit_descriptors(provider_id TEXT NOT NULL, commit_key TEXT NOT NULL, descriptor_key TEXT NOT NULL, PRIMARY KEY(provider_id,commit_key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ship_config(database_id TEXT PRIMARY KEY REFERENCES databases(id), mode TEXT NOT NULL CHECK(mode IN ('async','sync')), interval_ms INTEGER NOT NULL CHECK(interval_ms>=0)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ship_chains(branch_id TEXT PRIMARY KEY, database_id TEXT NOT NULL, chain INTEGER NOT NULL, epoch INTEGER NOT NULL, epoch_hash TEXT NOT NULL, base TEXT NOT NULL, known TEXT NOT NULL, shipped_sequence INTEGER NOT NULL, chain_bytes INTEGER NOT NULL, shipped_at INTEGER NOT NULL, pending TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
+)SQL");
     tx.Commit();
 }
 std::string Control::RepositoryID() {
@@ -289,6 +302,110 @@ Operation Control::CreateDatabase(const std::string &name, const std::string &re
     Complete(o);
     tx.Commit();
     return o;
+}
+Branch Control::CreateFromShippedBase(const std::string &name, const std::string &provider,
+                                      const std::string &database_id, const std::string &branch_id,
+                                      const std::string &branch_name, const RemoteHead &base) {
+    ValidateName(name);
+    ValidateName(branch_name);
+    if (provider == "local" || !LocalProvider(provider).empty())
+        throw std::runtime_error("Recovering a shipped branch needs its S3 location");
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = database_id.empty() ? UUID() : database_id;
+    if (!IsUUID(id) || (!branch_id.empty() && !IsUUID(branch_id)))
+        throw std::runtime_error("[differential:corrupt_data] Corrupt shipped identity");
+    Query existing(store->db, "SELECT name FROM databases WHERE id=? OR name=?");
+    existing.Text(1, id).Text(2, name);
+    if (existing.Step())
+        throw std::runtime_error("[differential:name_conflict] Database \"" + existing.Text(0) +
+                                 "\" already exists in this repository" +
+                                 (database_id.empty() ? "" : " (a failover recovers into a repository without it)"));
+    Query(store->db, "INSERT INTO databases(id,name,created_at) VALUES(?,?,?)")
+        .Text(1, id)
+        .Text(2, name)
+        .Int(3, Timestamp())
+        .Run();
+    AssignProvider(id, provider);
+    auto root = ImportMapTx(provider, base);
+    Branch b;
+    b.database = id;
+    b.id = branch_id.empty() ? UUID() : branch_id;
+    b.name = branch_name;
+    Query(store->db, "INSERT INTO branches(id,database_id,name,state,head,created_at) VALUES(?,?,?,'active',0,?)")
+        .Text(1, b.id)
+        .Text(2, id)
+        .Text(3, branch_name)
+        .Int(4, Timestamp())
+        .Run();
+    auto file = store->CreateFileTx(b.FileName(), base.size, LocalDatabasePool(id));
+    store->InstallRootTx(file, root);
+    tx.Commit();
+    return GetBranch(id, b.id, true);
+}
+std::optional<std::pair<std::string, int64_t>> Control::ShipConfigOf(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT mode,interval_ms FROM ship_config WHERE database_id=?");
+    q.Text(1, database);
+    if (!q.Step())
+        return std::nullopt;
+    return std::make_pair(q.Text(0), q.Int(1));
+}
+void Control::SetShipConfigOf(const std::string &database, const std::string &mode, int64_t interval_ms) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    if (mode == "off")
+        Query(store->db, "DELETE FROM ship_config WHERE database_id=?").Text(1, database).Run();
+    else
+        Query(store->db, "INSERT INTO ship_config VALUES(?,?,?) ON CONFLICT(database_id) DO UPDATE SET "
+                         "mode=excluded.mode,interval_ms=excluded.interval_ms")
+            .Text(1, database)
+            .Text(2, mode)
+            .Int(3, interval_ms)
+            .Run();
+    tx.Commit();
+}
+std::optional<Control::ShipChainRow> Control::ShipChainOf(const std::string &branch) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT chain,epoch,epoch_hash,base,known,shipped_sequence,chain_bytes,shipped_at,pending FROM "
+                       "ship_chains WHERE branch_id=?");
+    q.Text(1, branch);
+    if (!q.Step())
+        return std::nullopt;
+    ShipChainRow row;
+    row.chain = q.Int(0);
+    row.epoch = q.Int(1);
+    row.hash = q.Text(2);
+    row.base = q.Text(3);
+    row.known = q.Text(4);
+    row.sequence = q.Int(5);
+    row.bytes = q.Int(6);
+    row.shipped_at = q.Int(7);
+    row.pending = q.Text(8);
+    return row;
+}
+void Control::SetShipChainOf(const std::string &database, const std::string &branch, const ShipChainRow &row) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    // Shipping state survives process death; its epochs are synced with the next FULL commit (an epoch
+    // shipped again after a power loss is found in S3 with the same identity).
+    Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", false);
+    Query(store->db, "INSERT INTO ship_chains VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(branch_id) DO UPDATE SET "
+                     "chain=excluded.chain,epoch=excluded.epoch,epoch_hash=excluded.epoch_hash,base=excluded.base,"
+                     "known=excluded.known,shipped_sequence=excluded.shipped_sequence,chain_bytes=excluded.chain_bytes,"
+                     "shipped_at=excluded.shipped_at,pending=excluded.pending")
+        .Text(1, branch)
+        .Text(2, database)
+        .Int(3, row.chain)
+        .Int(4, row.epoch)
+        .Text(5, row.hash)
+        .Text(6, row.base)
+        .Text(7, row.known)
+        .Int(8, row.sequence)
+        .Int(9, row.bytes)
+        .Int(10, row.shipped_at)
+        .Text(11, row.pending)
+        .Run();
+    tx.Commit();
 }
 void Control::CreateSharedDatabase(const std::string &id, const std::string &name, const std::string &provider) {
     ValidateName(name);
@@ -429,7 +546,11 @@ std::string Control::ImportMapTx(const std::string &provider, const RemoteHead &
             .Text(2, location.second.pool)
             .Text(3, location.second.pack)
             .Run();
-        Query(store->db, "INSERT OR IGNORE INTO remote_chunks VALUES(?,?,?,?,?)")
+        // A location in a condemned pack gives way to the published one.
+        Query(store->db, "INSERT INTO remote_chunks VALUES(?,?,?,?,?) ON CONFLICT(provider_id,hash) DO UPDATE SET "
+                         "pool=excluded.pool,pack=excluded.pack,slot=excluded.slot WHERE EXISTS(SELECT 1 FROM "
+                         "remote_condemned d WHERE d.provider_id=remote_chunks.provider_id AND "
+                         "d.key='dbs/'||remote_chunks.pool||'/packs/'||remote_chunks.pack)")
             .Text(1, provider)
             .Text(2, location.first)
             .Text(3, location.second.pool)
@@ -608,6 +729,29 @@ void Control::CacheCommits(const std::string &database, const std::vector<Remote
             .Run();
     tx.Commit();
 }
+Control::RemoteSyncState Control::GetRemoteSyncState(const std::string &database) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    RemoteSyncState state;
+    Query q(store->db, "SELECT commits_full_at,expiries_full_at,expiries_watermark FROM remote_sync_state WHERE "
+                       "database_id=?");
+    q.Text(1, DatabaseID(database));
+    if (q.Step())
+        state = {q.Int(0), q.Int(1), q.Text(2)};
+    return state;
+}
+void Control::SetRemoteSyncState(const std::string &database, const RemoteSyncState &state) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", false); // re-derived by a full listing if lost
+    Query(store->db, "INSERT INTO remote_sync_state VALUES(?,?,?,?) ON CONFLICT(database_id) DO UPDATE SET "
+                     "commits_full_at=excluded.commits_full_at,expiries_full_at=excluded.expiries_full_at,"
+                     "expiries_watermark=excluded.expiries_watermark")
+        .Text(1, DatabaseID(database))
+        .Int(2, state.commits_full_at)
+        .Int(3, state.expiries_full_at)
+        .Text(4, state.expiries_watermark)
+        .Run();
+    tx.Commit();
+}
 void Control::ExpireCommits(const std::string &database, const std::vector<int64_t> &snapshots) {
     std::lock_guard<std::recursive_mutex> guard(store->mutex);
     Transaction tx(store->db);
@@ -716,7 +860,7 @@ std::shared_ptr<BranchLock> Control::Acquire(const Branch &b) {
     result->fd = store->permissions.Open(path / ("branch-" + b.id), O_RDWR | O_CLOEXEC);
     if (result->fd < 0 || flock(result->fd, LOCK_EX | LOCK_NB)) {
         Count(Counter::WriterConflicts);
-        throw std::runtime_error(
+        throw Error(ErrorCode::WriterBusy,
             "[differential:writer_busy] Writer busy: branch has a live attachment or management owner");
     }
     // A previous owner may have died with unsynced journaled writes: apply them before this
@@ -728,7 +872,7 @@ std::shared_ptr<BranchLock> Control::Acquire(const Branch &b) {
     intent.Text(1, b.id);
     if (intent.Step()) {
         Count(Counter::WriterConflicts);
-        throw std::runtime_error(
+        throw Error(ErrorCode::WriterBusy,
             "[differential:writer_busy] Branch has a pending compound operation; retry its request ID");
     }
     result->branch = GetBranch(b.database, b.id, true);
@@ -978,7 +1122,7 @@ Control::PrepareCompound(const std::string &database, const std::string &branch,
     lock->management_fd = store->permissions.Open(path / ("management-" + database_id), O_RDWR | O_CLOEXEC);
     if (lock->management_fd < 0 || flock(lock->management_fd, LOCK_EX | LOCK_NB)) {
         Count(Counter::WriterConflicts);
-        throw std::runtime_error("[differential:writer_busy] Database management busy");
+        throw Error(ErrorCode::WriterBusy, "[differential:writer_busy] Database management busy");
     }
     lock->fd = store->permissions.Open(path / ("branch-" + b.id), O_RDWR | O_CLOEXEC);
     if (lock->fd < 0 || flock(lock->fd, LOCK_EX | LOCK_NB)) {
@@ -1002,7 +1146,7 @@ Control::PrepareCompound(const std::string &database, const std::string &branch,
     pending.Text(1, b.id);
     if (pending.Step()) {
         if (pending.Text(0) != o.id)
-            throw std::runtime_error("[differential:writer_busy] Branch has another pending compound operation");
+            throw Error(ErrorCode::WriterBusy, "[differential:writer_busy] Branch has another pending compound operation");
         if (pending.Int(1) != b.head)
             throw std::runtime_error("[differential:stale_epoch] Stale compound operation head");
     } else {
@@ -1105,7 +1249,8 @@ Operation Control::FinishCompound(const Operation &operation, const Branch &b, c
 Snapshot Control::SnapshotAt(const std::string &database, const std::string &branch, int64_t timestamp,
                              int64_t start) {
     std::lock_guard<std::recursive_mutex> guard(store->mutex);
-    Transaction tx(store->db);
+    // Lookups only (also while binding AT): a read snapshot, never the authority write lock.
+    ReadTransaction tx(store->db);
     auto database_id = DatabaseID(database);
     if (Writers(database_id) == "shared") {
         auto current = start;
@@ -1127,7 +1272,6 @@ Snapshot Control::SnapshotAt(const std::string &database, const std::string &bra
             }
             if (!s.retired && s.published_at <= timestamp) {
                 s.event_at = s.published_at;
-                tx.Commit();
                 return s;
             }
             Query parent(store->db, "SELECT parent FROM remote_commits WHERE database_id=? AND id=?");
@@ -1150,7 +1294,6 @@ Snapshot Control::SnapshotAt(const std::string &database, const std::string &bra
         throw std::runtime_error("[differential:not_found] No retained snapshot at or before timestamp on this branch");
     auto s = GetSnapshot(database_id, q.Int(0));
     s.event_at = q.Int(1);
-    tx.Commit();
     return s;
 }
 std::vector<Snapshot> Control::Snapshots(const std::string &database) {
@@ -1584,7 +1727,8 @@ bool Control::RemoteVerified(const std::string &provider, const std::string &key
 void Control::RecordRemoteVerified(const std::string &provider, const std::string &key, const std::string &hash,
                                    uint64_t size) {
     std::lock_guard<std::recursive_mutex> guard(store->mutex);
-    Transaction tx(store->db);
+    // A cache of uploads: losing it after a crash only means a conditional re-upload. No sync of its own.
+    Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", false);
     Query(store->db, "INSERT INTO verified_remote_objects VALUES(?,?,?,?) ON CONFLICT(provider_id,key) DO "
                      "UPDATE SET hash=excluded.hash,size=excluded.size")
         .Text(1, provider)
@@ -1595,14 +1739,17 @@ void Control::RecordRemoteVerified(const std::string &provider, const std::strin
     tx.Commit();
 }
 std::map<std::string, RemoteChunk> Control::FindRemoteChunks(const std::string &provider,
-                                                             const std::vector<std::string> &hashes) {
+                                                             const std::vector<std::string> &hashes, bool reusable) {
     std::map<std::string, RemoteChunk> result;
     store->WithReader([&](Reader &reader) {
         for (auto &hash : hashes) {
             if (result.count(hash))
                 continue;
             Query q(reader.db,
-                    reader.Statement("SELECT pack,pool,slot FROM remote_chunks WHERE provider_id=? AND hash=?"));
+                    reader.Statement(reusable ? "SELECT c.pack,c.pool,c.slot FROM remote_chunks c WHERE c.provider_id=?1 "
+                                                "AND c.hash=?2 AND NOT EXISTS(SELECT 1 FROM remote_condemned d WHERE "
+                                                "d.provider_id=?1 AND d.key='dbs/'||c.pool||'/packs/'||c.pack)"
+                                              : "SELECT pack,pool,slot FROM remote_chunks WHERE provider_id=? AND hash=?"));
             q.Text(1, provider).Text(2, hash);
             if (q.Step())
                 result.emplace(hash, RemoteChunk{q.Text(0), q.Text(1), uint64_t(q.Int(2))});
@@ -1613,7 +1760,8 @@ std::map<std::string, RemoteChunk> Control::FindRemoteChunks(const std::string &
 void Control::RecordPack(const std::string &provider, const std::string &pool, const std::string &pack,
                          uint64_t size, const std::vector<std::string> &chunks) {
     std::lock_guard<std::recursive_mutex> guard(store->mutex);
-    Transaction tx(store->db);
+    // Synced with the export's completion (a later FULL commit); before that only a cache of uploads.
+    Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", false);
     Query(store->db, "INSERT OR IGNORE INTO remote_packs VALUES(?,?,?,?)")
         .Text(1, provider)
         .Text(2, pool)
@@ -1621,7 +1769,8 @@ void Control::RecordPack(const std::string &provider, const std::string &pool, c
         .Int(4, int64_t(size))
         .Run();
     for (size_t slot = 0; slot < chunks.size(); ++slot)
-        Query(store->db, "INSERT OR IGNORE INTO remote_chunks VALUES(?,?,?,?,?)")
+        Query(store->db, "INSERT INTO remote_chunks VALUES(?,?,?,?,?) ON CONFLICT(provider_id,hash) DO UPDATE SET "
+                         "pool=excluded.pool,pack=excluded.pack,slot=excluded.slot")
             .Text(1, provider)
             .Text(2, chunks[slot])
             .Text(3, pool)
@@ -1662,6 +1811,244 @@ int64_t Control::ParentSnapshot(const std::string &database, int64_t snapshot) {
                        "p.sequence DESC LIMIT 1");
     q.Text(1, DatabaseID(database)).Int(2, snapshot);
     return q.Step() ? q.Int(0) : 0;
+}
+namespace {
+// "dbs/<uuid>/packs/<sha256>" -> {pool, pack}; false for other keys.
+bool PackKey(const std::string &key, std::string &pool, std::string &pack) {
+    if (key.rfind("dbs/", 0) != 0 || key.size() != 4 + 36 + 7 + 64 || key.compare(40, 7, "/packs/") != 0)
+        return false;
+    pool = key.substr(4, 36);
+    pack = key.substr(47);
+    return true;
+}
+} // namespace
+bool Control::KnownCondemnation(const std::string &provider, const std::string &record) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Query q(store->db, "SELECT 1 FROM remote_gc_records WHERE provider_id=? AND key=?");
+    q.Text(1, provider).Text(2, record);
+    return q.Step();
+}
+void Control::RecordCondemnation(const std::string &provider, const std::string &record, int64_t at,
+                                 const std::vector<std::string> &keys, bool learned) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    Query known(store->db, "SELECT 1 FROM remote_gc_records WHERE provider_id=? AND key=?");
+    known.Text(1, provider).Text(2, record);
+    if (known.Step()) {
+        tx.Commit();
+        return;
+    }
+    for (auto &key : keys) {
+        Query(store->db, "INSERT INTO remote_condemned VALUES(?,?,?) ON CONFLICT(provider_id,key) DO UPDATE SET "
+                         "condemned_at=min(condemned_at,excluded.condemned_at)")
+            .Text(1, provider)
+            .Text(2, key)
+            .Int(3, at)
+            .Run();
+        // A later export uploads it again rather than trusting an earlier verification.
+        Query(store->db, "DELETE FROM verified_remote_objects WHERE provider_id=? AND key=?").Text(1, provider).Text(2, key).Run();
+        std::string pool, pack;
+        if (!PackKey(key, pool, pack))
+            continue;
+        // Exports place these chunks in new packs; locations local remote-only objects read stay until
+        // those objects are stored locally.
+        Query(store->db, "DELETE FROM remote_chunks WHERE provider_id=? AND pool=? AND pack=? AND hash NOT IN "
+                         "(SELECT r.hash FROM remote_objects r JOIN objects o ON o.hash=r.hash WHERE o.segment IS NULL)")
+            .Text(1, provider)
+            .Text(2, pool)
+            .Text(3, pack)
+            .Run();
+        Query(store->db, "DELETE FROM remote_packs WHERE provider_id=?1 AND pool=?2 AND pack=?3 AND NOT EXISTS(SELECT 1 "
+                         "FROM remote_chunks c WHERE c.provider_id=?1 AND c.pool=?2 AND c.pack=?3)")
+            .Text(1, provider)
+            .Text(2, pool)
+            .Text(3, pack)
+            .Run();
+    }
+    if (learned)
+        Query(store->db, "INSERT INTO remote_gc_records VALUES(?,?)").Text(1, provider).Text(2, record).Run();
+    tx.Commit();
+}
+std::map<std::string, int64_t> Control::Condemnations(const std::string &provider) {
+    std::map<std::string, int64_t> result;
+    store->WithReader([&](Reader &reader) {
+        Query q(reader.db, "SELECT key,condemned_at FROM remote_condemned WHERE provider_id=?");
+        q.Text(1, provider);
+        while (q.Step())
+            result.emplace(q.Text(0), q.Int(1));
+    });
+    return result;
+}
+bool Control::Condemned(const std::string &provider, const std::string &key) {
+    bool found = false;
+    store->WithReader([&](Reader &reader) {
+        Query q(reader.db, reader.Statement("SELECT 1 FROM remote_condemned WHERE provider_id=? AND key=?"));
+        q.Text(1, provider).Text(2, key);
+        found = q.Step();
+    });
+    return found;
+}
+std::vector<std::string> Control::LiveExportDescriptors(const std::string &provider) {
+    std::vector<std::string> result;
+    store->WithReader([&](Reader &reader) {
+        Query q(reader.db, "SELECT DISTINCT e.descriptor FROM exports e JOIN export_roots r ON r.export_id=e.id JOIN "
+                           "snapshots s ON s.database_id=e.database_id AND s.id=e.snapshot_id WHERE e.provider_id=? AND "
+                           "r.state='complete' AND s.retired=0 AND e.descriptor!=''");
+        q.Text(1, provider);
+        while (q.Step())
+            result.push_back(q.Text(0));
+    });
+    return result;
+}
+std::set<std::string> Control::RemoteOnlyPacks(const std::string &provider) {
+    std::set<std::string> result;
+    store->WithReader([&](Reader &reader) {
+        Query q(reader.db, "SELECT DISTINCT 'dbs/'||c.pool||'/packs/'||c.pack FROM remote_objects r JOIN objects o ON "
+                           "o.hash=r.hash AND o.segment IS NULL JOIN remote_chunks c ON c.hash=r.hash AND c.provider_id=?");
+        q.Text(1, provider);
+        while (q.Step())
+            result.insert(q.Text(0));
+    });
+    return result;
+}
+std::vector<std::string> Control::RemoteOnlyObjectsIn(const std::string &provider, const std::set<std::string> &packs) {
+    std::vector<std::string> result;
+    store->WithReader([&](Reader &reader) {
+        for (auto &key : packs) {
+            std::string pool, pack;
+            if (!PackKey(key, pool, pack))
+                continue;
+            Query q(reader.db, reader.Statement("SELECT c.hash FROM remote_chunks c JOIN remote_objects r ON "
+                                                "r.hash=c.hash JOIN objects o ON o.hash=c.hash AND o.segment IS NULL "
+                                                "WHERE c.provider_id=? AND c.pool=? AND c.pack=?"));
+            q.Text(1, provider).Text(2, pool).Text(3, pack);
+            while (q.Step())
+                result.push_back(q.Text(0));
+        }
+    });
+    return result;
+}
+void Control::MaterializeRemoteObjects(const std::map<std::string, SharedBytes> &objects) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    store->MaterializeObjectsTx(objects);
+    for (auto &object : objects)
+        Query(store->db, "DELETE FROM remote_objects WHERE hash=?").Text(1, object.first).Run();
+    tx.Commit();
+}
+// An object with no references is cached with one row whose reference is '' (cached, references nothing).
+Control::RemoteReferences Control::LoadRemoteReferences(const std::string &provider) {
+    RemoteReferences result;
+    store->WithReader([&](Reader &reader) {
+        Query packs(reader.db, "SELECT index_key,pack_key FROM remote_index_packs WHERE provider_id=?");
+        packs.Text(1, provider);
+        while (packs.Step()) {
+            auto &entry = result.index_packs[packs.Text(0)];
+            if (!packs.Text(1).empty())
+                entry.push_back(packs.Text(1));
+        }
+        Query pages(reader.db, "SELECT descriptor_key,index_key,size FROM remote_descriptor_pages WHERE provider_id=?");
+        pages.Text(1, provider);
+        while (pages.Step()) {
+            auto &entry = result.descriptor_pages[pages.Text(0)];
+            if (!pages.Text(1).empty())
+                entry.emplace_back(pages.Text(1), uint64_t(pages.Int(2)));
+        }
+        Query commits(reader.db, "SELECT commit_key,descriptor_key FROM remote_commit_descriptors WHERE provider_id=?");
+        commits.Text(1, provider);
+        while (commits.Step())
+            result.commit_descriptors.emplace(commits.Text(0), commits.Text(1));
+    });
+    return result;
+}
+void Control::StoreRemoteReferences(const std::string &provider, const RemoteReferences &references) {
+    if (references.index_packs.empty() && references.descriptor_pages.empty() && references.commit_descriptors.empty())
+        return;
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", false); // a cache: rebuilt from S3 if lost
+    for (auto &entry : references.index_packs) {
+        auto packs = entry.second.empty() ? std::vector<std::string> {""} : entry.second;
+        for (auto &pack : packs)
+            Query(store->db, "INSERT OR IGNORE INTO remote_index_packs VALUES(?,?,?)")
+                .Text(1, provider)
+                .Text(2, entry.first)
+                .Text(3, pack)
+                .Run();
+    }
+    for (auto &entry : references.descriptor_pages) {
+        auto pages = entry.second.empty() ? std::vector<std::pair<std::string, uint64_t>> {{"", 0}} : entry.second;
+        for (auto &page : pages)
+            Query(store->db, "INSERT OR IGNORE INTO remote_descriptor_pages VALUES(?,?,?,?)")
+                .Text(1, provider)
+                .Text(2, entry.first)
+                .Text(3, page.first)
+                .Int(4, int64_t(page.second))
+                .Run();
+    }
+    for (auto &entry : references.commit_descriptors)
+        Query(store->db, "INSERT OR IGNORE INTO remote_commit_descriptors VALUES(?,?,?)")
+            .Text(1, provider)
+            .Text(2, entry.first)
+            .Text(3, entry.second)
+            .Run();
+    tx.Commit();
+}
+void Control::ForgetRemoteObjects(const std::string &provider, const std::vector<std::string> &keys) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    for (auto &key : keys) {
+        Query(store->db, "DELETE FROM verified_remote_objects WHERE provider_id=? AND key=?").Text(1, provider).Text(2, key).Run();
+        Query(store->db, "DELETE FROM remote_index_packs WHERE provider_id=? AND index_key=?").Text(1, provider).Text(2, key).Run();
+        Query(store->db, "DELETE FROM remote_descriptor_pages WHERE provider_id=? AND descriptor_key=?")
+            .Text(1, provider)
+            .Text(2, key)
+            .Run();
+        std::string pool, pack;
+        if (!PackKey(key, pool, pack))
+            continue;
+        Query(store->db, "DELETE FROM remote_chunks WHERE provider_id=? AND pool=? AND pack=?")
+            .Text(1, provider)
+            .Text(2, pool)
+            .Text(3, pack)
+            .Run();
+        Query(store->db, "DELETE FROM remote_packs WHERE provider_id=? AND pool=? AND pack=?")
+            .Text(1, provider)
+            .Text(2, pool)
+            .Text(3, pack)
+            .Run();
+    }
+    tx.Commit();
+}
+std::vector<std::pair<std::string, int64_t>> Control::PruneMetadata(int64_t older_than, bool dry_run) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    // Completed operations that no pending compound intent still names.
+    const std::string operations = "SELECT id FROM operations o WHERE o.state='complete' AND o.created_at<?1 AND NOT "
+                                   "EXISTS(SELECT 1 FROM compound_intents c WHERE c.operation_id=o.id)";
+    // History of retired snapshots (time travel and branch heads only use retained ones), except
+    // snapshots whose export is still pending (their commit record names a parent from history).
+    const std::string history = "SELECT h.sequence FROM history h JOIN snapshots s ON s.database_id=h.database_id AND "
+                                "s.id=h.snapshot_id WHERE s.retired=1 AND h.effective_at<?1 AND NOT EXISTS(SELECT 1 "
+                                "FROM exports e JOIN export_roots r ON r.export_id=e.id WHERE "
+                                "e.database_id=s.database_id AND e.snapshot_id=s.id AND r.state='pending')";
+    auto count = [&](const std::string &sql) {
+        Query q(store->db, ("SELECT count(*) FROM (" + sql + ")").c_str());
+        q.Int(1, older_than);
+        q.Step();
+        return q.Int(0);
+    };
+    std::vector<std::pair<std::string, int64_t>> result = {{"operations", count(operations)},
+                                                           {"history", count(history)}};
+    if (!dry_run) {
+        for (auto table : {"collection_results", "compaction_details"})
+            Query(store->db, (std::string("DELETE FROM ") + table + " WHERE operation_id IN (" + operations + ")").c_str())
+                .Int(1, older_than)
+                .Run();
+        Query(store->db, ("DELETE FROM operations WHERE id IN (" + operations + ")").c_str()).Int(1, older_than).Run();
+        Query(store->db, ("DELETE FROM history WHERE sequence IN (" + history + ")").c_str()).Int(1, older_than).Run();
+    }
+    tx.Commit();
+    return result;
 }
 void Control::ExportComplete(const std::string &id, const std::string &descriptor) {
     std::lock_guard<std::recursive_mutex> guard(store->mutex);

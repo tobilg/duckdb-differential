@@ -5,7 +5,7 @@
 require differential
 
 statement ok
-SET differential_repository = '__TEST_DIR__/spill_policy_unused'
+SET differential_repository = '{TEST_DIR}/spill_policy_unused'
 
 statement error
 SET temp_directory = 'diff://spill.tmp'
@@ -33,7 +33,7 @@ SELECT status FROM differential_status() WHERE capability = 'repository_open'
 false
 
 statement ok
-SET temp_directory = '__TEST_DIR__/local_spill'
+SET temp_directory = '{TEST_DIR}/local_spill'
 
 statement ok
 SET VARIABLE temp_directory = 'diff://this-is-just-a-variable'

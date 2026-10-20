@@ -13,7 +13,7 @@ require differential
 query I
 SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'differential'
 ----
-v0.1.0
+v1.0.0
 
 # Every function is discoverable through duckdb_functions(): a description, an example, categories
 # and real parameter names (never col0), one per parameter type
@@ -21,22 +21,61 @@ query I
 SELECT count(DISTINCT function_name) FROM duckdb_functions()
 WHERE function_name LIKE 'differential\_%' ESCAPE '\' AND function_name <> 'differential_probe_checkpoint'
 ----
-26
+30
 
 query I
 SELECT count(*) FROM duckdb_functions()
 WHERE function_name LIKE 'differential\_%' ESCAPE '\' AND function_name <> 'differential_probe_checkpoint'
   AND (description IS NULL OR len(examples) = 0 OR len(categories) = 0
-       OR len(list_filter(parameters, p -> p LIKE 'col%')) > 0 OR len(parameters) <> len(parameter_types))
+       OR len(list_filter(parameters, lambda p: p LIKE 'col%')) > 0 OR len(parameters) <> len(parameter_types))
 ----
 0
 
-# Named parameters are listed in hash order: compare name/type pairs, sorted
+# Parameters are listed in declaration order: positional, then named
 query I
-SELECT list_sort(list_transform(range(len(parameters)), i -> parameters[i + 1] || ' ' || parameter_types[i + 1]))
+SELECT list_transform(range(len(parameters)), lambda i: parameters[i + 1] || ' ' || parameter_types[i + 1])
 FROM duckdb_functions() WHERE function_name = 'differential_restore'
 ----
-[branch VARCHAR, database VARCHAR, export_mode VARCHAR, request_id VARCHAR, snapshot_id BIGINT]
+[database VARCHAR, snapshot_id BIGINT, request_id VARCHAR, branch VARCHAR, export_mode VARCHAR]
+
+# Export settings: process-wide, validated
+statement error
+SET differential_export_verification = 'never'
+----
+must be one of
+
+statement error
+SET differential_export_staging = 'tape'
+----
+must be one of
+
+statement ok
+SET differential_export_staging = 'memory'
+
+query I
+SELECT status FROM differential_status() WHERE capability = 'export_uploads'
+----
+verified by the service's SHA-256 checksum (checksum); staged in memory
+
+statement ok
+SET differential_export_staging = 'disk'
+
+# Group commit: on by default, process-wide
+query I
+SELECT status LIKE 'on:%' FROM differential_status() WHERE capability = 'group_commit'
+----
+true
+
+statement ok
+SET differential_group_commit = false
+
+query I
+SELECT status LIKE 'off:%' FROM differential_status() WHERE capability = 'group_commit'
+----
+true
+
+statement ok
+SET differential_group_commit = true
 
 # Release builds never contain fault-injection hooks
 query I
@@ -90,7 +129,7 @@ RESET differential_remote_cache_size
 
 # Selecting a repository creates nothing until it is first used
 statement ok
-SET differential_repository = '__TEST_DIR__/differential_settings'
+SET differential_repository = '{TEST_DIR}/differential_settings'
 
 query I
 SELECT status FROM differential_status() WHERE capability = 'repository_open'
@@ -103,6 +142,62 @@ SELECT count(*) FROM differential_databases()
 0
 
 statement error
-SET differential_repository = '__TEST_DIR__/differential_other'
+SET differential_repository = '{TEST_DIR}/differential_other'
 ----
 Select repository before its first use
+
+# Every timing metric reports its distribution; each S3 operation type and both halves of a
+# durable publication are timed on their own
+query I
+SELECT count(*) FROM differential_storage_stats() WHERE metric IN ('s3_request_get_p99_nanoseconds',
+ 's3_request_range_get_p50_nanoseconds', 's3_request_put_stddev_nanoseconds', 's3_request_conditional_put_calls',
+ 's3_request_multipart_part_p95_nanoseconds', 's3_request_multipart_control_calls', 's3_request_head_calls',
+ 's3_request_list_calls', 's3_request_delete_calls', 'local_segment_sync_p99_nanoseconds',
+ 'local_metadata_commit_p50_nanoseconds', 'local_sync_p99_nanoseconds')
+----
+12
+
+# WAL shipping and followers: options are validated before anything is stored (S3 behaviour is
+# covered by test/integration/s3_shipping.py)
+statement error
+ATTACH 'differential:plain_ship' AS p (SHIP_WAL 'async')
+----
+SHIP_WAL needs an S3 DATA_PATH
+
+statement error
+ATTACH 'differential:plain_ship' AS p (SHIP_WAL 'often')
+----
+SHIP_WAL must be 'off', 'async' or 'sync'
+
+statement error
+ATTACH 'differential:plain_ship' AS p (SHIP_INTERVAL 5)
+----
+SHIP_INTERVAL needs SHIP_WAL
+
+statement error
+ATTACH 'differential:plain_ship' AS p (FOLLOW true)
+----
+FOLLOW applies to S3 branch paths
+
+statement error
+ATTACH 'differential:plain_ship' AS p (FOLLOW_INTERVAL 5)
+----
+FOLLOW_INTERVAL applies to FOLLOW true
+
+statement ok
+ATTACH 'differential:plain_ship' AS p (SHIP_WAL 'off')
+
+query II
+SELECT ship_wal, ship_pending FROM differential_branches('plain_ship')
+----
+off	NULL
+
+query I
+SELECT count(*) FROM differential_followers()
+----
+0
+
+query I
+SELECT count(*) FROM differential_status() WHERE capability IN ('wal_shipping', 'followers')
+----
+2

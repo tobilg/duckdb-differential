@@ -1,7 +1,9 @@
-// Immutable S3 export: content-addressed packs of 64 KiB chunks, paged chunk
+// Immutable S3 export: content-addressed packs of 256 KiB chunks, paged chunk
 // indexes and a self-contained descriptor; parallel, coalesced and verified range reads.
 #include "differential_metrics.hpp"
 #include "differential_export.hpp"
+#include "differential_error.hpp"
+#include "s3_internal.hpp"
 #include "differential_hooks.hpp"
 #include "differential_permissions.hpp"
 #include "differential_disk_cache.hpp"
@@ -33,16 +35,16 @@
 namespace differential {
 namespace {
 constexpr uint64_t INDEX_CHUNKS = 4096;
-// Index page ("DIX1"): u32 pack count, 32-byte pack identities, then 4096 entries
+// Index page ("DIX2"): u32 pack count, 32-byte pack identities, then 4096 entries
 // of chunk identity (32), pack number (u16 LE, 0xFFFF = hole) and pack slot (u16 LE).
-// Index page: "DIX1", u32 pack count, then per pack the 16-byte UUID of the database whose pool
+// Index page: "DIX2", u32 pack count, then per pack the 16-byte UUID of the database whose pool
 // holds it and the pack's SHA-256, then 4096 chunk entries.
 constexpr uint64_t INDEX_ENTRY = 36, INDEX_HEADER = 8, PACK_ENTRY = 48;
 constexpr uint16_t INDEX_HOLE = 0xFFFF;
 uint64_t IndexSize(uint64_t packs) { return INDEX_HEADER + PACK_ENTRY * packs + INDEX_CHUNKS * INDEX_ENTRY; }
-constexpr uint64_t MAX_PACK_CHUNKS = 128; // 8 MiB packs
-constexpr uint64_t REQUEST_CHUNKS = 16;   // 1 MiB: the smallest range worth a request of its own
-constexpr uint64_t MAX_WINDOW_CHUNKS = 64; // 4 MiB read-ahead per sequential stream
+constexpr uint64_t MAX_PACK_CHUNKS = (8ull << 20) / Store::CHUNK;   // 8 MiB packs
+constexpr uint64_t REQUEST_CHUNKS = (1ull << 20) / Store::CHUNK;    // 1 MiB: the smallest range worth a request of its own
+constexpr uint64_t MAX_WINDOW_CHUNKS = (4ull << 20) / Store::CHUNK; // 4 MiB read-ahead per sequential stream
 constexpr size_t MAX_STREAMS = 16;
 // Upload staging per repository (all processes): room for one full pack per parallel request,
 // 64 MiB to 512 MiB (differential_s3_max_requests 1-8 to 64).
@@ -200,20 +202,26 @@ struct Stage {
                 throw std::runtime_error("Cannot protect upload staging descriptor");
             if (flock(fd, LOCK_EX | LOCK_NB))
                 throw std::runtime_error("Cannot own upload staging file");
+            // Reserve the file's final size (sparse) while the namespace is locked: others count it,
+            // and the data is written after the lock is released.
+            if (ftruncate(fd, off_t(bytes.size())))
+                throw std::runtime_error("Cannot reserve upload staging capacity");
+            close(namespace_fd);
+            namespace_fd = -1;
             size_t done = 0;
             while (done < bytes.size()) {
-                auto n = write(fd, bytes.data() + done, bytes.size() - done);
+                auto n = pwrite(fd, bytes.data() + done, bytes.size() - done, off_t(done));
                 if (n <= 0)
                     throw std::runtime_error("Cannot write upload staging file");
                 done += size_t(n);
             }
-            close(namespace_fd);
         } catch (...) {
             if (fd >= 0)
                 close(fd);
             if (!path.empty())
                 unlink(path.c_str());
-            close(namespace_fd);
+            if (namespace_fd >= 0)
+                close(namespace_fd);
             throw;
         }
     }
@@ -231,9 +239,60 @@ struct Stage {
             close(namespace_fd);
     }
 };
+// Export settings (differential_export_verification, differential_export_staging): process-wide, the
+// last value set applies, read by every export (also background publication).
+std::atomic<bool> read_back{false}, from_memory{false};
+// In-memory uploads of this process share the byte budget disk staging has per repository; an
+// upload waits for room (one upload larger than the budget proceeds alone).
+class UploadBudget {
+  public:
+    explicit UploadBudget(uint64_t bytes) : bytes(bytes) {
+        std::unique_lock<std::mutex> lock(Mutex());
+        Signal().wait(lock, [&] { return Used() == 0 || Used() + bytes <= StagingLimit(); });
+        Used() += bytes;
+    }
+    ~UploadBudget() {
+        {
+            std::lock_guard<std::mutex> lock(Mutex());
+            Used() -= bytes;
+        }
+        Signal().notify_all();
+    }
+    UploadBudget(const UploadBudget &) = delete;
+
+  private:
+    uint64_t bytes;
+    static std::mutex &Mutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+    static std::condition_variable &Signal() {
+        static std::condition_variable signal;
+        return signal;
+    }
+    static uint64_t &Used() {
+        static uint64_t used = 0;
+        return used;
+    }
+};
+// Upload an immutable object (create-only), from memory or staged on disk.
+void PutImmutable(Control &control, S3Provider &provider, const std::string &key,
+                  const std::vector<unsigned char> &bytes, const std::string &hash) {
+    if (from_memory) {
+        UploadBudget budget(bytes.size());
+        Timer put(Metric::ExportPut);
+        provider.PutBytes(key, bytes, hash);
+        return;
+    }
+    std::optional<Timer> staging(std::in_place, Metric::ExportStage);
+    Stage stage(control.store->directory, control.RepositoryID(), bytes);
+    staging.reset();
+    Timer put(Metric::ExportPut);
+    provider.PutFile(key, stage.path, hash);
+}
 std::vector<unsigned char> Encode(const Descriptor &d) {
     std::ostringstream out;
-    out << "differential-export-v1\n"
+    out << "differential-export-v2\n"
         << d.engine << '\n'
         << d.database << '\n'
         << d.branch << '\n'
@@ -297,10 +356,10 @@ Descriptor Decode(const std::vector<unsigned char> &bytes) {
         return std::stoull(s);
     };
     Descriptor d;
-    if (line() != "differential-export-v1")
+    if (line() != "differential-export-v2")
         throw std::runtime_error("[differential:incompatible_format] Unsupported export descriptor format");
-    // Any well-formed engine line is accepted (descriptors written by DuckDB 1.5.6 say
-    // "duckdb-v1.5.6"). Whether the native file is readable is DuckDB's decision at open.
+    // Any well-formed engine line is accepted (e.g. "duckdb-v1.5.6" or "duckdb-v2.0.0").
+    // Whether the native file is readable is DuckDB's decision at open.
     d.engine = line();
     if (d.engine.rfind("duckdb-", 0) != 0 || d.engine.size() > 64 || d.engine.size() < 8 ||
         d.engine.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_+") !=
@@ -318,12 +377,13 @@ Descriptor Decode(const std::vector<unsigned char> &bytes) {
     d.root = line();
     d.size = number();
     d.pool = line();
-    if (d.snapshot <= 0 || !IsHash(d.root) || d.size > (uint64_t(1) << 40) || d.pool != Pool(d.database))
+    // Snapshot 0: the base of a shipping chain (an internal export, not a public snapshot).
+    if (d.snapshot < 0 || !IsHash(d.root) || d.size > (uint64_t(1) << 40) || d.pool != Pool(d.database))
         throw std::runtime_error("[differential:corrupt_data] Corrupt export bounds/namespace");
     auto count = number();
     auto expected = (Store::ChunkCount(d.size) + INDEX_CHUNKS - 1) / INDEX_CHUNKS;
-    // The 1 TiB size bound above permits 4097 pages: the shorter first chunk
-    // pushes the final 52 KiB into one additional index page.
+    // The 1 TiB size bound above permits 1025 pages: the shorter first chunk
+    // pushes the final 244 KiB into one additional index page.
     if (count != expected)
         throw std::runtime_error("[differential:corrupt_data] Corrupt export index count");
     for (uint64_t i = 0; i < count; i++) {
@@ -418,6 +478,194 @@ void Parallel(size_t count, unsigned width, const std::function<void(size_t)> &t
 // ---------------------------------------------------------------------------------------
 // Export
 namespace {
+using UploadFunction = std::function<void(const std::string &, const std::vector<unsigned char> &, const std::string &)>;
+// Verified immutable objects in the owned namespace are trusted by their local record; new objects
+// are uploaded conditionally (and, with read_back, read back) before being recorded.
+UploadFunction MakeUpload(Control &control, const std::string &provider_id, S3Provider &provider,
+                          const std::function<void()> &check_cancel) {
+    return [&control, provider_id, &provider, check_cancel](const std::string &key,
+                                                            const std::vector<unsigned char> &bytes,
+                                                            const std::string &hash) {
+        auto &config = provider.Config();
+        check_cancel();
+        if (control.RemoteVerified(provider_id, key, hash, bytes.size()))
+            return;
+        // The service verifies the upload against its SHA-256 (x-amz-checksum-sha256).
+        PutImmutable(control, provider, key, bytes, hash);
+        if (!read_back) {
+            control.RecordRemoteVerified(provider_id, key, hash, bytes.size());
+            return;
+        }
+        // differential_export_verification = 'read_back': for services that ignore upload checksums.
+        Timer verify(Metric::ExportVerify);
+        auto stored = provider.Head(key);
+        if (stored.size != bytes.size() || stored.sha256 != hash)
+            throw std::runtime_error("[differential:corrupt_data] Uploaded dependency identity/length mismatch");
+        check_cancel();
+        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (!digest || EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1)
+            throw std::runtime_error("SHA256 init failed");
+        for (uint64_t offset = 0; offset < bytes.size(); offset += config.max_range_bytes) {
+            auto length = std::min<uint64_t>(config.max_range_bytes, bytes.size() - offset);
+            auto part = provider.ReadSpan(key, offset, length);
+            if (EVP_DigestUpdate(digest.get(), part.data(), part.size()) != 1)
+                throw std::runtime_error("SHA256 update failed");
+        }
+        unsigned char verified[32];
+        unsigned n = 0;
+        if (EVP_DigestFinal_ex(digest.get(), verified, &n) != 1 || n != 32 || Hex(verified, 32) != hash)
+            throw std::runtime_error("[differential:corrupt_data] Uploaded dependency failed read-back verification");
+        control.RecordRemoteVerified(provider_id, key, hash, bytes.size());
+    };
+}
+// Uploads the packs and index pages of the root `d` describes (d.root, d.size, d.pool), filling its
+// page list and first index page and `references` (what the uploaded objects reference).
+void UploadGraph(Control &control, const std::string &provider_id, S3Provider &provider, Descriptor &d,
+                 Control::RemoteReferences &references, const std::function<void()> &check_cancel,
+                 const UploadFunction &upload) {
+    auto &config = provider.Config();
+    auto total_chunks = Store::ChunkCount(d.size);
+    auto pages = (total_chunks + INDEX_CHUNKS - 1) / INDEX_CHUNKS;
+    // Remote collection: never reference an object it condemned (learned now and again before the
+    // descriptor is published), so its grace period only has to cover this export's last step.
+    SyncCondemned(control, provider_id);
+    // Passes 1 and 2: upload the chunks no reusable pack holds, then the index pages. Returns the pack
+    // keys the pages reference.
+    auto build = [&]() {
+        d.pages.clear();
+        d.page_sizes.clear();
+        d.first_index.clear();
+        references = {};
+        std::set<std::string> referenced; // pack keys of the index pages
+        // Pass 1: chunks this provider has never stored, in first-appearance (file) order so a
+        // pack holds neighbouring file ranges and later reads coalesce.
+        std::vector<std::string> missing;
+        std::set<std::string> seen;
+        for (uint64_t page = 0; page < pages; page++) {
+            check_cancel();
+            auto refs = control.store->RootChunks(d.root, page * INDEX_CHUNKS, INDEX_CHUNKS);
+            std::vector<std::string> hashes;
+            for (auto &ref : refs)
+                if (seen.insert(ref.object).second)
+                    hashes.push_back(ref.object);
+            auto known = control.FindRemoteChunks(provider_id, hashes, true);
+            for (auto &hash : hashes) {
+                if (known.count(hash))
+                    ++chunks_reused;
+                else
+                    missing.push_back(hash);
+            }
+        }
+        // Packs stay below the multipart threshold so product objects never use multipart.
+        auto per_pack = std::max<uint64_t>(
+            1, std::min<uint64_t>(MAX_PACK_CHUNKS, (config.multipart_threshold - 1) / Store::CHUNK));
+        std::vector<std::vector<std::string>> groups;
+        for (size_t i = 0; i < missing.size(); i += per_pack)
+            groups.emplace_back(missing.begin() + int64_t(i),
+                                missing.begin() + int64_t(std::min<size_t>(missing.size(), i + per_pack)));
+        Parallel(groups.size(), provider.Concurrency(), [&](size_t i) {
+            auto chunks = groups[i];
+            std::vector<unsigned char> pack;
+            std::string hash;
+            for (size_t attempt = 0;; attempt++) {
+                {
+                    Timer build(Metric::ExportPackBuild);
+                    pack.clear();
+                    pack.reserve(chunks.size() * Store::CHUNK);
+                    for (auto &chunk : chunks) {
+                        auto bytes = control.store->Object(chunk);
+                        pack.insert(pack.end(), bytes->begin(), bytes->end());
+                    }
+                }
+                hash = Hash(pack);
+                if (!control.Condemned(provider_id, d.pool + "packs/" + hash))
+                    break;
+                // A pack with exactly these contents is condemned (and may be deleted at any time): lay
+                // the chunks out differently, so this export uploads a pack of its own.
+                if (chunks.size() > 1 && attempt + 1 < chunks.size())
+                    std::rotate(chunks.begin(), chunks.begin() + 1, chunks.end());
+                else if (chunks.size() < per_pack) // never past the multipart threshold
+                    chunks.push_back(chunks.front());
+                else
+                    throw std::runtime_error("[differential:busy] Every layout of an export pack is condemned; retry "
+                                             "the export");
+            }
+            upload(d.pool + "packs/" + hash, pack, hash);
+            control.RecordPack(provider_id, d.database, hash, pack.size(), chunks);
+            ++packs_uploaded;
+            chunks_uploaded += chunks.size();
+        });
+        // Pass 2: chunk indexes resolve every logical chunk to (identity, pack, slot).
+        for (uint64_t page = 0; page < pages; page++) {
+            check_cancel();
+            auto refs = control.store->RootChunks(d.root, page * INDEX_CHUNKS, INDEX_CHUNKS);
+            std::vector<std::string> hashes;
+            for (auto &ref : refs)
+                hashes.push_back(ref.object);
+            auto located = control.FindRemoteChunks(provider_id, hashes, true);
+            // Packs by (pool, pack): a chunk may live in another database's pool (e.g. a clone's source).
+            std::map<std::pair<std::string, std::string>, uint16_t> pack_numbers;
+            std::vector<std::pair<std::string, std::string>> packs;
+            for (auto &ref : refs) {
+                auto found = located.find(ref.object);
+                if (found == located.end())
+                    throw std::runtime_error("[differential:corrupt_data] Exported chunk has no recorded pack");
+                auto pack = std::make_pair(found->second.pool, found->second.pack);
+                if (pack_numbers.emplace(pack, uint16_t(packs.size())).second) {
+                    packs.push_back(pack);
+                    referenced.insert(Pool(pack.first) + "packs/" + pack.second);
+                }
+            }
+            std::vector<unsigned char> index(IndexSize(packs.size()), 0);
+            std::memcpy(index.data(), "DIX2", 4);
+            for (int b = 0; b < 4; b++)
+                index[4 + b] = static_cast<unsigned char>(packs.size() >> (8 * b));
+            for (size_t i = 0; i < packs.size(); i++) {
+                UnhexUUID(packs[i].first, index.data() + INDEX_HEADER + PACK_ENTRY * i);
+                Unhex(packs[i].second, index.data() + INDEX_HEADER + PACK_ENTRY * i + 16);
+            }
+            auto entries = index.data() + INDEX_HEADER + PACK_ENTRY * packs.size();
+            for (uint64_t slot = 0; slot < INDEX_CHUNKS; slot++) {
+                entries[slot * INDEX_ENTRY + 32] = INDEX_HOLE & 0xFF;
+                entries[slot * INDEX_ENTRY + 33] = INDEX_HOLE >> 8;
+            }
+            for (auto &ref : refs) {
+                auto &location = located.at(ref.object);
+                auto entry = entries + (ref.chunk % INDEX_CHUNKS) * INDEX_ENTRY;
+                auto number = pack_numbers.at(std::make_pair(location.pool, location.pack));
+                Unhex(ref.object, entry);
+                entry[32] = static_cast<unsigned char>(number & 0xFF);
+                entry[33] = static_cast<unsigned char>(number >> 8);
+                entry[34] = static_cast<unsigned char>(location.slot & 0xFF);
+                entry[35] = static_cast<unsigned char>(location.slot >> 8);
+            }
+            auto hash = Hash(index);
+            upload(d.pool + "indexes/" + hash, index, hash);
+            auto &page_packs = references.index_packs[d.pool + "indexes/" + hash];
+            for (auto &pack : packs)
+                page_packs.push_back(Pool(pack.first) + "packs/" + pack.second);
+            d.pages.push_back(hash);
+            d.page_sizes.push_back(index.size());
+            if (page == 0)
+                d.first_index = index;
+        }
+        return referenced;
+    };
+    for (int round = 1;; round++) {
+        auto referenced = build();
+        // A collection that condemned a pack these pages reference since the export started: build
+        // them again without it.
+        auto condemned = SyncCondemned(control, provider_id);
+        if (std::none_of(condemned.begin(), condemned.end(),
+                         [&](const std::string &key) { return referenced.count(key) > 0; }))
+            break;
+        if (round == 3)
+            throw std::runtime_error("[differential:busy] Remote collection kept condemning packs this export "
+                                     "references; the export stays pending. Retry it with differential_retry_export.");
+    }
+}
+} // namespace
+namespace {
 // The newest snapshot number published for a database: the first key of its newest-first commit
 // index (one LIST max-keys=1); 0 when none.
 int64_t NewestSnapshot(S3Provider &provider, const std::string &database) {
@@ -454,7 +702,7 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
     if (e.state == "complete")
         return e.descriptor;
     if (e.state == "abandoned")
-        throw std::runtime_error("[differential:head_conflict] The export of snapshot " + std::to_string(snapshot) +
+        throw Error(ErrorCode::HeadConflict, "[differential:head_conflict] The export of snapshot " + std::to_string(snapshot) +
                                  " was abandoned: another writer published that snapshot number");
     auto check_cancel = [&] {
         if (cancelled && cancelled())
@@ -474,8 +722,6 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
     // EXPORT_PENDING already retains the complete graph in the publication transaction.
     auto s = control.GetSnapshot(database, snapshot, false);
     auto provider = Client(control, e.provider);
-    auto &config = provider->Config();
-    auto repository = control.RepositoryID();
     Descriptor d;
     auto engine = Hook("DIFFERENTIAL_TEST_ENGINE_LINE"); // test builds: simulate another writer version
     d.engine = engine ? std::string(engine) : std::string("duckdb-") + duckdb::DuckDB::LibraryVersion();
@@ -487,133 +733,9 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
     d.size = uint64_t(s.size);
     d.pool = Pool(s.database);
     control.store->RootSize(s.root);
-    // Verified immutable objects in the owned namespace are trusted by their local record;
-    // new objects are uploaded conditionally and read back before being recorded.
-    auto upload = [&](const std::string &key, const std::vector<unsigned char> &bytes, const std::string &hash) {
-        check_cancel();
-        if (control.RemoteVerified(e.provider, key, hash, bytes.size()))
-            return;
-        {
-            std::optional<Timer> staging(std::in_place, Metric::ExportStage);
-            Stage stage(control.store->directory, repository, bytes);
-            staging.reset();
-            Timer put(Metric::ExportPut);
-            provider->PutFile(key, stage.path, hash);
-        }
-        Timer verify(Metric::ExportVerify);
-        auto stored = provider->Head(key);
-        if (stored.size != bytes.size() || stored.sha256 != hash)
-            throw std::runtime_error("[differential:corrupt_data] Uploaded dependency identity/length mismatch");
-        check_cancel();
-        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-        if (!digest || EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1)
-            throw std::runtime_error("SHA256 init failed");
-        for (uint64_t offset = 0; offset < bytes.size(); offset += config.max_range_bytes) {
-            auto length = std::min<uint64_t>(config.max_range_bytes, bytes.size() - offset);
-            auto part = provider->ReadSpan(key, offset, length);
-            if (EVP_DigestUpdate(digest.get(), part.data(), part.size()) != 1)
-                throw std::runtime_error("SHA256 update failed");
-        }
-        unsigned char verified[32];
-        unsigned n = 0;
-        if (EVP_DigestFinal_ex(digest.get(), verified, &n) != 1 || n != 32 || Hex(verified, 32) != hash)
-            throw std::runtime_error("[differential:corrupt_data] Uploaded dependency failed read-back verification");
-        control.RecordRemoteVerified(e.provider, key, hash, bytes.size());
-    };
-    auto total_chunks = Store::ChunkCount(d.size);
-    auto pages = (total_chunks + INDEX_CHUNKS - 1) / INDEX_CHUNKS;
-    // Pass 1: chunks this provider has never stored, in first-appearance (file) order so a
-    // pack holds neighbouring file ranges and later reads coalesce.
-    std::vector<std::string> missing;
-    std::set<std::string> seen;
-    for (uint64_t page = 0; page < pages; page++) {
-        check_cancel();
-        auto refs = control.store->RootChunks(s.root, page * INDEX_CHUNKS, INDEX_CHUNKS);
-        std::vector<std::string> hashes;
-        for (auto &ref : refs)
-            if (seen.insert(ref.object).second)
-                hashes.push_back(ref.object);
-        auto known = control.FindRemoteChunks(e.provider, hashes);
-        for (auto &hash : hashes) {
-            if (known.count(hash))
-                ++chunks_reused;
-            else
-                missing.push_back(hash);
-        }
-    }
-    // Packs stay below the multipart threshold so product objects never use multipart.
-    auto per_pack = std::max<uint64_t>(
-        1, std::min<uint64_t>(MAX_PACK_CHUNKS, (config.multipart_threshold - 1) / Store::CHUNK));
-    std::vector<std::vector<std::string>> groups;
-    for (size_t i = 0; i < missing.size(); i += per_pack)
-        groups.emplace_back(missing.begin() + int64_t(i),
-                            missing.begin() + int64_t(std::min<size_t>(missing.size(), i + per_pack)));
-    Parallel(groups.size(), provider->Concurrency(), [&](size_t i) {
-        auto &chunks = groups[i];
-        std::vector<unsigned char> pack;
-        pack.reserve(chunks.size() * Store::CHUNK);
-        {
-            Timer build(Metric::ExportPackBuild);
-            for (auto &hash : chunks) {
-                auto bytes = control.store->Object(hash);
-                pack.insert(pack.end(), bytes->begin(), bytes->end());
-            }
-        }
-        auto hash = Hash(pack);
-        upload(d.pool + "packs/" + hash, pack, hash);
-        control.RecordPack(e.provider, s.database, hash, pack.size(), chunks);
-        ++packs_uploaded;
-        chunks_uploaded += chunks.size();
-    });
-    // Pass 2: chunk indexes resolve every logical chunk to (identity, pack, slot).
-    for (uint64_t page = 0; page < pages; page++) {
-        check_cancel();
-        auto refs = control.store->RootChunks(s.root, page * INDEX_CHUNKS, INDEX_CHUNKS);
-        std::vector<std::string> hashes;
-        for (auto &ref : refs)
-            hashes.push_back(ref.object);
-        auto located = control.FindRemoteChunks(e.provider, hashes);
-        // Packs by (pool, pack): a chunk may live in another database's pool (e.g. a clone's source).
-        std::map<std::pair<std::string, std::string>, uint16_t> pack_numbers;
-        std::vector<std::pair<std::string, std::string>> packs;
-        for (auto &ref : refs) {
-            auto found = located.find(ref.object);
-            if (found == located.end())
-                throw std::runtime_error("[differential:corrupt_data] Exported chunk has no recorded pack");
-            auto pack = std::make_pair(found->second.pool, found->second.pack);
-            if (pack_numbers.emplace(pack, uint16_t(packs.size())).second)
-                packs.push_back(pack);
-        }
-        std::vector<unsigned char> index(IndexSize(packs.size()), 0);
-        std::memcpy(index.data(), "DIX1", 4);
-        for (int b = 0; b < 4; b++)
-            index[4 + b] = static_cast<unsigned char>(packs.size() >> (8 * b));
-        for (size_t i = 0; i < packs.size(); i++) {
-            UnhexUUID(packs[i].first, index.data() + INDEX_HEADER + PACK_ENTRY * i);
-            Unhex(packs[i].second, index.data() + INDEX_HEADER + PACK_ENTRY * i + 16);
-        }
-        auto entries = index.data() + INDEX_HEADER + PACK_ENTRY * packs.size();
-        for (uint64_t slot = 0; slot < INDEX_CHUNKS; slot++) {
-            entries[slot * INDEX_ENTRY + 32] = INDEX_HOLE & 0xFF;
-            entries[slot * INDEX_ENTRY + 33] = INDEX_HOLE >> 8;
-        }
-        for (auto &ref : refs) {
-            auto &location = located.at(ref.object);
-            auto entry = entries + (ref.chunk % INDEX_CHUNKS) * INDEX_ENTRY;
-            auto number = pack_numbers.at(std::make_pair(location.pool, location.pack));
-            Unhex(ref.object, entry);
-            entry[32] = static_cast<unsigned char>(number & 0xFF);
-            entry[33] = static_cast<unsigned char>(number >> 8);
-            entry[34] = static_cast<unsigned char>(location.slot & 0xFF);
-            entry[35] = static_cast<unsigned char>(location.slot >> 8);
-        }
-        auto hash = Hash(index);
-        upload(d.pool + "indexes/" + hash, index, hash);
-        d.pages.push_back(hash);
-        d.page_sizes.push_back(index.size());
-        if (page == 0)
-            d.first_index = index;
-    }
+    auto upload = MakeUpload(control, e.provider, *provider, check_cancel);
+    Control::RemoteReferences references; // what the objects of this export reference (remote collection)
+    UploadGraph(control, e.provider, *provider, d, references, check_cancel, upload);
     Crash("dependencies_uploaded");
     // The descriptor names the snapshot number, the commit record its descriptor. History: an
     // immutable commit record per exported snapshot (newest first in a listing), create-only and
@@ -645,9 +767,13 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
         try {
             upload(commit_key, commit, Hash(commit));
             Failpoint("DIFFERENTIAL_SHARED_CRASH", "commit_recorded");
+            auto &pages = references.descriptor_pages[key];
+            for (size_t page = 0; page < d.pages.size(); page++)
+                pages.emplace_back(d.pool + "indexes/" + d.pages[page], d.page_sizes[page]);
+            references.commit_descriptors[commit_key] = key;
             break;
         } catch (const std::exception &error) {
-            if (std::string(error.what()).find("Immutable object identity conflict") == std::string::npos)
+            if (!Is(error, ErrorCode::ObjectConflict))
                 throw;
             // Shared: another writer took the number between the listing and this write.
             if (shared && attempt < 8)
@@ -658,7 +784,7 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
                                          "numbers. The export stays pending; retry it with differential_retry_export.");
             // Another writer with this database's identity (e.g. a copy of this repository)
             // already published this snapshot number: a split brain, not a transport error.
-            throw std::runtime_error("[differential:head_conflict] Snapshot " + std::to_string(s.id) +
+            throw Error(ErrorCode::HeadConflict, "[differential:head_conflict] Snapshot " + std::to_string(s.id) +
                                      " of database " + s.database_name + " was already published by another writer, "
                                      "for example a copy of this repository on another host; this export stays "
                                      "pending. If this repository is the only writer of the database, run "
@@ -668,6 +794,7 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
     }
     auto name = EncodeName(s.database, s.database_name);
     upload("names/" + s.database_name + "/" + s.database, name, Hash(name));
+    control.StoreRemoteReferences(e.provider, references);
     control.ExportComplete(e.id, key);
     Crash("completion_committed");
     return key;
@@ -694,6 +821,50 @@ std::string ExportSnapshot(Control &control, const std::string &database, int64_
     return ExportOne(control, database, snapshot, cancelled, true);
 }
 
+std::string ExportBase(Control &control, const std::string &provider_id, const Branch &branch, const Root &root,
+                       const std::function<void()> &check_cancel) {
+    Timer timer(Metric::Export);
+    auto provider = Client(control, provider_id);
+    Descriptor d;
+    auto engine = Hook("DIFFERENTIAL_TEST_ENGINE_LINE");
+    d.engine = engine ? std::string(engine) : std::string("duckdb-") + duckdb::DuckDB::LibraryVersion();
+    d.database = branch.database;
+    d.branch = branch.id;
+    d.snapshot = 0;
+    d.published_at = control.Clock();
+    d.root = root.id;
+    d.size = root.size;
+    d.pool = Pool(branch.database);
+    auto upload = MakeUpload(control, provider_id, *provider, check_cancel);
+    Control::RemoteReferences references;
+    for (int round = 1;; round++) {
+        UploadGraph(control, provider_id, *provider, d, references, check_cancel, upload);
+        auto bytes = Encode(d);
+        auto hash = Hash(bytes);
+        auto key = "descriptors/" + hash;
+        // A pack condemned while uploading: build the graph again without it (as exports do).
+        auto condemned = SyncCondemned(control, provider_id);
+        bool clean = true;
+        for (auto &pages : references.index_packs)
+            for (auto &pack : pages.second)
+                clean = clean && !condemned.count(pack);
+        if (!clean) {
+            if (round == 3)
+                throw std::runtime_error("[differential:busy] Remote collection kept condemning packs of a shipping "
+                                         "base; shipping retries later");
+            continue;
+        }
+        upload(key, bytes, hash);
+        auto &pages = references.descriptor_pages[key];
+        for (size_t page = 0; page < d.pages.size(); page++)
+            pages.emplace_back(d.pool + "indexes/" + d.pages[page], d.page_sizes[page]);
+        control.StoreRemoteReferences(provider_id, references);
+        auto name = EncodeName(branch.database, branch.database_name);
+        upload("names/" + branch.database_name + "/" + branch.database, name, Hash(name));
+        return key;
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Remote reads
 namespace {
@@ -701,7 +872,7 @@ void CheckIndex(const Bytes &index) {
     uint64_t packs = 0;
     for (int b = 0; b < 4 && size_t(4 + b) < index.size(); b++)
         packs |= uint64_t(index[4 + b]) << (8 * b);
-    if (index.size() < IndexSize(0) || std::memcmp(index.data(), "DIX1", 4) != 0 || index.size() != IndexSize(packs))
+    if (index.size() < IndexSize(0) || std::memcmp(index.data(), "DIX2", 4) != 0 || index.size() != IndexSize(packs))
         throw std::runtime_error("[differential:corrupt_data] Corrupt remote index page");
 }
 // Recently read descriptors, process-wide and verified (immutable, named by their hash).
@@ -767,12 +938,14 @@ RemoteSnapshot::RemoteSnapshot(Control &control, const std::string &provider_id,
     if (!descriptor.pages.empty()) {
         auto index = std::make_shared<const Bytes>(descriptor.first_index);
         CheckIndex(*index);
-        last_index = index;
-        last_index_page = 0;
+        indexes.emplace_front(0, index);
         if (caching.memory && caching.fill)
             caching.memory->Insert(object_prefix + descriptor.pool + "indexes/" + descriptor.pages[0], 0,
                                    index->data(), index->size());
     }
+    // A small export's other index pages are loaded at once, in parallel: scans need them all.
+    if (descriptor.pages.size() > 1 && descriptor.pages.size() <= INDEX_CACHE_PAGES)
+        Parallel(descriptor.pages.size() - 1, provider->Concurrency(), [&](size_t i) { Index(i + 1); });
 }
 // Verified bytes of an immutable object range from the memory cache.
 SharedBytes RemoteSnapshot::FromMemory(const std::string &object, uint64_t offset, uint64_t length) {
@@ -847,17 +1020,20 @@ SharedBytes RemoteSnapshot::Index(uint64_t page) {
     if (page >= descriptor.pages.size())
         throw std::runtime_error("[differential:corrupt_data] Remote index page out of range");
     {
-        // Consecutive reads mostly stay within one index page (256 MiB of the file).
         std::lock_guard<std::mutex> guard(index_mutex);
-        if (last_index && last_index_page == page)
-            return last_index;
+        for (auto it = indexes.begin(); it != indexes.end(); ++it)
+            if (it->first == page) {
+                indexes.splice(indexes.begin(), indexes, it);
+                return indexes.front().second;
+            }
     }
     auto index = FetchObject(descriptor.pool + "indexes/" + descriptor.pages[page], descriptor.page_sizes[page],
                              descriptor.pages[page]);
     CheckIndex(*index);
     std::lock_guard<std::mutex> guard(index_mutex);
-    last_index_page = page;
-    last_index = index;
+    indexes.emplace_front(page, index);
+    if (indexes.size() > INDEX_CACHE_PAGES)
+        indexes.pop_back();
     return index;
 }
 RemoteSnapshot::Location RemoteSnapshot::Locate(const Bytes &index, uint64_t slot) const {
@@ -1262,6 +1438,8 @@ std::vector<std::pair<std::string, uint64_t>> ExportMetrics() {
             {"sdk_executor_threads_global", 4}};
     for (auto &metric : DiskCache::Metrics())
         metrics.push_back(metric);
+    for (auto &metric : RemoteCollectionMetrics())
+        metrics.push_back(metric);
     return metrics;
 }
 
@@ -1487,7 +1665,7 @@ void PublishSharedHeads(Control &control, const std::string &provider_id, const 
         control.ClearConflict(d.branch);
     }
     if (!conflict.empty())
-        throw std::runtime_error(conflict);
+        throw Error(ErrorCode::BranchConflict, conflict);
 }
 } // namespace
 
@@ -1523,7 +1701,7 @@ void PublishHeads(Control &control, const std::string &database, bool claim, con
                     (record && ((!record->etag.empty() && current.etag == record->etag) ||
                                 (current.head && !record->write_id.empty() && current.head->write_id == record->write_id)));
         if (!ours && !claim)
-            throw std::runtime_error(
+            throw Error(ErrorCode::HeadConflict,
                 "[differential:head_conflict] The S3 branch head " + key +
                 " was written by another writer, for example a copy of this repository on another host; it was "
                 "not changed. Exports are unaffected. If this repository is the only writer of the database, run "
@@ -1545,14 +1723,65 @@ void PublishHeads(Control &control, const std::string &database, bool claim, con
             // first attempt: the head then carries this write's ID.
             auto now = ReadHeadVersion(*provider, key);
             if (!now.head || now.head->write_id != head.write_id)
-                throw std::runtime_error("[differential:head_conflict] The S3 branch head " + key +
+                throw Error(ErrorCode::HeadConflict, "[differential:head_conflict] The S3 branch head " + key +
                                          " changed while it was being updated, by another writer; it was not "
                                          "changed.");
             etag = now.etag;
         }
         control.RecordHeadWrite(provider_id, key, HeadWrite{*etag, head.write_id, "", d.snapshot});
     }
+    // A head that still names a dropped branch becomes a tombstone: readers get not_found, and remote
+    // collection stops keeping its data. A new branch of that name publishes over the tombstone.
+    std::set<std::string> dropped_ids;
+    std::map<std::string, Branch> dropped;
+    for (auto &b : control.Branches(database))
+        if (b.state != "active") {
+            dropped_ids.insert(b.id);
+            dropped[b.name] = b;
+        }
+    for (auto &entry : dropped) {
+        Head head;
+        head.database = entry.second.database;
+        head.database_name = entry.second.database_name;
+        head.branch_name = entry.first;
+        auto key = head.Key();
+        auto record = control.HeadWriteFor(provider_id, key);
+        if (!record)
+            continue; // never published by this repository
+        auto current = ReadHeadVersion(*provider, key);
+        if (!current.head || !dropped_ids.count(current.head->branch))
+            continue; // absent, already a tombstone, or the head of a live branch of that name
+        bool ours = (!record->etag.empty() && current.etag == record->etag) ||
+                    (!record->write_id.empty() && current.head->write_id == record->write_id) ||
+                    (!record->pending.empty() && current.head->write_id == record->pending);
+        if (!ours && !claim)
+            throw Error(ErrorCode::HeadConflict,
+                        "[differential:head_conflict] The S3 branch head " + key +
+                            " of a dropped branch was written by another writer; it was not changed. If this "
+                            "repository is the only writer of the database, run differential_claim_branch_heads('" +
+                            head.database_name + "').");
+        head.branch = current.head->branch;
+        head.write_id = WriteID();
+        auto pending = *record;
+        pending.pending = head.write_id;
+        control.RecordHeadWrite(provider_id, key, pending); // before the PUT: a lost response stays ours
+        auto etag = provider->PutMutable(key, EncodeDropped(head, Control::Now()), current.etag);
+        if (!etag) {
+            // An SDK retry after a lost response fails its condition against our own first attempt.
+            auto now = provider->ReadMutable(key);
+            std::string written(now ? std::string(now->first.begin(), now->first.end()) : "");
+            if (!now || !IsDropped(now->first) || written.find("\nwrite " + head.write_id + "\n") == std::string::npos)
+                throw Error(ErrorCode::HeadConflict, "[differential:head_conflict] The S3 branch head " + key +
+                                                         " changed while it was being dropped, by another writer; it "
+                                                         "was not changed.");
+            etag = now->second;
+        }
+        control.RecordHeadWrite(provider_id, key, HeadWrite{*etag, head.write_id, "", 0});
+    }
 }
+namespace {
+std::optional<RemoteCommit> DecodeCommit(const std::vector<unsigned char> &bytes);
+} // namespace
 std::vector<int64_t> ClaimDatabase(Control &control, const std::string &database) {
     std::string provider_id;
     control.ExportedHeads(database, provider_id);
@@ -1574,10 +1803,14 @@ std::vector<int64_t> ClaimDatabase(Control &control, const std::string &database
         if (!stat)
             continue;
         auto local = control.GetSnapshot(database, snapshot, false);
-        auto remote = provider->ReadSpan(key, 0, stat->size);
-        std::string text(remote.begin(), remote.end());
-        bool ours = text.find("\nbranch " + local.branch + "\n") != std::string::npos &&
-                    text.find("\npublished_at " + std::to_string(local.published_at) + "\n") != std::string::npos;
+        std::optional<RemoteCommit> remote;
+        try {
+            remote = DecodeCommit(provider->ReadSpan(key, 0, stat->size));
+        } catch (const std::exception &) {
+            // Unreadable: not a record this repository wrote.
+        }
+        bool ours = remote && remote->snapshot == snapshot && remote->branch == local.branch &&
+                    remote->published_at == local.published_at;
         if (!ours && control.AbandonExport(database, snapshot))
             abandoned.push_back(snapshot);
     }
@@ -1816,7 +2049,7 @@ Branch PrepareSharedBranch(Control &control, const std::string &provider_id, con
         try {
             lock = control.Acquire(*existing);
         } catch (const std::exception &error) {
-            if (writable || std::string(error.what()).find("[differential:writer_busy]") == std::string::npos)
+            if (writable || !Is(error, ErrorCode::WriterBusy))
                 throw;
             return std::nullopt;
         }
@@ -2015,8 +2248,7 @@ std::string PublishShared(Control &control, const std::string &database, const s
     try {
         PublishHeads(control, database, false, branch);
     } catch (const std::exception &error) {
-        if (writing.on_conflict != "branch" ||
-            std::string(error.what()).find("[differential:branch_conflict]") == std::string::npos)
+        if (writing.on_conflict != "branch" || !Is(error, ErrorCode::BranchConflict))
             throw;
         return ForkConflict(control, database, branch);
     }
@@ -2245,7 +2477,7 @@ std::vector<WriterMarker> AnnounceWriter(const std::shared_ptr<Control> &control
         others.push_back(*marker);
     }
     if (!others.empty() && on_busy == "error")
-        throw std::runtime_error("[differential:writer_busy] " + DescribeWriters(others) +
+        throw Error(ErrorCode::WriterBusy, "[differential:writer_busy] " + DescribeWriters(others) +
                                  " ATTACH with ON_BUSY 'warn' to write anyway: concurrent updates of the branch "
                                  "are detected when they are published.");
     WriterMarker mine;
@@ -2350,16 +2582,48 @@ std::optional<RemoteCommit> DecodeCommit(const std::vector<unsigned char> &bytes
     return c;
 }
 // Numbers of the keys under an inverted-number index (snapshots/ or expired/).
-std::vector<int64_t> ListNumbers(S3Provider &provider, const std::string &within) {
+// Newest first. With `stop`, the listing ends after the first key (number, S3 LastModified) it accepts.
+std::vector<int64_t> ListNumbers(S3Provider &provider, const std::string &within,
+                                 const std::function<bool(int64_t, int64_t)> &stop = {}) {
     std::vector<int64_t> numbers;
     std::string continuation;
     do {
         auto page = provider.List(continuation, 1000, within);
-        for (auto &key : page.keys) {
-            auto inverted = key.substr(within.size());
+        for (size_t i = 0; i < page.keys.size(); i++) {
+            auto inverted = page.keys[i].substr(within.size());
             if (inverted.size() != 10 || inverted.find_first_not_of("0123456789") != std::string::npos)
-                throw std::runtime_error("[differential:corrupt_data] Corrupt record key " + key);
+                throw std::runtime_error("[differential:corrupt_data] Corrupt record key " + page.keys[i]);
             numbers.push_back(SNAPSHOT_KEY_MAX - std::stoll(inverted));
+            if (stop && stop(numbers.back(), page.modified[i]))
+                return numbers;
+        }
+        continuation = page.continuation;
+    } while (!continuation.empty());
+    return numbers;
+}
+// Time-ordered expiry log of a shared database: dbs/<uuid>/expiries/<20-digit microseconds>-<10-digit n>.
+std::string ExpiryLogPrefix(const std::string &database, int64_t micros) {
+    auto time = std::to_string(std::max<int64_t>(0, micros));
+    return Pool(database) + "expiries/" + std::string(20 - time.size(), '0') + time;
+}
+std::string ExpiryLogKey(const std::string &database, int64_t snapshot, int64_t micros) {
+    auto number = std::to_string(snapshot);
+    return ExpiryLogPrefix(database, micros) + "-" + std::string(10 - number.size(), '0') + number;
+}
+// Expiry log entries after `start_after`: their snapshot numbers and the newest entry's time.
+std::vector<int64_t> ListExpiryLog(S3Provider &provider, const std::string &database, const std::string &start_after,
+                                   int64_t &newest) {
+    std::vector<int64_t> numbers;
+    auto within = Pool(database) + "expiries/";
+    std::string continuation;
+    do {
+        auto page = provider.List(continuation, 1000, within, start_after);
+        for (auto &key : page.keys) {
+            auto name = key.substr(within.size());
+            if (name.size() != 31 || name[20] != '-' || name.find_first_not_of("0123456789-") != std::string::npos)
+                throw std::runtime_error("[differential:corrupt_data] Corrupt expiry log key " + key);
+            numbers.push_back(std::stoll(name.substr(21)));
+            newest = std::max<int64_t>(newest, std::stoll(name.substr(0, 20)));
         }
         continuation = page.continuation;
     } while (!continuation.empty());
@@ -2372,7 +2636,7 @@ std::string ExpiryKey(const std::string &database, int64_t snapshot) {
 std::mutex history_mutex;
 std::map<std::string, std::chrono::steady_clock::time_point> history_synced;
 } // namespace
-void SyncHistory(Control &control, const std::string &database, bool throttled) {
+void SyncHistory(Control &control, const std::string &database, bool throttled, bool full) {
     if (control.Writers(database) != "shared")
         return;
     auto id = control.FindDatabase(database);
@@ -2385,9 +2649,20 @@ void SyncHistory(Control &control, const std::string &database, bool throttled) 
             return;
     }
     auto provider = Client(control, control.Profile(id));
+    // Incremental by default; a full listing at most a day after the last one, or on request.
+    constexpr int64_t WINDOW = 15ll * 60 * 1000000, DAY = 24ll * 3600 * 1000000;
+    auto clock = Control::Now();
+    auto state = control.GetRemoteSyncState(id);
+    bool full_commits = full || clock - state.commits_full_at > DAY;
+    bool full_expiries = full || state.expiries_watermark.empty() || clock - state.expiries_full_at > DAY;
     auto cached = control.CachedCommits(id);
     std::vector<int64_t> missing;
-    for (auto n : ListNumbers(*provider, Pool(id) + "snapshots/"))
+    // Commit records list newest first. A number below a newer one is only published moments after
+    // its writer listed the index, so a cached record older than the window ends the listing.
+    auto known = [&](int64_t n, int64_t modified) {
+        return !full_commits && cached.count(n) && modified < clock - WINDOW;
+    };
+    for (auto n : ListNumbers(*provider, Pool(id) + "snapshots/", known))
         if (!cached.count(n))
             missing.push_back(n);
     std::vector<RemoteCommit> commits(missing.size());
@@ -2401,7 +2676,21 @@ void SyncHistory(Control &control, const std::string &database, bool throttled) 
         commits[i] = *commit;
     });
     control.CacheCommits(id, commits);
-    control.ExpireCommits(id, ListNumbers(*provider, Pool(id) + "expired/"));
+    // Expiries: every expiry record in a full listing; else the log entries since the last read (from a
+    // window before it, for writers whose entry is a little older than their write).
+    int64_t newest = state.expiries_watermark.empty() ? 0 : std::stoll(state.expiries_watermark);
+    if (full_expiries) {
+        control.ExpireCommits(id, ListNumbers(*provider, Pool(id) + "expired/"));
+        newest = std::max(newest, clock);
+        state.expiries_full_at = clock;
+    } else
+        control.ExpireCommits(id, ListExpiryLog(*provider, id, ExpiryLogPrefix(id, newest - WINDOW), newest));
+    if (full_commits)
+        state.commits_full_at = clock;
+    state.expiries_watermark = std::to_string(newest);
+    control.SetRemoteSyncState(id, state);
+    // A writer's base snapshot is read from S3 on demand: copy what remote collection condemned.
+    SyncCondemned(control, control.Profile(id));
     std::lock_guard<std::mutex> guard(history_mutex);
     history_synced[key] = now;
 }
@@ -2430,6 +2719,10 @@ void ExpireShared(Control &control, const std::string &database, const std::vect
                     std::to_string(Control::Now()) + "\nrepository " + repository + "\n";
         provider->PutRecord(ExpiryKey(id, n), {text.begin(), text.end()}); // false: already expired
         Failpoint("DIFFERENTIAL_SHARED_CRASH", "expiry_recorded");
+        // The time-ordered log other writers read incrementally (a repeated expiry adds another entry).
+        // Test builds can leave it out, as a crash between the two writes would.
+        if (!Hook("DIFFERENTIAL_TEST_NO_EXPIRY_LOG"))
+            provider->PutRecord(ExpiryLogKey(id, n, Control::Now()), {text.begin(), text.end()});
     }
     control.ExpireCommits(id, snapshots);
 }
@@ -2446,7 +2739,7 @@ std::string PrepareSharedDrop(Control &control, const std::string &database, con
     if (!remote->head)
         return ""; // already dropped in S3
     if (!base || base->etag != remote->etag)
-        throw std::runtime_error("[differential:branch_conflict] Branch " + branch + " moved in S3 (snapshot " +
+        throw Error(ErrorCode::BranchConflict, "[differential:branch_conflict] Branch " + branch + " moved in S3 (snapshot " +
                                  std::to_string(remote->head->snapshot) + ") since this repository last saw it; "
                                  "ATTACH it to follow S3 (or reconcile it), then drop it");
     return remote->etag;
@@ -2464,7 +2757,7 @@ void TombstoneBranch(Control &control, const std::string &database, const Branch
     head.write_id = WriteID();
     auto written = Client(control, provider_id)->PutMutable(head.Key(), EncodeDropped(head, Control::Now()), etag);
     if (!written)
-        throw std::runtime_error("[differential:branch_conflict] Branch " + branch.name + " was dropped here, but its "
+        throw Error(ErrorCode::BranchConflict, "[differential:branch_conflict] Branch " + branch.name + " was dropped here, but its "
                                  "S3 head changed meanwhile and was left as it is");
     // A new branch of this name publishes on top of the tombstone.
     control.RecordHeadWrite(provider_id, head.Key(), HeadWrite{*written, head.write_id, "", 0});
@@ -2515,4 +2808,50 @@ void EnsureLocalSnapshot(Control &control, const std::string &database, int64_t 
 void ScheduleHistorySync(const std::shared_ptr<Control> &control, const std::string &database) {
     Publisher::Instance().Schedule(control, database, "");
 }
+void ExpireExported(Control &control, const std::string &database, const std::vector<int64_t> &snapshots) {
+    if (snapshots.empty())
+        return;
+    auto id = control.FindDatabase(database);
+    auto provider = Client(control, control.Profile(id));
+    auto repository = control.RepositoryID();
+    for (auto n : snapshots) {
+        auto text = "differential-expired-v1\nsnapshot " + std::to_string(n) + "\nexpired_at " +
+                    std::to_string(Control::Now()) + "\nrepository " + repository + "\n";
+        provider->PutRecord(ExpiryKey(id, n), {text.begin(), text.end()}); // false: already expired
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Internal interface of the S3 sources (s3_internal.hpp)
+std::shared_ptr<S3Provider> S3Client(Control &control, const std::string &provider) {
+    return Client(control, provider);
+}
+void ParallelTasks(size_t count, unsigned width, const std::function<void(size_t)> &task) {
+    Parallel(count, width, task);
+}
+void UploadImmutable(Control &control, S3Provider &provider, const std::string &key,
+                     const std::vector<unsigned char> &bytes) {
+    PutImmutable(control, provider, key, bytes, Hash(bytes));
+}
+void SetExportVerification(bool verify_by_reading_back) { read_back = verify_by_reading_back; }
+void SetExportStaging(bool in_memory) { from_memory = in_memory; }
+bool ExportReadsBack() { return read_back; }
+bool ExportStagesInMemory() { return from_memory; }
+Descriptor DecodeDescriptor(const std::vector<unsigned char> &bytes) { return Decode(bytes); }
+std::vector<std::string> IndexPackKeys(const Bytes &index) {
+    CheckIndex(index);
+    uint64_t packs = (index.size() - IndexSize(0)) / PACK_ENTRY;
+    std::vector<std::string> keys;
+    for (uint64_t i = 0; i < packs; i++) {
+        auto entry = index.data() + INDEX_HEADER + PACK_ENTRY * i;
+        keys.push_back(Pool(HexUUID(entry)) + "packs/" + Hex(entry + 16, 32));
+    }
+    return keys;
+}
+std::optional<Head> DecodeHeadObject(const std::vector<unsigned char> &bytes) {
+    if (IsDropped(bytes))
+        return std::nullopt;
+    return DecodeHead(bytes);
+}
+std::optional<RemoteCommit> DecodeCommitRecord(const std::vector<unsigned char> &bytes) { return DecodeCommit(bytes); }
 } // namespace differential

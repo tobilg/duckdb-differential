@@ -45,13 +45,17 @@ jobs:
 
       # DuckDB derives its version from the submodule's release tag and commit hash, but the checkout
       # above is shallow and has no tags (the CLI would report v0.0.1). Fetch only the tag of the
-      # pinned commit, and abbreviate hashes to 10 digits as DuckDB's own builds do (v1.5.6, 069cc9f9b5).
+      # pinned commit, and abbreviate hashes to 10 digits as DuckDB's own builds do. A pre-release
+      # commit without a tag names its version through OVERRIDE_GIT_DESCRIBE (Makefile) instead.
       - name: Fetch the DuckDB version tag
         run: |
           set -euo pipefail
           head=$(git -C duckdb rev-parse HEAD)
           tag=$(git -C duckdb ls-remote --tags origin | awk -v h="$head" '$1==h {sub("refs/tags/","",$2); sub(/\^\{\}$/,"",$2); print $2; exit}')
-          test -n "$tag" || { echo "The duckdb submodule commit $head carries no release tag" >&2; exit 1; }
+          if [ -z "$tag" ]; then
+            grep -q '^OVERRIDE_GIT_DESCRIBE ?= v' Makefile || { echo "The duckdb submodule commit $head carries no release tag and the Makefile names no version" >&2; exit 1; }
+            exit 0
+          fi
           git -C duckdb fetch --depth=1 --force origin "refs/tags/${tag}:refs/tags/${tag}"
           git -C duckdb config core.abbrev 10
           git -C duckdb describe --tags --long

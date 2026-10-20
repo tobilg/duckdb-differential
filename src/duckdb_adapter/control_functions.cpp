@@ -15,11 +15,14 @@
 #include "differential_control.hpp"
 #include "differential_repository.hpp"
 #include "differential_export.hpp"
+#include "differential_error.hpp"
 #include "differential_recovery.hpp"
 #include "sql_options.hpp"
 #include "secrets.hpp"
 #include "remote_cache.hpp"
 #include "differential_catalog.hpp"
+#include "follow.hpp"
+#include "differential_shipping.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -41,6 +44,7 @@ enum class Command {
     ROOTS,
     REMOTE_HEADS,
     WRITERS,
+    FOLLOWERS,
     STATS,
     // lifecycle
     CREATE_SNAPSHOT,
@@ -55,10 +59,13 @@ enum class Command {
     RESOLVE_CONFLICT,
     IMPORT_DATABASE,
     RECOVER_EXPORT,
+    RECOVER_BRANCH,
     // maintenance
     CLEANUP_OLD_FILES,
     DELETE_ORPHANED_FILES,
-    COMPACT
+    COMPACT,
+    CLEANUP_REMOTE_FILES,
+    CLEANUP_METADATA
 };
 bool ReadOnly(Command c) { return c <= Command::STATS; }
 struct Info : TableFunctionInfo {
@@ -79,7 +86,7 @@ struct Binding : TableFunctionData {
     std::optional<int64_t> snapshot, older_than;
     vector<int64_t> versions;
     string branch, keep;
-    bool dry_run = false, cleanup_all = false, defer_export = false;
+    bool dry_run = false, cleanup_all = false, defer_export = false, full_refresh = false, same_identity = false;
     int64_t limit = 1000;
     DataPathOptions data;
 };
@@ -94,7 +101,7 @@ Value Time(int64_t t) { return t ? Value::TIMESTAMPTZ(timestamp_tz_t(t)) : Value
 const LogicalType V = LogicalType::VARCHAR, I = LogicalType::BIGINT, T = LogicalType::TIMESTAMP_TZ,
                   B = LogicalType::BOOLEAN;
 // DuckLake's snapshots() columns first, then differential-specific ones.
-vector<string> SnapshotNames() {
+vector<Identifier> SnapshotNames() {
     return {"snapshot_id",       "snapshot_time",  "snapshot_name",      "author",       "commit_message",
             "commit_extra_info", "branch_id",      "captured_at",        "root",         "logical_size",
             "retired",           "publication_state", "export_state",    "export_locator", "uri",
@@ -123,7 +130,7 @@ vector<Value> SnapshotRow(const differential::Snapshot &s) {
             Value::BIGINT(s.source_snapshot)};
 }
 unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
-                              vector<string> &names) {
+                              vector<Identifier> &names) {
     auto &info = input.info->Cast<Info>();
     auto b = make_uniq<Binding>();
     b->repository = info.repository;
@@ -135,7 +142,7 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
         if (v.IsNull())
             throw InvalidInputException("Required management argument cannot be NULL");
     for (auto &entry : input.named_parameters) {
-        auto &name = entry.first;
+        auto name = StringUtil::Lower(entry.first.GetIdentifierName());
         auto &value = entry.second;
         if (value.IsNull())
             continue;
@@ -162,10 +169,17 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
             b->keep = StringUtil::Lower(value.ToString());
             if (b->keep != "branch" && b->keep != "remote")
                 throw InvalidInputException("keep must be 'branch' or 'remote'");
+        } else if (name == "refresh") {
+            auto refresh = StringUtil::Lower(value.ToString());
+            if (refresh != "incremental" && refresh != "full")
+                throw InvalidInputException("refresh must be 'incremental' or 'full'");
+            b->full_refresh = refresh == "full";
         } else if (name == "dry_run")
             b->dry_run = value.GetValue<bool>();
         else if (name == "cleanup_all")
             b->cleanup_all = value.GetValue<bool>();
+        else if (name == "same_identity")
+            b->same_identity = value.GetValue<bool>();
         else if (name == "max_objects" || name == "max_pages")
             b->limit = value.GetValue<int64_t>();
         else if (name == "export_mode") {
@@ -189,8 +203,9 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
         names = {"database_id",        "database_name", "branch_id",          "branch_name",
                  "state",              "root",          "writer_epoch",       "head_snapshot_id",
                  "created_at",         "source_database_id", "source_snapshot_id", "uri",
-                 "remote_state",       "remote_snapshot_id", "kept_branch"};
-        types = {V, V, V, V, V, V, I, I, T, V, I, V, V, I, V};
+                 "remote_state",       "remote_snapshot_id", "kept_branch",        "ship_wal",
+                 "shipped_chain",      "shipped_epoch", "shipped_at",         "ship_pending"};
+        types = {V, V, V, V, V, V, I, I, T, V, I, V, V, I, V, V, I, I, T, B};
         break;
     case Command::DATABASES:
         names = {"database_id", "database_name", "data_path", "last_snapshot_id", "created_at", "writers"};
@@ -225,6 +240,16 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
         names = {"metric", "value"};
         types = {V, I};
         break;
+    case Command::FOLLOWERS:
+        names = {"alias",  "database_name", "branch_name",  "follows",    "follow_interval_ms", "chain", "epoch",
+                 "snapshot_id", "state_time", "checked_at", "polls", "changes", "error"};
+        types = {V, V, V, V, I, I, I, I, T, T, I, I, V};
+        break;
+    case Command::RECOVER_BRANCH:
+        names = {"database_id", "database_name", "branch_id", "branch_name", "shipped_chain", "shipped_epoch",
+                 "uri"};
+        types = {V, V, V, V, I, I, V};
+        break;
     case Command::EXPIRE_SNAPSHOTS:
     case Command::EVICT_SNAPSHOTS:
         names = {"snapshot_id", "snapshot_time", "snapshot_name", "dry_run", "operation_id", "export_locator"};
@@ -250,6 +275,15 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
     case Command::DELETE_ORPHANED_FILES:
         names = {"dry_run", "orphaned_files"};
         types = {B, I};
+        break;
+    case Command::CLEANUP_REMOTE_FILES:
+        names = {"dry_run",           "roots",           "live_objects",   "unreachable_objects",
+                 "unreachable_bytes", "condemned_objects", "deleted_objects", "deleted_bytes"};
+        types = {B, I, I, I, I, I, I, I};
+        break;
+    case Command::CLEANUP_METADATA:
+        names = {"dry_run", "table_name", "rows"};
+        types = {B, V, I};
         break;
     case Command::COMPACT:
         names = {"operation_id",    "free_pages_before", "free_bytes_before", "pages_reclaimed",
@@ -277,7 +311,7 @@ struct Target {
 };
 Target ResolveTarget(ClientContext &context, differential::Control &c, const string &argument) {
     Target target;
-    auto attached = DatabaseManager::Get(context).GetDatabase(context, argument);
+    auto attached = DatabaseManager::Get(context).GetDatabase(context, Identifier(argument));
     if (attached && !attached->IsSystem() && !attached->IsTemporary()) {
         auto path = attached->GetStorageManager().GetDBPath();
         if (path.rfind("diff://", 0) == 0) {
@@ -300,18 +334,21 @@ Target ResolveTarget(ClientContext &context, differential::Control &c, const str
 }
 // Exports are complete at this point; a head failure only leaves remote discovery stale. `branch`
 // limits a shared database's update to the head of the branch an operation changed.
+[[noreturn]] void ThrowHeadError(const std::exception &error, const string &database) {
+    // Another writer owns or moved the head: retrying cannot help; the message says what can.
+    if (differential::Is(error, differential::ErrorCode::HeadConflict) ||
+        differential::Is(error, differential::ErrorCode::BranchConflict))
+        throw IOException("%s", error.what());
+    throw IOException("[differential:incomplete_export] Snapshot export completed, but the S3 branch heads "
+                      "were not updated: %s. Run differential_retry_export('%s') to publish them.",
+                      error.what(), database);
+}
 void PublishBranchHeads(differential::Control &c, const string &database, const string &branch = "") {
     differential::Timer timer(differential::Metric::BranchHeadPublish);
     try {
         differential::PublishHeads(c, database, false, branch);
     } catch (const std::exception &error) {
-        // Another writer owns or moved the head: retrying cannot help; the message says what can.
-        if (string(error.what()).find("[differential:head_conflict]") != string::npos ||
-            string(error.what()).find("[differential:branch_conflict]") != string::npos)
-            throw IOException("%s", error.what());
-        throw IOException("[differential:incomplete_export] Snapshot export completed, but the S3 branch heads "
-                          "were not updated: %s. Run differential_retry_export('%s') to publish them.",
-                          error.what(), database);
+        ThrowHeadError(error, database);
     }
 }
 // Pin the local root of a retained snapshot for the duration of a lifecycle operation. An
@@ -419,7 +456,7 @@ differential::Operation ImportNative(ClientContext &context, differential::Contr
                 throw IOException("Import checksum initialization failed");
             std::array<unsigned char, 65536> bytes;
             for (uint64_t offset = 0; offset < uint64_t(size);) {
-                if (context.interrupted)
+                if (context.IsInterrupted())
                     throw InterruptException();
                 auto n = std::min<uint64_t>(bytes.size(), uint64_t(size) - offset);
                 local->Read(*handle, bytes.data(), int64_t(n), offset);
@@ -516,7 +553,7 @@ differential::Operation ResolveConflict(ClientContext &context, differential::Co
     try {
         lease = c.Acquire(branch);
     } catch (const std::exception &error) {
-        if (string(error.what()).find("[differential:writer_busy]") == string::npos)
+        if (!differential::Is(error, differential::ErrorCode::WriterBusy))
             throw;
         throw IOException("[differential:active_attachment_or_transaction] Branch \"%s\" is attached or being "
                           "written; DETACH it first",
@@ -539,7 +576,7 @@ differential::Operation ResolveConflict(ClientContext &context, differential::Co
     auto base = c.HeadWriteFor(c.Profile(database), key.Key());
     // Local work is whatever this branch has beyond the S3 head it last wrote or adopted.
     if (keep == "branch" && kept && (!base || kept != base->snapshot)) {
-        differential::ExportSnapshot(c, database, kept, [&] { return context.interrupted.load(); });
+        differential::ExportSnapshot(c, database, kept, [&] { return context.IsInterrupted(); });
         kept_branch = name.empty() ? differential::ConflictBranchName(branch_name, kept) : name;
         std::optional<differential::Branch> earlier; // created by this request before an interruption
         try {
@@ -579,7 +616,7 @@ void Run(ClientContext &context, const Binding &b, State &state) {
     case Command::SNAPSHOTS: {
         // Shared databases: other writers' snapshots come from S3 commit records (read here).
         auto database = ResolveTarget(context, c, text(0)).database;
-        differential::SyncHistory(c, database);
+        differential::SyncHistory(c, database, false, b.full_refresh);
         for (auto &s : c.Snapshots(database))
             state.rows.push_back(SnapshotRow(s));
         return;
@@ -616,6 +653,15 @@ void Run(ClientContext &context, const Binding &b, State &state) {
         }
         return;
     }
+    case Command::FOLLOWERS:
+        for (auto &f : Followers())
+            state.rows.push_back({Value(f.alias), Value(f.database), Value(f.branch), Value(f.mode),
+                                  Value::BIGINT(f.interval_ms), f.mode == "commits" ? Value::BIGINT(f.chain) : Value(I),
+                                  f.mode == "commits" ? Value::BIGINT(f.epoch) : Value(I),
+                                  f.mode == "snapshots" ? Value::BIGINT(f.snapshot) : Value(I), Time(f.published_at),
+                                  Time(f.checked_at), Value::BIGINT(f.polls), Value::BIGINT(f.changes),
+                                  Optional(f.error)});
+        return;
     case Command::STATS:
         for (auto &m : differential::Timings())
             state.rows.push_back({Value(m.first), Value::UBIGINT(m.second)});
@@ -624,6 +670,8 @@ void Run(ClientContext &context, const Binding &b, State &state) {
         for (auto &m : differential::S3Provider::Metrics())
             state.rows.push_back({Value(m.first), Value::UBIGINT(m.second)});
         for (auto &m : differential::ExportMetrics())
+            state.rows.push_back({Value(m.first), Value::UBIGINT(m.second)});
+        for (auto &m : differential::ShippingMetrics())
             state.rows.push_back({Value(m.first), Value::UBIGINT(m.second)});
         state.rows.push_back({Value("local_payload_objects"), Value::UBIGINT(c.store->ObjectCount())});
         return;
@@ -651,6 +699,29 @@ void Run(ClientContext &context, const Binding &b, State &state) {
     case Command::DELETE_ORPHANED_FILES:
         state.rows.push_back({Value::BOOLEAN(b.dry_run), Value::BIGINT(c.DeleteOrphanedFiles(b.dry_run, b.limit))});
         return;
+    case Command::CLEANUP_REMOTE_FILES: {
+        // Every database in the location: packs are shared between them. Reads and writes S3 here only.
+        auto location = text(0);
+        if (!differential::S3Location::Is(location))
+            throw InvalidInputException("Expected an s3://bucket/prefix/ location");
+        if (location.back() != '/')
+            location += '/';
+        auto provider = EnsureS3(context, c, data, location);
+        constexpr int64_t WEEK = 7ll * 24 * 3600 * 1000000;
+        auto older_than = b.older_than ? *b.older_than : differential::Control::Now() - WEEK;
+        auto r = differential::CollectRemote(c, provider, older_than, b.dry_run);
+        state.rows.push_back({Value::BOOLEAN(b.dry_run), Value::BIGINT(r.roots), Value::BIGINT(r.live_objects),
+                              Value::BIGINT(r.unreachable_objects), Value::BIGINT(r.unreachable_bytes),
+                              Value::BIGINT(r.condemned_objects), Value::BIGINT(r.deleted_objects),
+                              Value::BIGINT(r.deleted_bytes)});
+        return;
+    }
+    case Command::CLEANUP_METADATA:
+        if (!b.older_than)
+            throw InvalidInputException("differential_cleanup_metadata needs older_than => <timestamp>");
+        for (auto &row : c.PruneMetadata(*b.older_than, b.dry_run))
+            state.rows.push_back({Value::BOOLEAN(b.dry_run), Value(row.first), Value::BIGINT(row.second)});
+        return;
     case Command::EXPIRE_SNAPSHOTS:
     case Command::EVICT_SNAPSHOTS: {
         bool evict = b.command == Command::EVICT_SNAPSHOTS;
@@ -659,13 +730,17 @@ void Run(ClientContext &context, const Binding &b, State &state) {
         if (shared)
             differential::SyncHistory(c, database);
         auto selected = c.SelectSnapshots(database, b.versions, b.older_than, evict);
-        // Shared databases: published snapshots expire for every writer (recorded in S3 first).
-        if (shared && !evict && !b.dry_run) {
+        // Published snapshots expire in S3 first: for every writer of a shared database, and for
+        // remote collection, which reclaims what only expired snapshots reference.
+        if (!evict && !b.dry_run) {
             vector<int64_t> published;
             for (auto &s : selected)
                 if (s.export_state == "complete")
                     published.push_back(s.id);
-            differential::ExpireShared(c, database, published);
+            if (shared)
+                differential::ExpireShared(c, database, published);
+            else
+                differential::ExpireExported(c, database, published);
         }
         for (auto &s : selected) {
             string operation;
@@ -702,7 +777,7 @@ void Run(ClientContext &context, const Binding &b, State &state) {
             auto op = c.RetryExport(database, id, request);
             string key;
             try {
-                key = differential::ExportSnapshot(c, database, id, [&] { return context.interrupted.load(); });
+                key = differential::ExportSnapshot(c, database, id, [&] { return context.IsInterrupted(); });
             } catch (const std::exception &error) {
                 throw IOException("[differential:incomplete_export] Snapshot %d remains pending: %s", id, error.what());
             }
@@ -762,7 +837,7 @@ void Run(ClientContext &context, const Binding &b, State &state) {
     string on_conflict = "fail", forked_branch;
     switch (b.command) {
     case Command::CREATE_SNAPSHOT: {
-        auto attachment = DatabaseManager::Get(context).GetDatabase(context, text(0));
+        auto attachment = DatabaseManager::Get(context).GetDatabase(context, Identifier(text(0)));
         if (!attachment || attachment->IsReadOnly() ||
             attachment->GetStorageManager().GetDBPath().rfind("diff://", 0) != 0)
             throw InvalidInputException("Expected a writable differential attachment (ATTACH 'differential:...')");
@@ -860,6 +935,28 @@ void Run(ClientContext &context, const Binding &b, State &state) {
         differential::TombstoneBranch(c, database, branch, etag);
         break;
     }
+    case Command::RECOVER_BRANCH: {
+        // The newest shipped state of a branch, from s3://…/heads/<database>[/<uuid>][/<branch>].
+        std::pair<string, string> head_location;
+        if (!SplitHeadLocation(text(0), head_location))
+            throw InvalidInputException("Expected s3://<bucket>/<prefix>/heads/<database>[/<database uuid>][/<branch>]");
+        auto provider = EnsureS3(context, c, data, head_location.first);
+        auto location = differential::ResolveBranchLocation(c, provider, head_location.second);
+        auto existing = c.FindDatabase(text(1));
+        if (!existing.empty() && !b.request.empty()) {
+            // A repeated request: the database it created.
+            auto branch = c.GetBranch(existing, location.branch_name);
+            state.rows.push_back({Value(existing), Value(text(1)), Value(branch.id), Value(branch.name), Value(I),
+                                  Value(I), Value(branch.URI())});
+            return;
+        }
+        auto recovered = differential::RecoverBranch(c, provider, location.database, location.branch_name, text(1),
+                                                     b.same_identity);
+        auto branch = c.GetBranch(recovered.database, recovered.branch, true);
+        state.rows.push_back({Value(recovered.database), Value(text(1)), Value(branch.id), Value(branch.name),
+                              Value::BIGINT(recovered.chain), Value::BIGINT(recovered.epoch), Value(branch.URI())});
+        return;
+    }
     case Command::IMPORT_DATABASE:
         op = ImportNative(context, c, b.request, text(0), text(1), EnsureDataPath(context, c, data));
         break;
@@ -893,7 +990,7 @@ void Run(ClientContext &context, const Binding &b, State &state) {
                 auto id = preservation ? op.preservation : op.snapshot;
                 if (!id)
                     continue;
-                auto key = differential::ExportSnapshot(c, op.database, id, [&] { return context.interrupted.load(); });
+                auto key = differential::ExportSnapshot(c, op.database, id, [&] { return context.IsInterrupted(); });
                 // A shared database's export can renumber the operation's snapshots.
                 op = c.GetOperation(op.id);
                 if (!key.empty()) {
@@ -907,11 +1004,12 @@ void Run(ClientContext &context, const Binding &b, State &state) {
                               op.id, error.what());
         }
         if (!export_key.empty()) {
+            differential::Timer timer(differential::Metric::BranchHeadPublish);
             try {
-                PublishBranchHeads(c, op.database, op.branch);
-            } catch (const IOException &error) {
-                if (on_conflict != "branch" || string(error.what()).find("[differential:branch_conflict]") == string::npos)
-                    throw;
+                differential::PublishHeads(c, op.database, false, op.branch);
+            } catch (const std::exception &error) {
+                if (on_conflict != "branch" || !differential::Is(error, differential::ErrorCode::BranchConflict))
+                    ThrowHeadError(error, op.database);
                 // ON_CONFLICT 'branch': the snapshot becomes a branch of its own; this branch follows S3
                 // again at its next ATTACH if it has no changes after the snapshot.
                 forked_branch = c.GetBranch(op.database, differential::ForkConflict(c, op.database, op.branch)).id;
@@ -1068,6 +1166,11 @@ const vector<FunctionDoc> &FunctionDocs() {
          "branches.",
          "SELECT branch_name, host, live FROM differential_writers('team');", {"database"},
          {"differential", "shared", "introspection"}},
+        {"differential_followers",
+         "Lists this process's followers (ATTACH ... FOLLOW true): what each follows, the state it reads, when it "
+         "last checked S3 and its last error.",
+         "SELECT alias, follows, epoch, checked_at FROM differential_followers();", {},
+         {"differential", "s3", "introspection"}},
         {"differential_create_snapshot",
          "Checkpoints an attached writable branch and publishes it as an immutable snapshot with optional commit "
          "metadata; exports it to S3 and, for shared databases, moves the S3 branch head.",
@@ -1122,6 +1225,13 @@ const vector<FunctionDoc> &FunctionDocs() {
          "SELECT database_id FROM differential_recover_export('s3://my-bucket/lake/descriptors/<sha256>', "
          "'restored');",
          {"location", "name"}, {"differential", "s3", "import"}},
+        {"differential_recover_branch",
+         "Recovers the newest shipped state of a branch (SHIP_WAL) from S3 into a new local database: its chain's "
+         "base, read on demand, plus every shipped epoch; DuckDB replays the WAL at the first ATTACH. "
+         "same_identity => true keeps the original identities (a failover of the writer).",
+         "SELECT database_id, shipped_epoch FROM differential_recover_branch('s3://my-bucket/lake/heads/sales/main', "
+         "'sales_recovered');",
+         {"location", "name"}, {"differential", "s3", "import"}},
         {"differential_cleanup_old_files",
          "Collects local data that no snapshot, branch, pin or pending export references any more.",
          "SELECT deleted_objects FROM differential_cleanup_old_files(cleanup_all => true);", {},
@@ -1132,6 +1242,19 @@ const vector<FunctionDoc> &FunctionDocs() {
          {"differential", "maintenance"}},
         {"differential_compact", "Returns free pages of the repository's metadata store to the file system.",
          "SELECT pages_reclaimed FROM differential_compact(max_pages => 1000);", {}, {"differential", "maintenance"}},
+        {"differential_cleanup_remote_files",
+         "Garbage-collects an S3 location in two phases: condemns data no branch head or unexpired snapshot "
+         "references, and deletes what stayed condemned and unreachable since before older_than (default: a "
+         "week ago).",
+         "SELECT condemned_objects, deleted_bytes FROM differential_cleanup_remote_files('s3://my-bucket/lake/', "
+         "dry_run => true);",
+         {"location"}, {"differential", "s3", "maintenance"}},
+        {"differential_cleanup_metadata",
+         "Deletes completed operation records and history entries of expired snapshots older than older_than; "
+         "request IDs of deleted operations no longer replay.",
+         "SELECT table_name, rows FROM differential_cleanup_metadata(older_than => now() - INTERVAL 30 DAY, "
+         "dry_run => true);",
+         {}, {"differential", "maintenance"}},
     };
     return docs;
 }
@@ -1152,27 +1275,39 @@ FunctionDescription ScopedDescription(const string &name) {
     return description;
 }
 } // namespace
+// Names a control function's positional parameters after its FunctionDocs entry (they stay
+// positional-only) and declares its named parameters as typed options.
+void DeclareParameters(TableFunction &f, const vector<std::pair<const char *, LogicalType>> &named) {
+    auto &signature = f.GetSignature();
+    for (auto &doc : FunctionDocs()) {
+        if (f.GetName() != doc.name)
+            continue;
+        for (idx_t i = 0; i < signature.GetParameterCount() && i < doc.positional.size(); i++)
+            signature.GetParameter(i).SetName(Identifier(doc.positional[i]));
+    }
+    if (!named.empty())
+        signature.WithTypedKwargs("options", [&](TypedKwargs &options) {
+            for (auto &entry : named)
+                options.Add(entry.first, entry.second);
+        });
+}
 void DescribeFunctions(DatabaseInstance &db) {
     auto &catalog = Catalog::GetSystemCatalog(db);
     auto transaction = CatalogTransaction::GetSystemTransaction(db);
-    auto &schema = catalog.GetSchema(transaction, DEFAULT_SCHEMA);
+    auto &schema = catalog.GetSchema(transaction, Identifier::DefaultSchema());
     for (auto &doc : FunctionDocs()) {
-        auto found = schema.GetEntry(transaction, CatalogType::TABLE_FUNCTION_ENTRY, doc.name);
+        auto found = schema.GetEntry(transaction, CatalogType::TABLE_FUNCTION_ENTRY, Identifier(doc.name));
         if (!found)
             continue; // not registered in this build
         auto &entry = found->Cast<TableFunctionCatalogEntry>();
         entry.descriptions.clear();
-        // One description per overload, matched by its positional types; names in the order
-        // duckdb_functions() lists the parameters: positional, then named.
+        // One description per overload, matched by its positional types (parameter names come
+        // from the signature, see DeclareParameters).
         for (idx_t i = 0; i < entry.functions.Size(); i++) {
-            auto function = entry.functions.GetFunctionByOffset(i);
+            auto &signature = entry.functions.GetFunctionByOffset(i)->GetSignature();
             FunctionDescription description;
-            description.parameter_types = function.arguments;
-            for (idx_t argument = 0; argument < function.arguments.size(); argument++)
-                description.parameter_names.push_back(argument < doc.positional.size() ? doc.positional[argument]
-                                                                                       : "col" + to_string(argument));
-            for (auto &parameter : function.named_parameters)
-                description.parameter_names.push_back(parameter.first);
+            for (idx_t argument = 0; argument < signature.GetPositionalParameterCount(); argument++)
+                description.parameter_types.push_back(signature.GetParameter(argument).GetType());
             description.description = doc.description;
             description.examples = {doc.example};
             description.categories = doc.categories;
@@ -1195,7 +1330,7 @@ unique_ptr<CatalogEntry> CreateScopedFunction(std::shared_ptr<differential::Repo
         command = Command::BRANCHES;
     else
         return nullptr;
-    TableFunction function(name, {}, Execute, Bind, Init);
+    TableFunction function(Identifier(name), {}, Execute, Bind, Init);
     auto info = make_shared_ptr<Info>(std::move(repository), command);
     info->catalog = &catalog;
     function.function_info = std::move(info);
@@ -1212,9 +1347,8 @@ void RegisterControlFunctions(ExtensionLoader &loader, std::shared_ptr<different
         TableFunction f(name, std::move(arguments), Execute, Bind, Init);
         f.function_info = make_shared_ptr<Info>(repository, command);
         if (!ReadOnly(command))
-            f.named_parameters["request_id"] = V;
-        for (auto &entry : named)
-            f.named_parameters[entry.first] = entry.second;
+            named.insert(named.begin(), {"request_id", V});
+        DeclareParameters(f, named);
         loader.RegisterFunction(f);
     };
     vector<std::pair<const char *, LogicalType>> data_path = {
@@ -1225,7 +1359,7 @@ void RegisterControlFunctions(ExtensionLoader &loader, std::shared_ptr<different
     vector<std::pair<const char *, LogicalType>> selection = {
         {"versions", LogicalType::LIST(I)}, {"older_than", T}, {"dry_run", B}};
     // Introspection
-    add("differential_snapshots", Command::SNAPSHOTS, {V}, {});
+    add("differential_snapshots", Command::SNAPSHOTS, {V}, {{"refresh", V}});
     add("differential_current_snapshot", Command::CURRENT_SNAPSHOT, {V}, {});
     add("differential_branches", Command::BRANCHES, {V}, {});
     add("differential_databases", Command::DATABASES, {}, {});
@@ -1234,6 +1368,7 @@ void RegisterControlFunctions(ExtensionLoader &loader, std::shared_ptr<different
     add("differential_retention_roots", Command::ROOTS, {}, {});
     add("differential_storage_stats", Command::STATS, {}, {});
     add("differential_writers", Command::WRITERS, {V}, {});
+    add("differential_followers", Command::FOLLOWERS, {}, {});
     {
         // S3 options as for DATA_PATH (the location is the positional argument).
         vector<std::pair<const char *, LogicalType>> s3(data_path.begin() + 1, data_path.end());
@@ -1255,7 +1390,7 @@ void RegisterControlFunctions(ExtensionLoader &loader, std::shared_ptr<different
         for (auto arguments : {vector<LogicalType> {V}, vector<LogicalType> {V, I}}) {
             TableFunction f("differential_retry_export", arguments, Execute, Bind, Init);
             f.function_info = make_shared_ptr<Info>(repository, Command::RETRY_EXPORT);
-            f.named_parameters["request_id"] = V;
+            DeclareParameters(f, {{"request_id", V}});
             retry.AddFunction(f);
         }
         loader.RegisterFunction(retry);
@@ -1264,10 +1399,22 @@ void RegisterControlFunctions(ExtensionLoader &loader, std::shared_ptr<different
     add("differential_resolve_conflict", Command::RESOLVE_CONFLICT, {V}, {{"keep", V}, {"branch", V}, {"name", V}});
     add("differential_import_database", Command::IMPORT_DATABASE, {V, V}, data_path);
     add("differential_recover_export", Command::RECOVER_EXPORT, {V, V}, data_path);
+    {
+        vector<std::pair<const char *, LogicalType>> s3(data_path.begin() + 1, data_path.end());
+        s3.push_back({"same_identity", B});
+        add("differential_recover_branch", Command::RECOVER_BRANCH, {V, V}, s3);
+    }
     // Maintenance
     add("differential_cleanup_old_files", Command::CLEANUP_OLD_FILES, {},
         {{"dry_run", B}, {"cleanup_all", B}, {"max_objects", I}});
     add("differential_delete_orphaned_files", Command::DELETE_ORPHANED_FILES, {}, {{"dry_run", B}, {"max_objects", I}});
     add("differential_compact", Command::COMPACT, {}, {{"max_pages", I}});
+    {
+        vector<std::pair<const char *, LogicalType>> remote(data_path.begin() + 1, data_path.end());
+        remote.push_back({"older_than", T});
+        remote.push_back({"dry_run", B});
+        add("differential_cleanup_remote_files", Command::CLEANUP_REMOTE_FILES, {V}, remote);
+    }
+    add("differential_cleanup_metadata", Command::CLEANUP_METADATA, {}, {{"older_than", T}, {"dry_run", B}});
 }
 } // namespace duckdb

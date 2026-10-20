@@ -125,8 +125,18 @@ with tempfile.TemporaryDirectory(prefix='differential-time-travel-') as tmp:
         for t in threads:t.join()
         assert not errors,errors[:3]
         assert live()<=1+8
+        # A transaction keeps reading a snapshot another connection evicts; the evicted attachment and
+        # its reader pin live until that transaction ends.
+        host.query(conns[1],"BEGIN; SELECT sum(v) FROM m.t AT (VERSION => 1);")
+        for i in range(2,12):
+            host.query(conns[2],f"SELECT sum(v) FROM m.t AT (VERSION => {i});")
+        assert host.query(conns[1],"SELECT sum(v) FROM m.t AT (VERSION => 1);")==1
+        held=live()
+        assert held==1+8+1,held  # live branch + capacity + the evicted one still in use
+        host.query(conns[1],"COMMIT;")
+        assert live()==1+8,live()
         host.query(conns[0],"DETACH m;")
         assert live()==0
     finally:host.close()
-    passed('hidden snapshot attachments stay within 8 per instance; prepared statements rebind after eviction; 8 connections x 40 random versions')
+    passed('hidden snapshot attachments stay within 8 per instance; prepared statements rebind after eviction; 8 connections x 40 random versions; an evicted snapshot stays readable and pinned until its transaction ends')
 evidence_path('time-travel.json').write_text(json.dumps({'passed':results},indent=2)+'\n')

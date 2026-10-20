@@ -7,6 +7,7 @@
 #include "differential_hooks.hpp"
 #include "differential_repository.hpp"
 #include "differential_export.hpp"
+#include "differential_shipping.hpp"
 #include "differential_recovery.hpp"
 #include "remote_cache.hpp"
 #include "spill_policy.hpp"
@@ -35,6 +36,9 @@ struct DurableHandle : FileHandle {
     int64_t inode = -1;
     string root, pool;
     std::shared_ptr<differential::RemoteSnapshot> remote;
+    // A follower's image of a shipped state (diff://follow/<id>[.suffix]), read-only.
+    std::shared_ptr<const differential::FollowImage> follow;
+    string follow_suffix;
     uint64_t root_size = 0;
     std::shared_ptr<differential::Pin> pin;
     uint64_t position = 0;
@@ -51,6 +55,8 @@ struct DurableHandle : FileHandle {
     // reading ahead is worth it (something keeps what is read ahead).
     differential::RemoteCaching caching;
     bool remote_caches = false;
+    // The memory cache this handle retains (released at close).
+    std::shared_ptr<differential::RemoteMemoryCache> cache_user;
     std::shared_ptr<differential::BranchLock> branch_lock;
     DurableHandle(FileSystem &fs, string path, FileOpenFlags flags, std::shared_ptr<differential::Store> store,
                   std::shared_ptr<differential::Control> control)
@@ -61,11 +67,11 @@ struct DurableHandle : FileHandle {
             return;
         closed = true;
         if (inode >= 0 && flags.OpenForWriting()) {
-            // Native close does not sync. Publish buffered bytes without a sync so another
-            // process that takes the released branch observes them.
+            // Native close does not sync. Publish the file group's buffered bytes without a sync so
+            // another process that takes the released branch observes them.
             bool flushed = false;
             try {
-                store->Flush();
+                store->Flush(inode);
                 flushed = true;
             } catch (...) {
                 if (branch_lock) {
@@ -77,12 +83,22 @@ struct DurableHandle : FileHandle {
             if (flushed && shared && main && branch_lock &&
                 differential::GetSharedWriting(*control, branch_lock->branch.id).publish_on_detach)
                 differential::PublishOnClose(*control, branch_lock->branch.database, branch_lock->branch.id);
-            if (announced)
-                differential::WithdrawWriter(*control, branch_lock->branch.id);
+            // SHIP_WAL: ship what is left while the branch is still ours (errors are recorded).
+            if (flushed && main && branch_lock && !shared)
+                differential::ShipOnClose(*control, branch_lock->branch.id);
         }
+        // Also when the open failed after announcing (no inode): the marker would otherwise be
+        // renewed for the life of the process.
+        if (announced)
+            differential::WithdrawWriter(*control, branch_lock->branch.id);
         pin.reset();
         remote.reset();
+        follow.reset();
         branch_lock.reset();
+        if (cache_user) {
+            cache_user->Release();
+            cache_user.reset();
+        }
         if (lock_fd >= 0) {
             close(lock_fd);
             lock_fd = -1;
@@ -120,6 +136,18 @@ class DurableFileSystem : public FileSystem {
         return name;
     }
     bool IsRoot(const string &uri) { return Probes() && uri.rfind("diff://roots/", 0) == 0; }
+    // diff://follow/<image id>[.suffix]: a follower's image, served from memory and S3.
+    static bool Follow(const string &uri, string &id, string &suffix) {
+        if (uri.rfind("diff://follow/", 0) != 0)
+            return false;
+        id = uri.substr(14);
+        auto dot = id.find('.');
+        suffix = dot == string::npos ? "" : id.substr(dot);
+        id = id.substr(0, dot);
+        if (id.empty() || id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789") != string::npos)
+            throw IOException("Invalid differential follower URI");
+        return true;
+    }
     std::shared_ptr<differential::BranchLock> Owner(const string &branch) {
         std::lock_guard<std::mutex> guard(owners_mutex);
         auto found = owners.find(branch);
@@ -148,15 +176,33 @@ class DurableFileSystem : public FileSystem {
     bool CanSeek() override { return true; }
     // DuckDB's REMOTE_ONLY block prefetch uses this classification. Only export
     // handles are wholly remote; local files and mutable overlays retain local behavior.
-    bool OnDiskFile(FileHandle &h) override { return !H(h).remote; }
+    bool OnDiskFile(FileHandle &h) override { return !H(h).remote && !H(h).follow; }
     bool IsPathAbsolute(const string &) override { return true; }
     string PathSeparator(const string &) override { return "/"; }
     string CanonicalizePath(const string &uri, optional_ptr<FileOpener> = nullptr) override {
+        string id, suffix;
+        if (Follow(uri, id, suffix))
+            return uri;
         Name(uri);
         return Resolve(uri).canonical;
     }
     unique_ptr<FileHandle> OpenFile(const string &uri, FileOpenFlags flags,
                                     optional_ptr<FileOpener> opener = nullptr) override {
+        string follow_id, follow_suffix;
+        if (Follow(uri, follow_id, follow_suffix)) {
+            auto image = differential::FindFollowImage(follow_id);
+            if (!image || !image->Exists(follow_suffix)) {
+                if (flags.ReturnNullIfNotExists())
+                    return nullptr;
+                throw IOException("[differential:not_found] Follower file does not exist");
+            }
+            if (flags.OpenForWriting())
+                throw IOException("[differential:read_only_attachment] A follower is read-only");
+            auto h = make_uniq<DurableHandle>(*this, uri, flags, store, control);
+            h->follow = image;
+            h->follow_suffix = follow_suffix;
+            return std::move(h);
+        }
         auto name = Name(uri);
         auto resolved = Resolve(uri);
         if (resolved.managed && !resolved.historical && !resolved.remote)
@@ -180,6 +226,10 @@ class DurableFileSystem : public FileSystem {
             differential::RemoteCaching caching;
             caching.memory = memory_cache;
             caching.disk_limit = RemoteDiskCacheLimit(opener);
+            if (memory_cache) {
+                memory_cache->Retain();
+                h->cache_user = memory_cache;
+            }
             h->remote = std::make_shared<differential::RemoteSnapshot>(*control, resolved.provider, resolved.descriptor,
                                                                        std::move(caching));
             return std::move(h);
@@ -267,6 +317,10 @@ class DurableFileSystem : public FileSystem {
         if (resolved.managed) {
             h->caching.memory = memory_cache;
             h->caching.disk_limit = RemoteDiskCacheLimit(opener);
+            if (memory_cache) {
+                memory_cache->Retain();
+                h->cache_user = memory_cache;
+            }
             h->remote_caches = h->caching.disk_limit || (memory_cache && memory_cache->Enabled());
             differential::SetRemoteObjectCacheLimit(h->caching.disk_limit);
         }
@@ -284,6 +338,8 @@ class DurableFileSystem : public FileSystem {
     int64_t GetFileSize(FileHandle &h) override {
         if (H(h).remote)
             return int64_t(H(h).remote->descriptor.size);
+        if (H(h).follow)
+            return int64_t(H(h).follow->Size(H(h).follow_suffix));
         return int64_t(H(h).root.empty() ? store->Size(H(h).inode) : H(h).root_size);
     }
     FileType GetFileType(FileHandle &) override { return FileType::FILE_TYPE_REGULAR; }
@@ -292,7 +348,8 @@ class DurableFileSystem : public FileSystem {
         if (n < 0)
             throw IOException("Negative read");
         ProbeEvent("pread", h.path, n, p);
-        auto count = H(h).remote         ? H(h).remote->Read(b, uint64_t(n), p)
+        auto count = H(h).follow         ? H(h).follow->Read(H(h).follow_suffix, b, uint64_t(n), p)
+                     : H(h).remote         ? H(h).remote->Read(b, uint64_t(n), p)
                      : H(h).root.empty() ? store->Read(H(h).inode, b, uint64_t(n), p, Context(H(h)))
                                          : store->ReadRoot(H(h).root, b, uint64_t(n), p, H(h).pool);
         if (count != uint64_t(n))
@@ -302,14 +359,15 @@ class DurableFileSystem : public FileSystem {
         if (n < 0)
             throw IOException("Negative read");
         ProbeEvent("read", h.path, n, H(h).position);
-        auto count = H(h).remote         ? H(h).remote->Read(b, uint64_t(n), H(h).position)
+        auto count = H(h).follow         ? H(h).follow->Read(H(h).follow_suffix, b, uint64_t(n), H(h).position)
+                     : H(h).remote         ? H(h).remote->Read(b, uint64_t(n), H(h).position)
                      : H(h).root.empty() ? store->Read(H(h).inode, b, uint64_t(n), H(h).position, Context(H(h)))
                                          : store->ReadRoot(H(h).root, b, uint64_t(n), H(h).position, H(h).pool);
         H(h).position += count;
         return int64_t(count);
     }
     void Write(FileHandle &h, void *b, int64_t n, idx_t p) override {
-        if (n < 0 || !h.flags.OpenForWriting() || !H(h).root.empty() || H(h).remote)
+        if (n < 0 || !h.flags.OpenForWriting() || !H(h).root.empty() || H(h).remote || H(h).follow)
             throw IOException("[differential:read_only_attachment] Invalid write or read-only root");
         ProbeEvent("pwrite", h.path, n, p);
         store->Write(H(h).inode, b, uint64_t(n), p);
@@ -329,6 +387,7 @@ class DurableFileSystem : public FileSystem {
         auto &handle = H(h);
         ProbeEvent("sync.begin", h.path);
         if (handle.inode >= 0 && h.flags.OpenForWriting()) {
+            bool checkpoint = handle.header_written;
             if (handle.header_written) {
                 // Durably publish every buffered write and seal the completed checkpoint image
                 // as the file's latest internal generation, in one authority transaction.
@@ -349,12 +408,20 @@ class DurableFileSystem : public FileSystem {
                 if (handle.maintain)
                     control->ScheduleMaintenance();
             } else
-                store->Sync();
+                store->Sync(handle.inode); // this file's group: other databases keep writing
+            // SHIP_WAL: async schedules shipping; sync returns once the state is in S3.
+            if (handle.branch_lock && !handle.shared) {
+                try {
+                    differential::AfterSync(*control, handle.branch_lock->branch.id, checkpoint);
+                } catch (const std::exception &error) {
+                    throw IOException("%s", error.what());
+                }
+            }
         }
         ProbeEvent("sync.end", h.path);
     }
     void Truncate(FileHandle &h, int64_t n) override {
-        if (n < 0 || !h.flags.OpenForWriting() || !H(h).root.empty() || H(h).remote)
+        if (n < 0 || !h.flags.OpenForWriting() || !H(h).root.empty() || H(h).remote || H(h).follow)
             throw IOException("[differential:read_only_attachment] Invalid truncate or read-only root");
         ProbeEvent("truncate", h.path, n);
         store->Truncate(H(h).inode, uint64_t(n));
@@ -364,6 +431,11 @@ class DurableFileSystem : public FileSystem {
     idx_t SeekPosition(FileHandle &h) override { return H(h).position; }
     void Reset(FileHandle &h) override { H(h).position = 0; }
     bool FileExists(const string &uri, optional_ptr<FileOpener> = nullptr) override {
+        string follow_id, follow_suffix;
+        if (Follow(uri, follow_id, follow_suffix)) {
+            auto image = differential::FindFollowImage(follow_id);
+            return image && image->Exists(follow_suffix);
+        }
         auto name = Name(uri);
         auto resolved = Resolve(uri);
         ProbeEvent("exists", uri);
@@ -382,6 +454,9 @@ class DurableFileSystem : public FileSystem {
         throw IOException("Differential does not support directory creation");
     }
     void MoveFile(const string &a, const string &b, optional_ptr<FileOpener> = nullptr) override {
+        string id, suffix;
+        if (Follow(a, id, suffix) || Follow(b, id, suffix))
+            throw IOException("[differential:read_only_attachment] A follower is read-only");
         auto source = Resolve(a);
         auto target = Resolve(b);
         if (IsRoot(a) || IsRoot(b) || source.historical || target.historical || source.remote || target.remote)
@@ -393,6 +468,9 @@ class DurableFileSystem : public FileSystem {
         store->Rename(source.managed ? source.file : Name(a), target.managed ? target.file : Name(b));
     }
     bool TryRemoveFile(const string &uri, optional_ptr<FileOpener> = nullptr) override {
+        string id, suffix;
+        if (Follow(uri, id, suffix))
+            throw IOException("[differential:read_only_attachment] A follower is read-only");
         auto name = Name(uri);
         auto resolved = Resolve(uri);
         ProbeEvent("try_remove", uri);

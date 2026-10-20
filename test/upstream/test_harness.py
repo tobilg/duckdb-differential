@@ -26,7 +26,7 @@ evidence = upstream.evidence_path('upstream-harness-' + str(time.time_ns()))
 evidence.mkdir()
 
 SCRIPT = """query I
-SELECT current_setting('secret_directory') = '__TEST_DIR__/test_secret_dir'
+SELECT current_setting('secret_directory') = '{{TEST_DIR}}/test_secret_dir'
 ----
 true
 
@@ -48,7 +48,7 @@ SELECT starts_with(path, 'diff://') FROM duckdb_databases() WHERE NOT internal
 statement ok
 CREATE TABLE initial(i INTEGER)
 
-load __TEST_DIR__/first.db
+load {{TEST_DIR}}/first.db
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE table_name='initial'
@@ -100,7 +100,7 @@ SELECT * FROM t
 
 {snapshot}
 
-load __TEST_DIR__/first.db readonly
+load {{TEST_DIR}}/first.db readonly
 
 query I
 SELECT * FROM t
@@ -112,7 +112,7 @@ INSERT INTO t VALUES (43)
 ----
 read-only
 
-load __TEST_DIR__/first.db
+load {{TEST_DIR}}/first.db
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE table_name='t'
@@ -122,7 +122,7 @@ SELECT count(*) FROM duckdb_tables() WHERE table_name='t'
 statement ok
 CREATE TABLE t(i INTEGER)
 
-load __TEST_DIR__/second.db
+load {{TEST_DIR}}/second.db
 
 statement ok
 CREATE TABLE t(i INTEGER)
@@ -149,11 +149,11 @@ with tempfile.TemporaryDirectory(prefix='upstream-bridge-test-') as tmp:
         print('PASS', mode, 'catalog identity, load reset, restart, readonly and named connections')
     for source, expected in [('mode skip\n\nstatement ok\nSELECT 42\n', 'not_executed'),
                              ('# Empty source is not execution\n', 'not_executed'),
-                             ('load __TEST_DIR__/empty.db\n\nrestart\n\nrestart\n', 'passed'),
+                             ('load {TEST_DIR}/empty.db\n\nrestart\n\nrestart\n', 'passed'),
                              ('mode skip\n\nstatement ok\nSELECT 404\n\nmode unskip\n\n'
                               'query I\nSELECT 1 WHERE false\n----\n\n', 'passed'),
                              ('query I\nSELECT 1\n----\n2\n', 'failed'),
-                             ("query I\nSELECT 1 WHERE false AND '__TEST_DIR__' IS NOT NULL\n----\n\n", 'passed')]:
+                             ("query I\nSELECT 1 WHERE false AND '{TEST_DIR}' IS NOT NULL\n----\n\n", 'passed')]:
         name = 'test/sql/result_' + expected + '.test'
         (root / name).write_text(source)
         result, log = upstream.run_test(runner, extension, bridge, name, 'differential', None, evidence)

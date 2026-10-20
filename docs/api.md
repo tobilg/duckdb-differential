@@ -8,7 +8,7 @@ For a task-oriented walkthrough, see the [usage lifecycle guide](lifecycle.md) a
 writers, [shared databases](shared-databases.md). The [SQL reference](sql-reference.md) lists
 every statement, option, setting and function with an example.
 
-Install the community extension once, load it in each session (DuckDB 1.5.6), then ATTACH:
+Install the community extension once, load it in each session (DuckDB 2.0), then ATTACH:
 
 ```sql
 INSTALL differential FROM community;
@@ -33,6 +33,9 @@ Named parameters accept both `=>` and `:=`.
 | `differential_snapshot_on_checkpoint` | `false` | Publish every completed native checkpoint of a writable branch as a public snapshot (`commit_message = 'checkpoint'`). Read when a file is opened. Unchanged images publish nothing. |
 | `differential_remote_cache_size` | `0` (off) | Size of the repository's disk cache for data read from S3, in `memory_limit` syntax (`'4GB'`, `'512MiB'`). Read when an S3 export, head or evicted snapshot is opened. See [caching](#caching-s3-reads). Global scope. |
 | `differential_s3_max_requests` | `16` | Parallel S3 requests per process (1–64), shared by all S3 locations and DuckDB instances in the process. See [parallel S3 requests](#parallel-s3-requests). |
+| `differential_group_commit` | `true` | Concurrent syncs of different databases in one process share a durable transaction (one sync); 16 MiB of new data per transaction at most. Process-wide. |
+| `differential_export_verification` | `'checksum'` | How exports verify uploads: the S3 service checks each object's SHA-256 (`x-amz-checksum-sha256`), or `'read_back'` also downloads and hashes it (for S3-compatible services that ignore checksums). Process-wide. |
+| `differential_export_staging` | `'disk'` | Where exports stage objects before upload: files under `<repository>/staging/` (with the quota below), or `'memory'`, within the same byte budget per process. Process-wide. |
 | `differential_repository_shared` | `false` | Create the repository for several local users: setgid group-writable directories (`02770`) and files (`0660`) for the repository directory's group. Only applies when the repository is created (an existing private repository refuses it); users joining a shared repository need no setting. See [deployment.md](deployment.md#sharing-a-repository-between-local-users). |
 
 LOAD, SET, binding, PREPARE and plain EXPLAIN do not initialize a repository.
@@ -58,8 +61,14 @@ ATTACH 'differential:<database>' [AS alias] [(option value, ...)]
 | `PUBLISH_ON_DETACH bool` | Shared databases, writable attachments, default `false`: when the branch's file closes (DETACH, or the database closing), wait until its final checkpoint is published. |
 | `ON_BUSY 'warn' \| 'error' \| 'ignore'` | Shared databases, writable attachments: what ATTACH does when another live writer has a "being written" marker on the branch. `'warn'` (default) prints a warning to stderr, `'error'` refuses with `writer_busy`, `'ignore'` says nothing. Advisory only: conflicts are still detected when publishing. |
 | `ON_CONFLICT 'fail' \| 'branch'` | Shared databases, writable attachments: what a snapshot does when another writer moved the branch head. `'fail'` (default) reports `branch_conflict`; `'branch'` publishes the snapshot as a branch of its own. Applies to this attachment only. |
+| `SHIP_WAL 'off' \| 'async' \| 'sync'` | Single-writer databases with an S3 data path, writable attachments: ship every published state of the branch to S3 continuously ([WAL shipping](#wal-shipping-and-followers)). `'async'` ships in the background at most every `SHIP_INTERVAL`; `'sync'` makes each commit wait until it is in S3. Stored per database in the repository: later writable attachments ship until `SHIP_WAL 'off'`. Rejected for shared databases, local data paths and read-only attachments. |
+| `SHIP_INTERVAL seconds` | With `SHIP_WAL` (0–3600, default 1): minimum time between two epochs of a branch in `async` mode; bounds S3 PUTs. Stored with `SHIP_WAL`. |
 | S3 options | `REGION`, `ENDPOINT`, `CREDENTIAL_PROFILE`, `PATH_STYLE`, `ALLOW_HTTP`, `MAX_REQUESTS`, `RETRIES`, `CONNECT_TIMEOUT_MS`, `REQUEST_TIMEOUT_MS`, `MAX_RANGE_BYTES`, `MULTIPART_THRESHOLD` (only with an `s3://` path). A matching `TYPE s3` secret usually makes them unnecessary. |
 | `SECRET 'name'` | Take unset options from a `TYPE differential` secret ([secrets](#secrets)). |
+
+Head paths (`ATTACH 'differential:s3://…/heads/<database>[/<uuid>][/<branch>]'`) also take
+`FOLLOW true` and `FOLLOW_INTERVAL seconds` (1–3600, default 10): a read-only follower that moves to
+the branch's newest state on its own ([followers](#wal-shipping-and-followers)).
 
 At most one snapshot selector may be given. `SNAPSHOT_TIME` and `READ_ONLY` resolve within
 `BRANCH`. Native options (`BLOCK_SIZE`, `STORAGE_VERSION`, …) pass through to DuckDB.
@@ -124,16 +133,19 @@ Names and allocator metadata never rewind. Snapshot names remain reserved after 
 | `differential_clone_database(database, name, snapshot =>, branch =>, export_mode =>)` | New independent database (UUID, allocator, snapshot 1) on the same data path. |
 | `differential_restore(database, snapshot_id, branch =>, export_mode =>)` | Reset a detached branch (default: the attached branch, else `main`) to a snapshot. Its current contents are first preserved as a snapshot (`preserved before restore`). Then the restored state is published (`restored to snapshot N`). |
 | `differential_drop_branch(database, branch, export_mode =>)` | Preserve the committed contents as a snapshot and tombstone a detached branch. The last active branch cannot be dropped. |
-| `differential_expire_snapshots(database, versions => [..], older_than =>, dry_run => false)` | Retire snapshots: hidden from attach, name and time lookup; existing attachments and remote exports survive. `versions` always selects; `older_than` selects non-retired snapshots published before the time. |
+| `differential_expire_snapshots(database, versions => [..], older_than =>, dry_run => false)` | Retire snapshots: hidden from attach, name and time lookup; existing attachments survive. Exported ones are recorded as expired in S3, for remote collection. `versions` always selects; `older_than` selects non-retired snapshots published before the time. |
 | `differential_evict_snapshots(database, versions =>, older_than =>, dry_run =>)` | Drop the local copy of snapshots whose S3 export completed (`older_than` only selects those). Attachments read through S3; branch/clone/restore rehydrate. |
 | `differential_claim_branch_heads(database)` | Take the database's S3 branch heads over after a copy of the repository wrote them ([branch heads](#s3-snapshot-profile)); single-writer databases only. Returns `branch_name`, `snapshot_id`, `head`. |
 | `differential_retry_export(database [, snapshot_id])` | Resume pending S3 exports: all of them, or one. Works for retired snapshots and deleted branches and allocates no snapshot ID. Also republishes all branch heads (shared databases: except diverged branches). |
 | `differential_resolve_conflict(database, keep =>, branch =>, name =>)` | Shared databases: reconcile a detached branch (default: the attached branch, else `main`) with its S3 head. Its current contents are first preserved as a snapshot (`preserved before conflict resolution`) unless its latest snapshot holds them. `keep => 'branch'` publishes that work as a new branch (`name`, default `<branch>-conflict-<snapshot>`); `keep => 'remote'` keeps it only as a local snapshot. Then the branch becomes its S3 head again. Returns `operation_id`, `branch_name`, `remote_snapshot_id`, `kept_snapshot_id`, `kept_branch`. |
 | `differential_import_database(source_path, name, data_path =>, S3 options, secret =>)` | Copy an offline, checkpoint-consistent native file into a new database. Native WAL/recovery sidecars and changing sources are rejected. |
 | `differential_recover_export('s3://…/descriptors/<sha256>', name, data_path =>, S3 options, secret =>)` | Copy and verify an exported snapshot into a new writable database. |
+| `differential_recover_branch('s3://…/heads/<database>[/<uuid>][/<branch>]', name, same_identity => false, S3 options, secret =>)` | Recover the newest shipped state of a branch ([WAL shipping](#wal-shipping-and-followers)) into a new database `name` on the same S3 location: the chain's base is imported without downloading, its epochs are applied, and DuckDB replays the WAL at the first ATTACH. `same_identity => true` keeps the database and branch identities (a failover). Returns `database_id`, `database_name`, `branch_id`, `branch_name`, `shipped_chain`, `shipped_epoch`, `uri`. |
 | `differential_cleanup_old_files(dry_run => false, cleanup_all => false, max_objects => 1000)` | One bounded collection step, or with `cleanup_all` steps until the queues are empty. A dry run counts exactly, using a read snapshot and no locks. |
 | `differential_delete_orphaned_files(dry_run => false, max_objects => 1000)` | Remove local-pool files that no mapping references (left by crashes between file write and commit). |
 | `differential_compact(max_pages => 1000)` | Incrementally return free pages of the metadata store to the file system. Roots and pins are preserved. |
+| `differential_cleanup_remote_files(location, older_than => a week ago, dry_run => false, S3 options)` | Two-phase garbage collection of an S3 location: condemn unreachable data, delete what stayed condemned and unreachable since before `older_than`. Exports never reference condemned data. |
+| `differential_cleanup_metadata(older_than =>, dry_run => false)` | Delete completed operation records and history entries of expired snapshots older than the cutoff. |
 
 Commit metadata (`author`, `message`, `extra_info`) is stored with the snapshot and part of
 request matching. System operations label their snapshots: `checkpoint`,
@@ -321,8 +333,8 @@ History and management in shared databases:
 - **Branches and restores** can start from, or return to, another writer's snapshot. Its map is
   imported, but not its data.
 - **Expiry** (`differential_expire_snapshots`) records each published snapshot as expired in S3,
-  so it is retired for every writer. A snapshot that is a branch head in S3 cannot expire. Data
-  is never deleted.
+  so it is retired for every writer. A snapshot that is a branch head in S3 cannot expire. Its data
+  is deleted only by `differential_cleanup_remote_files`, one grace period after nothing reaches it.
 - **Dropping a branch** (`differential_drop_branch`) needs its S3 head still at this repository's
   base. It then replaces the head with a tombstone, conditionally, which drops the branch for
   every writer and reader. Another repository's unchanged copy is dropped at its next ATTACH; a
@@ -346,6 +358,126 @@ no false conflict.
 
 The number of an unexported snapshot (for example with `export_mode => 'deferred'`) can still
 change when it is exported.
+
+### WAL shipping and followers
+
+Snapshots are the unit of S3 durability: without WAL shipping, losing the writer's host loses the
+commits since the latest exported snapshot. `SHIP_WAL` closes that gap for single-writer databases.
+
+```sql
+ATTACH 'differential:sales' AS sales (DATA_PATH 's3://my-bucket/lake/', SHIP_WAL 'sync');
+INSERT INTO sales.orders VALUES (1, 'shipped before the commit returns');
+SELECT branch_name, ship_wal, shipped_epoch, shipped_at, ship_pending FROM differential_branches('sales');
+```
+
+- **What is shipped.** Every publication of the branch's files (main file and WAL) is recorded in the
+  same local transaction and shipped as an epoch: WAL bytes appended since the last epoch and the
+  256 KiB main-file chunks that changed, inline. Epochs are create-only objects under
+  `dbs/<uuid>/log/<branch>/…`, chained by hash. A chain starts from an internal base export of the
+  main file after each checkpoint (and after 256 epochs or 64 MiB of epoch data).
+- **`async`** (the commit returns after its local commit): epochs follow at most every
+  `SHIP_INTERVAL` seconds, so a busy branch costs at most one PUT per interval (plus packs for a new
+  chain's base). Losing the host loses what `ship_pending` shows as not yet shipped. Failures are
+  retried in the background.
+- **`sync`**: a commit also waits for one PUT. Losing the host loses no acknowledged commit; if the
+  upload fails, the commit reports `[differential:ship_failed]` (it is durable locally).
+- **Recovery and failover.** `differential_recover_branch` rebuilds the branch on any host with
+  bucket access; with `same_identity => true` that host continues the database, turns shipping on
+  with `SHIP_WAL` and ships into a newer chain. A copy of the repository that still ships the same
+  branch then gets `head_conflict` (epochs are create-only).
+- **Remote collection** keeps each branch's newest chain and collects superseded ones.
+
+```sql
+-- another host, after losing the writer:
+SELECT database_name, shipped_epoch FROM differential_recover_branch(
+    's3://my-bucket/lake/heads/sales/main', 'sales', same_identity => true);
+ATTACH 'differential:sales' AS sales (SHIP_WAL 'sync');
+```
+
+**Followers** keep a read-only attachment current without re-attaching:
+
+```sql
+ATTACH 'differential:s3://my-bucket/lake/heads/sales/main' AS sales_live (FOLLOW true, FOLLOW_INTERVAL 10);
+SELECT count(*) FROM sales_live.orders;          -- the newest shipped commit (or exported snapshot)
+SELECT alias, follows, epoch, checked_at, error FROM differential_followers();
+```
+
+- A follower of a shipping branch follows commits (base export plus applied epochs); of any other
+  exported branch, its exported snapshots.
+- A background thread checks S3 once per interval: one request while nothing changed (a HEAD of
+  the next epoch key, or of the branch head). New states are opened in the background as hidden
+  read-only attachments, so a query never waits for S3 while binding.
+- Each transaction reads one state; the next transaction reads the newest. A state caught during a
+  checkpoint is skipped until the checkpoint completes. `AT` is not available on a follower, and
+  catalog listings (`duckdb_tables()`) describe the state at ATTACH.
+- DETACH stops the follower.
+
+#### S3 request costs
+
+The requests below are what the extension issues; the prices are Amazon S3 Standard list prices
+in `us-east-1` at the time of writing (PUT, COPY, POST and LIST: $0.005 per 1,000; GET and HEAD:
+$0.0004 per 1,000). Other regions, storage classes and S3-compatible services price differently, so
+check your provider's price list. A month is 30 days.
+
+**Requests per event**
+
+| Event | Requests |
+| --- | --- |
+| `async` epoch (any number of commits within one `SHIP_INTERVAL`) | 1 PUT (multipart above `MULTIPART_THRESHOLD`, default 16 MiB: create + one PUT per part + complete) |
+| `sync` commit | 1 PUT (concurrent commits of one branch can share an epoch) |
+| New chain (after each completed checkpoint, 256 epochs or 64 MiB) | 1 LIST and 1 HEAD to number the chain, 2 LISTs of remote-collection records, the base export (one PUT per new 8 MiB pack of changed data, one per index page, one descriptor), epoch 0 and a redirect epoch in the old chain: typically 3 LISTs, 1 HEAD and 4–6 PUTs for small changes |
+| Idle branch, shipping on | none |
+| Idle follower, per `FOLLOW_INTERVAL` | 1 HEAD (next epoch key, or the branch head for a follower of snapshots) |
+| Follower, per new epoch | 1 HEAD and 1 GET per 8 MiB (`MAX_RANGE_BYTES`) of the epoch (the check that finds no further epoch is the poll's HEAD) |
+| Follower, new chain or new snapshot | the epochs of the chain from epoch 0 (HEAD + GET each), the base descriptor and index pages; table data is read on demand like any export |
+| `differential_recover_branch` | 1 LIST, then HEAD + GET per epoch of the newest chain, the base descriptor and index pages; data on demand |
+
+**Shipping, per busy branch (commits at least every interval), per month**
+
+| Configuration | PUTs per month | Cost per month |
+| --- | ---: | ---: |
+| `async`, `SHIP_INTERVAL 0.2` | 12,960,000 | $64.80 |
+| `async`, `SHIP_INTERVAL 1` (default) | 2,592,000 | $12.96 |
+| `async`, `SHIP_INTERVAL 5` | 518,400 | $2.59 |
+| `async`, `SHIP_INTERVAL 10` | 259,200 | $1.30 |
+| `async`, `SHIP_INTERVAL 60` | 43,200 | $0.22 |
+| `sync`, 1 commit per second | 2,592,000 | $12.96 |
+| `sync`, 10 commits per second | 25,920,000 | $129.60 |
+| `sync`, 100 commits per second | 259,200,000 | $1,296.00 |
+
+Branches that are idle part of the time cost proportionally less; an idle branch costs nothing.
+`async` cost depends on the interval, not on the commit rate (1,000 commits in one interval are
+one epoch); `sync` cost grows with the commit rate. Chain starts add a few requests per checkpoint:
+1,000 checkpoints a day (roughly 16 GB of WAL with DuckDB's default 16 MiB checkpoint threshold)
+add about 3,000 LISTs and 5,000 PUTs a day, about $1.20 a month.
+
+**Followers, each, per month while the branch is idle**
+
+| `FOLLOW_INTERVAL` | HEADs per month | Cost per month |
+| --- | ---: | ---: |
+| 1 s | 2,592,000 | $1.04 |
+| 5 s | 518,400 | $0.21 |
+| 10 s (default) | 259,200 | $0.10 |
+| 60 s | 43,200 | $0.02 |
+| 300 s | 8,640 | $0.003 |
+
+While the branch is busy, each follower also reads every epoch once: one HEAD and one GET per
+epoch (for `async` at most one epoch per `SHIP_INTERVAL`). A follower of a branch that ships an epoch
+every second therefore adds about 2.6 million HEADs and 2.6 million GETs a month, about $2.07 on top
+of its polling, and 100 such followers about $207. With `FOLLOW_INTERVAL` longer than
+`SHIP_INTERVAL` a follower reads several epochs per check; the requests per epoch stay the same, so
+a longer follow interval saves only polling, not epoch reads.
+
+**Other costs**
+
+- **Storage.** A chain holds at most about 64 MiB of epochs plus its base export's new packs;
+  superseded chains are deleted by `differential_cleanup_remote_files` after its grace period
+  (default a week), so shipping adds roughly a week of chains per branch.
+- **Data transfer.** Requests from compute in the bucket's region transfer data for free on AWS;
+  followers and recovery outside the region pay egress for the epochs and data they read.
+- **Measure your own.** `differential_storage_stats()` counts requests per type (`s3_put_calls`,
+  `s3_get_calls`, `s3_head_calls`, `s3_list_calls`) and shipped epochs and bytes (`ship_epochs`,
+  `ship_epoch_bytes`); `differential_followers()` reports each follower's `polls` and `changes`.
 
 ### Caching S3 reads
 
@@ -376,6 +508,9 @@ SELECT metric, value FROM differential_storage_stats() WHERE metric LIKE 'remote
 - Rehydration and `differential_recover_export` read the caches but do not fill them.
 - The external file cache belongs to one DuckDB instance (all its connections share it); the
   disk cache is shared by every process of the repository.
+- The external file cache is filled in the background, shortly after each S3 read (a read that
+  arrives first fetches again). Reads use only cached data that is still in memory, never forcing
+  other memory out while DuckDB loads a block.
 
 **Reuse one DuckDB instance.** Open one database and share it (one connection, more
 connections from it, or a connection pool). Each new instance starts with an empty memory cache;
@@ -412,7 +547,7 @@ CREATE SECRET lake_keys (TYPE s3, KEY_ID '…', SECRET '…', REGION 'eu-central
                          SCOPE 's3://my-bucket/lake/');
 -- Your AWS environment (SSO, profiles, roles; needs the aws extension, which DuckDB autoloads);
 -- REFRESH keeps temporary credentials fresh
-CREATE SECRET lake_aws (TYPE s3, PROVIDER credential_chain, PROFILE 'analytics', REFRESH auto);
+CREATE SECRET lake_aws (TYPE s3, PROVIDER credential_chain, PROFILE 'analytics', REFRESH auto, REGION 'us-east-1');
 -- An S3-compatible service such as MinIO
 CREATE SECRET minio (TYPE s3, KEY_ID '…', SECRET '…', ENDPOINT 'localhost:9000',
                      URL_STYLE 'path', USE_SSL false, SCOPE 's3://test-bucket/');
@@ -468,9 +603,11 @@ DuckDB host reading AWS S3 from outside the bucket's region or over the internet
   so one round trip fetches many blocks instead of one.
 - Memory outside `memory_limit`: up to `MAX_RANGE_BYTES` (8 MiB) per request in flight, so
   64 requests can hold about 512 MiB.
-- Temporary disk during exports: each pack upload is staged as a file of up to 8 MiB in
-  `<repository>/staging/`. The repository allows 8 MiB per parallel request (at least 64 MiB, at
-  most 512 MiB at 64 requests); the files are deleted after each upload.
+- Temporary disk during exports (`differential_export_staging = 'disk'`, the default): each pack
+  upload is staged as a file of up to 8 MiB in `<repository>/staging/`. The repository allows
+  8 MiB per parallel request (at least 64 MiB, at most 512 MiB at 64 requests); the files are
+  deleted after each upload. With `'memory'`, uploads stream from memory and the process waits
+  for room within the same budget instead.
 
 To choose a value for your network, run `benchmarks/s3_throughput.py` against a bucket you own
 ([development](#development-and-limits)).
@@ -490,13 +627,14 @@ Branches and clones inherit the data path.
 | --- | --- |
 | `differential_snapshots(database)` | `snapshot_id`, `snapshot_time`, `snapshot_name`, `author`, `commit_message`, `commit_extra_info`, branch, capture time, root/size, retirement, local/export state, locator, `uri`, lineage |
 | `differential_current_snapshot(database)` | `id`: the attached snapshot for a snapshot alias, else the latest public snapshot of the attached branch (alias) or `main` |
-| `differential_branches(database)` | UUID/name, state, root, epoch, head snapshot, creation and lineage, canonical `uri`; shared databases: `remote_state`, `remote_snapshot_id`, `kept_branch` |
+| `differential_branches(database)` | UUID/name, state, root, epoch, head snapshot, creation and lineage, canonical `uri`; shared databases: `remote_state`, `remote_snapshot_id`, `kept_branch`; WAL shipping: `ship_wal`, `shipped_chain`, `shipped_epoch`, `shipped_at`, `ship_pending` |
 | `differential_databases()` | `database_id`, `database_name`, `data_path`, `last_snapshot_id`, `created_at`, `writers` (`single` or `shared`) |
 | `differential_providers()` | Data paths, the S3 configuration and limits (never credentials), and `credential_source`: the DuckDB secret in use, the profile, or the AWS SDK default chain |
 | `differential_operations()` | Request IDs, durable operation state and result identities |
 | `differential_retention_roots()` | Current retention reasons and root identities |
-| `differential_storage_stats()` | Lock-free counters: timings (`<name>_calls`, `_nanoseconds`, `_max_nanoseconds`), payload/manifest/page counts, GC queues, journal bytes, WAL checkpoints, SDK calls/bytes/retries, remote memory and disk cache, coalesced ranges, prefetch, packs. For S3 ATTACH: `attach_resolve` (repository, secrets, provider registration, branch-head lookup), `branch_head_resolve`, `attach_repository_open`, `s3_secret_lookup`, `s3_provider_registration`, `remote_descriptor_open` (client and descriptor GET), `s3_client_create`, `s3_credentials`, and per request `s3_dns_lookup` and `s3_connect` (DNS + TCP + TLS, new connections only) and `s3_first_byte` |
+| `differential_storage_stats()` | Lock-free counters: timings (`<name>_calls`, `_nanoseconds`, `_max_nanoseconds`, `_stddev_nanoseconds`, `_p50/_p95/_p99_nanoseconds`; per S3 operation type `s3_request_*`), WAL shipping (`ship_*`) and followers (`follow_epochs_applied`), payload/manifest/page counts, GC queues, active and retired segment bytes, WAL checkpoints, SDK calls/bytes/retries, remote memory and disk cache, coalesced ranges, prefetch, packs. For S3 ATTACH: `attach_resolve` (repository, secrets, provider registration, branch-head lookup), `branch_head_resolve`, `attach_repository_open`, `s3_secret_lookup`, `s3_provider_registration`, `remote_descriptor_open` (client and descriptor GET), `s3_client_create`, `s3_credentials`, and per request `s3_dns_lookup` and `s3_connect` (DNS + TCP + TLS, new connections only) and `s3_first_byte` |
 | `differential_remote_heads(location, S3 options, secret =>)` | Branch heads in an S3 location: `database_name`, `database_id`, `branch_name`, `branch_id`, `snapshot_id`, `snapshot_time`, `export_locator`, `head` (attachable path) |
+| `differential_followers()` | Followers of this process: `alias`, `database_name`, `branch_name`, `follows` (`commits` or `snapshots`), `follow_interval_ms`, `chain`, `epoch`, `snapshot_id`, `state_time`, `checked_at`, `polls`, `changes`, `error` |
 | `differential_writers(database)` | Shared databases: "being written" markers in S3: `branch_name`, `writer_id`, `host`, `repository_id`, `process_id`, `started_at`, `renewed_at`, `live`, `this_process` |
 | `differential_status()` | Implementation scope, durability profiles and unsupported guarantees |
 
@@ -529,10 +667,13 @@ pass-through backend (`DIFFERENTIAL_PROBE_ROOT`), diagnostic raw addressing
 `differential_probe_checkpoint`. Release builds compile none of them, and
 `differential_status()` reports `test_hooks`.
 
-Fixed v1 bounds:
-- 1 TiB logical files; a 12 KiB first chunk followed by 64 KiB chunks, stored as 64 KiB objects.
-  Manifest pages have 256 slots (the first covers 16 MiB − 52 KiB, later pages 16 MiB).
-- A 64 MiB write overlay per store and a 32 MiB local verified-chunk cache.
+Fixed bounds:
+- 1 TiB logical files; a 12 KiB first chunk followed by 256 KiB chunks (one per native block),
+  stored as 256 KiB objects; WAL sidecars stored as byte ranges. Manifest pages have 256 slots
+  (the first covers 64 MiB − 244 KiB, later pages 64 MiB).
+- Buffered writes per database are published in the background beyond 16 MiB and by the writer
+  itself beyond 64 MiB (256 MiB for all databases together); segments are retired beyond 64 MiB;
+  a 64 MiB local verified-chunk cache.
 - 8 MiB S3 packs. Remote reads are cached in DuckDB's external file cache (within
   `memory_limit`) and, when `differential_remote_cache_size` is set, in the repository disk cache.
 - Upload staging of 8 MiB per allowed parallel request (64 MiB up to 512 MiB);

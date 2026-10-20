@@ -9,6 +9,7 @@
 // binds; an approved exception to execution-only effects) and its schema is returned
 // through a read-only facade, so the binder reads the snapshot's native catalog and storage.
 #include "differential_catalog.hpp"
+#include "follow.hpp"
 #include "sql_options.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_set.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
 namespace {
@@ -29,10 +31,15 @@ class ScopedFunctionGenerator : public DefaultGenerator {
     ScopedFunctionGenerator(Catalog &catalog, SchemaCatalogEntry &schema,
                             std::shared_ptr<differential::Repository> repository)
         : DefaultGenerator(catalog), schema(schema), repository(std::move(repository)) {}
-    unique_ptr<CatalogEntry> CreateDefaultEntry(CatalogTransaction, const string &name) override {
-        return CreateScopedFunction(repository, catalog, schema, name);
+    unique_ptr<CatalogEntry> CreateDefaultEntry(CatalogTransaction, const Identifier &name) override {
+        return CreateScopedFunction(repository, catalog, schema, name.GetIdentifierName());
     }
-    vector<string> GetDefaultEntries() override { return ScopedFunctionNames(); }
+    vector<Identifier> GetDefaultEntries() override {
+        vector<Identifier> names;
+        for (auto &name : ScopedFunctionNames())
+            names.emplace_back(name);
+        return names;
+    }
 
   private:
     SchemaCatalogEntry &schema;
@@ -91,7 +98,7 @@ class SnapshotSchemaEntry : public SchemaCatalogEntry {
         return snapshot.GetCatalogTransaction(transaction.GetContext());
     }
     static EntryLookupInfo Plain(const EntryLookupInfo &lookup) {
-        return EntryLookupInfo(lookup.GetCatalogType(), lookup.GetEntryName(), lookup.GetErrorContext());
+        return EntryLookupInfo(lookup.GetCatalogType(), QualifiedName(lookup.GetEntryIdentifier()), lookup.GetErrorContext());
     }
     Catalog &snapshot;
     SchemaCatalogEntry &inner;
@@ -110,7 +117,7 @@ void DifferentialCatalog::FinalizeLoad(optional_ptr<ClientContext> context) {
     if (remote || time_travel_snapshot)
         return;
     auto system = CatalogTransaction::GetSystemTransaction(GetDatabase());
-    auto schema = DuckCatalog::LookupSchema(system, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, DEFAULT_SCHEMA),
+    auto schema = DuckCatalog::LookupSchema(system, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier::DefaultSchema())),
                                             OnEntryNotFound::RETURN_NULL);
     if (!schema)
         return;
@@ -123,6 +130,15 @@ optional_ptr<SchemaCatalogEntry> DifferentialCatalog::LookupSchema(CatalogTransa
                                                                    const EntryLookupInfo &schema_lookup,
                                                                    OnEntryNotFound if_not_found) {
     auto at = schema_lookup.GetAtClause();
+    if (follower && !time_travel_snapshot && transaction.HasContext()) {
+        if (at)
+            throw BinderException("AT (...) is not available on a follower (FOLLOW true): it reads the newest state");
+        auto &context = transaction.GetContext();
+        if (auto state = follower->Choose(context))
+            return state->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup.GetEntryIdentifier(),
+                                                                                  if_not_found);
+        return DuckCatalog::LookupSchema(transaction, schema_lookup, if_not_found);
+    }
     if (!at || time_travel_snapshot)
         return DuckCatalog::LookupSchema(transaction, schema_lookup, if_not_found);
     auto &context = transaction.GetContext();
@@ -134,7 +150,7 @@ optional_ptr<SchemaCatalogEntry> DifferentialCatalog::LookupSchema(CatalogTransa
         auto database = resolved.historical ? resolved.snapshot.database : resolved.branch.database;
         // Shared databases: other writers' snapshots resolve from the cached S3 commit records (refreshed
         // by ATTACH and differential_snapshots, never while binding).
-        auto unit = StringUtil::Upper(at->Unit());
+        auto unit = StringUtil::Upper(at->Unit().GetIdentifierName());
         int64_t id;
         if (unit == "VERSION")
             id = BigIntValue::Get(at->GetValue().DefaultCastAs(LogicalType::BIGINT));
@@ -152,56 +168,84 @@ optional_ptr<SchemaCatalogEntry> DifferentialCatalog::LookupSchema(CatalogTransa
     } catch (const std::exception &error) {
         throw BinderException(error.what());
     }
-    // Open (or reuse) the hidden attachment; evict the least recently used beyond capacity.
+    // Open (or reuse) the hidden attachment. Opening an evicted snapshot reads its export from S3, so it
+    // happens outside the cache lock, under a lock of its own name only.
     auto name = "__differential_" + snapshot.database + "_" + std::to_string(snapshot.id);
-    shared_ptr<AttachedDatabase> attached;
+    auto &manager = DatabaseManager::Get(context);
+    std::shared_ptr<std::mutex> opening;
     {
         std::lock_guard<std::mutex> guard(cache->mutex);
-        auto &manager = DatabaseManager::Get(context);
-        attached = manager.GetDatabase(name);
-        if (!attached) {
-            AttachInfo info;
-            info.name = name;
-            info.path = snapshot.URI();
-            info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-            info.options["type"] = Value("differential");
-            info.options[TIME_TRAVEL_OPTION] = Value::BOOLEAN(true);
-            AttachOptions options(info.options, AccessMode::READ_ONLY);
-            options.visibility = AttachVisibility::HIDDEN;
-            attached = manager.AttachDatabase(context, info, options);
-            if (!attached)
-                attached = manager.GetDatabase(name);
-            if (!attached)
-                throw BinderException("Could not open snapshot %d for AT", snapshot.id);
-        }
-        cache->recent.remove(name);
-        cache->recent.push_front(name);
-        while (cache->recent.size() > TimeTravelCache::CAPACITY) {
-            auto victim = cache->recent.back();
-            cache->recent.pop_back();
-            manager.DetachDatabase(context, victim, OnEntryNotFound::RETURN_NULL);
-        }
+        auto &entry = cache->opening[name];
+        if (!entry)
+            entry = std::make_shared<std::mutex>();
+        opening = entry;
     }
+    std::unique_lock<std::mutex> open_lock(*opening);
+    // A transaction that already reads this snapshot keeps its attachment, even after another
+    // connection evicted it: one name must name one database within a transaction.
+    auto attached = MetaTransaction::Get(context).GetReferencedDatabaseOwning(Identifier(name));
+    bool listed = !attached || manager.GetDatabase(Identifier(name)) == attached; // an evicted one is not cached again
+    if (!attached)
+        attached = manager.GetDatabase(Identifier(name));
+    if (!attached) {
+        AttachInfo info;
+        info.name = Identifier(name);
+        info.path = snapshot.URI();
+        info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+        info.options["type"] = Value("differential");
+        info.options[TIME_TRAVEL_OPTION] = Value::BOOLEAN(true);
+        AttachOptions options(info.options, AccessMode::READ_ONLY);
+        options.visibility = AttachVisibility::HIDDEN;
+        attached = manager.AttachDatabase(context, info, options);
+        if (!attached)
+            attached = manager.GetDatabase(Identifier(name));
+        if (!attached)
+            throw BinderException("Could not open snapshot %d for AT", snapshot.id);
+    }
+    open_lock.unlock();
+    // Evict the least recently used beyond capacity. Detaching only unlists an attachment: queries
+    // that use it keep it (and its reader pin) until they finish, and a later lookup reopens it.
+    vector<string> victims;
+    {
+        std::lock_guard<std::mutex> guard(cache->mutex);
+        if (listed) {
+            cache->recent.remove(name);
+            cache->recent.push_front(name);
+        }
+        while (cache->recent.size() > TimeTravelCache::CAPACITY) {
+            victims.push_back(cache->recent.back());
+            cache->recent.pop_back();
+        }
+        // Names neither recent nor being opened need no lock entry.
+        for (auto it = cache->opening.begin(); it != cache->opening.end();)
+            if (it->second.use_count() == 1 &&
+                std::find(cache->recent.begin(), cache->recent.end(), it->first) == cache->recent.end())
+                it = cache->opening.erase(it);
+            else
+                ++it;
+    }
+    for (auto &victim : victims)
+        manager.DetachDatabase(context, Identifier(victim), OnEntryNotFound::RETURN_NULL);
     {
         std::lock_guard<std::mutex> guard(mutex);
         hidden.insert(name);
     }
-    return attached->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup.GetEntryName(),
+    return attached->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup.GetEntryIdentifier(),
                                                                              if_not_found);
 }
 
-optional_ptr<SchemaCatalogEntry> DifferentialCatalog::SnapshotSchema(ClientContext &context, const string &schema,
+optional_ptr<SchemaCatalogEntry> DifferentialCatalog::SnapshotSchema(ClientContext &context, const Identifier &schema,
                                                                      OnEntryNotFound if_not_found) {
     // Starting this catalog's transaction also keeps the attachment alive for the query.
     auto own = GetCatalogTransaction(context);
-    auto inner = DuckCatalog::LookupSchema(own, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, schema), if_not_found);
+    auto inner = DuckCatalog::LookupSchema(own, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(schema)), if_not_found);
     if (!inner)
         return nullptr;
     std::lock_guard<std::mutex> guard(mutex);
-    auto &facade = facades[inner->name];
+    auto &facade = facades[inner->name.GetIdentifierName()];
     if (!facade) {
         CreateSchemaInfo info;
-        info.schema = inner->name;
+        info.SetQualifiedName(QualifiedName({inner->name}, Identifier()));
         facade = make_uniq<SnapshotSchemaEntry>(*this, *inner, info);
     }
     return facade.get();
@@ -209,6 +253,8 @@ optional_ptr<SchemaCatalogEntry> DifferentialCatalog::SnapshotSchema(ClientConte
 
 // Detaching a database also releases the snapshots its AT clauses opened (and their pins).
 void DifferentialCatalog::OnDetach(ClientContext &context) {
+    if (follower)
+        follower->Stop(context);
     std::set<string> names;
     {
         std::lock_guard<std::mutex> guard(mutex);
@@ -218,7 +264,7 @@ void DifferentialCatalog::OnDetach(ClientContext &context) {
         std::lock_guard<std::mutex> guard(cache->mutex);
         for (auto &name : names) {
             cache->recent.remove(name);
-            DatabaseManager::Get(context).DetachDatabase(context, name, OnEntryNotFound::RETURN_NULL);
+            DatabaseManager::Get(context).DetachDatabase(context, Identifier(name), OnEntryNotFound::RETURN_NULL);
         }
     }
     DuckCatalog::OnDetach(context);

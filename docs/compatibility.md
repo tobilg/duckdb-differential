@@ -2,13 +2,13 @@
 
 | Component | Identity and observed result |
 | --- | --- |
-| DuckDB | v1.5.6 (`069cc9f9b5`), the community repository's current stable; built from the `duckdb/` submodule |
-| Build | DuckDB C++ extension template with `extension-ci-tools` (`v1.5-variegata`), `EXTENSION_STATIC_BUILD=1` |
+| DuckDB | v2.0.0 as the community repository builds it before the tag: untagged commit `d54cbbe3df`; built from the `duckdb/` submodule. 1.5.6 is no longer built |
+| Build | DuckDB C++ extension template with `extension-ci-tools` (`v2.0-cyanoptera`), `EXTENSION_STATIC_BUILD=1`; `OVERRIDE_GIT_DESCRIBE` names the untagged pre-release |
 | Dependencies | vcpkg `cd61e1e26a03`: AWS SDK for C++ 1.11.820 (`s3`), SQLite 3.53.2, OpenSSL 3.6.3, statically linked; the artifact exports only `differential_duckdb_cpp_init` |
-| macOS arm64 | macOS 26.7, Apple clang 21, CMake 4.1.2, Ninja. `make release`, `make test` (SQL logic tests), `make integration`, `make test_integration`, `make test_minio`: all pass |
-| macOS amd64 | Built by CI only (`osx_amd64`); not run locally |
-| Linux amd64 | Integration build, 6 C++ tests and 27 local integration suites passed in [CI run 38291321428](https://github.com/tobilg/duckdb-differential/actions/runs/38291321428/job/114951862323) (Ubuntu 24.04); MinIO image pull failed before S3 tests, which remain unverified on Linux |
-| Linux arm64 | Not yet verified. All non-AWS sources pass a syntax-only g++ 13 compile (Ubuntu 24.04) against DuckDB 1.5.6 headers |
+| macOS arm64 | DuckDB 1.5.6 only: macOS 26.7, Apple clang 21, CMake 4.1.2, Ninja; `make release`, `make test`, `make integration`, `make test_integration`, `make test_minio` passed. Not yet rerun on DuckDB 2.0 |
+| macOS amd64 | DuckDB 2.0 at `d54cbbe3df` (2026-10-21): macOS 15.8.1, Apple clang 17, CMake 4.4.4, Ninja. `make release`, `make test` (8 SQL test files), `make integration`, `make test_integration` (7 C++ tests, 28 suites), the MinIO suites (`test_minio`), `make test_upstream_harness`, and the upstream SQLLogicTests added or changed since the previous pin (510 files) with their exclusions audited: all pass. The full upstream comparison and exclusion audit last ran at the previous pre-release commit `b15358c371` |
+| Linux amd64 | DuckDB 1.5.6 only: integration build, 6 C++ tests and 27 local integration suites passed in [CI run 38291321428](https://github.com/tobilg/duckdb-differential/actions/runs/38291321428/job/114951862323) (Ubuntu 24.04); MinIO image pull failed before S3 tests, which remain unverified on Linux |
+| Linux arm64 | Not yet verified; on DuckDB 1.5.6 all non-AWS sources passed a syntax-only g++ 13 compile (Ubuntu 24.04) |
 | Windows, wasm | Not supported (POSIX file locking, `fsync`, `mmap`); excluded from all builds |
 | Official DuckDB extensions in the same process | `aws`, `httpfs` and `sqlite` (each bundling its own SDK/OpenSSL/SQLite) loaded before and after `differential`; S3 used through both SDK copies (`coexistence.py`, macOS arm64) |
 | MinIO | RELEASE.2025-10-15T17-29-55Z, upstream source built by [coollabsio/minio](https://github.com/coollabsio/minio), image `ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9` (linux/amd64 and linux/arm64). Anonymous manifest lookup, pull and full `make test_minio` pass (macOS arm64, 2026-10-13; 105 PASS lines); hosted CI with this image remains unrun |
@@ -28,23 +28,23 @@ extension linked in. `make integration` produces the test build: hooks compiled 
 CLI and `libduckdb` without Differential linked in, the C++ unit tests, the upstream SQLLogicTest runner and the SDK probe. Community
 builds are signed by DuckDB; local builds are unsigned and need `-unsigned`.
 
-**Durability by platform.** At every native sync, publication is one SQLite transaction with
-`synchronous=FULL`. On macOS SQLite's `fullfsync` and the store's directory syncs use
-`F_FULLFSYNC`, which also flushes the device's write cache (stronger than stock DuckDB on macOS,
-which uses `fsync`). On Linux the same points use `fsync`/`fdatasync`, matching native DuckDB on
-Linux; whether the device cache is flushed then depends on the filesystem and device (write
-barriers). Power-loss behaviour is untested on both.
+**Durability by platform.** At every native sync, publication syncs the file group's segment and
+then commits one SQLite transaction with `synchronous=FULL`. On every OS, macOS included, SQLite and the store's own syncs use
+`fsync`/`fdatasync`, matching native DuckDB (no `F_FULLFSYNC` on macOS, which native DuckDB does
+not use either). Whether the device's write cache is flushed then depends on the filesystem and
+device (on macOS, `fsync` does not flush it). Power-loss behaviour is untested.
 
-There is exactly one local store format (1: header-aligned chunks, paged manifests, write journal, durable inode
-allocator, collection queues), one control format (1) and one export format
-(`differential-export-v1`, packs and `DIX1` indexes). Repositories and exports in any other
+There is exactly one local store format (2: 256 KiB block-aligned chunks, log-file byte ranges,
+paged manifests, append-only segments holding the write journal and payload, CRC32C-verified local
+reads, durable inode allocator, collection queues), one control format (1) and one export format
+(`differential-export-v2`, packs of 256 KiB chunks and `DIX2` indexes). Repositories and exports in any other
 format are refused with `incompatible_format`; there are no migrations (`write_path.py` checks
 the refusal). Descriptors record the writing DuckDB version; readers accept any version line,
 and DuckDB decides at attach time whether it can open the native file (`s3_tiering.py` attaches
 and recovers an export labelled `duckdb-v9.9.9`). Compaction is described in
 [architecture.md](architecture.md).
 
-Native SQL has upstream 1.5.6 semantics and limitations. External files, credentials,
+Native SQL has upstream DuckDB 2.0 semantics and limitations. External files, credentials,
 native extension binaries and session state are not included in snapshots. Explicitly
 qualified catalog references are not rewritten for clones. Cross-database writes retain
 upstream transaction limitations. Disk-full tests inject SQLite's FULL result; physical

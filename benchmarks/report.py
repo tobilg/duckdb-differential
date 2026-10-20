@@ -12,6 +12,8 @@ def load(name):
 local, lifecycle, operations, s3 = [load(name) for name in ('local', 'lifecycle', 'operations', 's3')]
 lines = [
     '# Benchmark observations', '',
+    'Gigabyte-scale runs (concurrent commits, bulk load, cold scans, S3 export settings, remote',
+    'garbage collection, shared history) are in [benchmarks-scale.md](benchmarks-scale.md).', '',
     'Measured on macOS 26.7 arm64 with stock DuckDB 1.5.6 and a release build without',
     'test hooks. These are development measurements, not release performance promises.',
     'Native sync points remain durability boundaries: every native FileSync commits the',

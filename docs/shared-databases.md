@@ -46,7 +46,7 @@ What it does not do:
 INSTALL differential FROM community;
 LOAD differential;
 SET differential_repository = '/absolute/repository';   -- one repository per host
-CREATE SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto, SCOPE 's3://my-bucket/lake/');
+CREATE SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto, REGION 'us-east-1', SCOPE 's3://my-bucket/lake/');
 ```
 
 Each host needs read and write access to the prefix. Credentials come from a `TYPE s3` secret
@@ -319,9 +319,14 @@ SELECT snapshot_id FROM differential_expire_snapshots('team', versions => [1]);
 SELECT deleted_objects FROM differential_cleanup_old_files(cleanup_all => true);
 ```
 
-- Expiring a snapshot retires it for every host (it is recorded in S3). A snapshot that is the head
+- Expiring a snapshot retires it for every host (it is recorded in S3). Hosts read new snapshots
+  and expiries incrementally; `differential_snapshots('team', refresh => 'full')` re-reads the whole
+  history (done automatically at most once a day). A snapshot that is the head
   of a branch cannot expire.
-- S3 data is never deleted by the extension, not even of expired snapshots or dropped branches.
-  Remove a whole location only when no host uses it any more.
+- S3 data of expired snapshots and dropped branches is deleted only by
+  `differential_cleanup_remote_files`, run by any host: it condemns unreachable data first and
+  deletes it a grace period later (default a week). A host whose branch reads its base snapshot
+  from S3 copies condemned data locally when it next attaches or publishes, so keep the grace
+  period longer than any host stays offline with unpublished work.
 - `differential_cleanup_old_files` and `differential_compact` maintain each host's repository as
   for any database. Data of another host's snapshots is not stored locally in the first place.

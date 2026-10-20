@@ -1,6 +1,6 @@
 # duckdb-differential
 
-An experimental C++ extension for **stock DuckDB 1.5.6** that adds versioning to ordinary
+An experimental C++ extension for **stock DuckDB 2.0** that adds versioning to ordinary
 DuckDB databases: snapshots, time travel, branches, clones, restore and S3 export. Native
 catalogs, SQL, transactions, indexes and compression run unchanged over a durable
 differential filesystem that shares unchanged data between all versions. The SQL surface
@@ -36,9 +36,9 @@ other platforms are untested.
 | [Deployment](docs/deployment.md) | Processes, users and hosts; local storage vs S3; branch heads |
 | [Concurrency and multitenancy](docs/concurrency-and-multitenancy.md) | What runs concurrently, guarded heads, shared databases, tenant isolation |
 | [Durability and recovery](docs/durability-and-recovery.md) | The durable write path and the evidence for crash recovery |
-| [Storage formats](docs/storage-format.md) | Repository layout, metadata schema, hashes, journal, S3 layout and formats |
+| [Storage formats](docs/storage-format.md) | Repository layout, metadata schema, hashes, segments, S3 layout and formats |
 | [Architecture](docs/architecture.md) | How the extension sits below DuckDB's native storage |
-| [Compatibility](docs/compatibility.md) · [Benchmarks](docs/benchmarks.md) · [Feasibility evidence](docs/feasibility.md) | Verified DuckDB build, dependencies and platforms; measurements; evidence that stock DuckDB supports the design |
+| [Compatibility](docs/compatibility.md) · [Benchmarks](docs/benchmarks.md) ([TPC-H](docs/benchmarks-tpch.md)) | Verified DuckDB build, dependencies and platforms; measurements |
 | [Changelog](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) | |
 
 ## Contents
@@ -52,7 +52,7 @@ other platforms are untested.
 
 ## Installation
 
-`differential` targets DuckDB 1.5.6 and is prepared for community publication. Until it is
+`differential` targets DuckDB 2.0 and is prepared for community publication. Until it is
 published, [build and load it locally](#build). The planned community installation is:
 
 ```sql
@@ -79,6 +79,9 @@ The full reference is [docs/api.md](docs/api.md).
 | `differential_snapshot_on_checkpoint` | `false` | Publish every changed checkpoint as a snapshot. |
 | `differential_repository_shared` | `false` | Create the repository for several local users (group-writable). Only applies when the repository is created. |
 | `differential_s3_max_requests` | `16` | Parallel S3 requests per process (1–64). Measure your link with `benchmarks/s3_throughput.py`. |
+| `differential_group_commit` | `true` | Concurrent commits of different databases share one durable transaction and sync. |
+| `differential_export_verification` | `'checksum'` | `'read_back'` also downloads and hashes every uploaded object (for S3-compatible services that ignore upload checksums). |
+| `differential_export_staging` | `'disk'` | `'memory'` uploads without staging files on disk. |
 | `differential_remote_cache_size` | `0` (off) | Keep data read from S3 in a disk cache in the repository, up to this size (e.g. `'4GB'`). |
 
 ### ATTACH
@@ -164,11 +167,11 @@ Every mutation accepts `request_id => '…'`, making it safely retryable.
 
 | Purpose | Functions |
 | --- | --- |
-| Inspect | `differential_snapshots(db)`, `differential_current_snapshot(db)`, `differential_branches(db)`, `differential_databases()`, `differential_operations()`, `differential_providers()`, `differential_retention_roots()`, `differential_storage_stats()`, `differential_status()`, `differential_writers(db)` |
+| Inspect | `differential_snapshots(db)`, `differential_current_snapshot(db)`, `differential_branches(db)`, `differential_databases()`, `differential_operations()`, `differential_providers()`, `differential_retention_roots()`, `differential_storage_stats()`, `differential_status()`, `differential_writers(db)`, `differential_followers()` |
 | Snapshot | `differential_create_snapshot(db, name =>, author =>, message =>, extra_info =>, export_mode =>)` |
 | Fork | `differential_create_branch(db, name, snapshot =>, branch =>)`, `differential_clone_database(db, name, snapshot =>, branch =>)` |
 | Restore and delete | `differential_restore(db, snapshot_id, branch =>)`, `differential_drop_branch(db, branch)`, `differential_expire_snapshots(db, versions =>, older_than =>, dry_run =>)` |
-| Import and recover | `differential_import_database(path, name, data_path =>)`, `differential_recover_export('s3://…/descriptors/<sha256>', name)` |
+| Import and recover | `differential_import_database(path, name, data_path =>)`, `differential_recover_export('s3://…/descriptors/<sha256>', name)`, `differential_recover_branch('s3://…/heads/<db>/<branch>', name, same_identity =>)` |
 | S3 | `differential_retry_export(db [, snapshot_id])` (also republishes branch heads), `differential_evict_snapshots(db, versions =>, older_than =>, dry_run =>)`, `differential_remote_heads('s3://bucket/prefix/')`, `differential_claim_branch_heads(db)` |
 | Shared databases | `differential_resolve_conflict(db, keep => 'branch' \| 'remote', branch =>, name =>)`, `differential_writers(db)` |
 | Maintenance | `differential_cleanup_old_files(dry_run =>, cleanup_all =>, max_objects =>)`, `differential_delete_orphaned_files(dry_run =>)`, `differential_compact(max_pages =>)` |
@@ -212,21 +215,28 @@ strategies and failure handling, are walked through in [shared databases](docs/s
   serves a single client, SQLite serves "multiple local clients". Several DuckDB processes can
   share one repository: writers on different branches, readers and maintenance.
   See [why SQLite for metadata](docs/architecture.md#why-sqlite-for-metadata).
-- **Writes.** Native writes are buffered and journaled, then published at native sync points.
-  Acknowledged commits are durable with a full device flush, which is stronger
-  than stock DuckDB on macOS. Completed but unsynced writes survive process death and, like
+- **Writes.** Native writes are buffered and appended to segment files, then published at native
+  sync points (WAL appends store only their bytes; native blocks are stored once, where written).
+  Acknowledged commits are durable at `fsync`, as with native DuckDB on every OS. Completed but unsynced writes survive process death and, like
   native writes, may be lost on power loss.
-- **Snapshots** are immutable and share unchanged 64 KiB chunks with every other version.
+- **Snapshots** are immutable and share unchanged 256 KiB chunks (native blocks) with every other version.
   Branches and clones copy maps, not data.
 - **S3 profile.** Commits stay locally durable. A snapshot is remotely durable once its export
   completes; failed or deferred exports keep their local data for retry.
-  - Exports are retained indefinitely. This is not distributed garbage collection.
+  - Exports are retained until their snapshots expire and `differential_cleanup_remote_files`
+    collects them: two phases, with a grace period, safe against concurrent exports.
   - A completed export's local copy can be collected after expiry, or evicted explicitly.
     Reads then go through S3, and branch or restore download it again.
-- **Formats.** The repository layout, metadata schema, hashing, journal, local pools and S3 layout
-  (packs, `DIX1` index pages, descriptors) are specified in [docs/storage-format.md](docs/storage-format.md).
+  - **WAL shipping** (opt-in, `SHIP_WAL 'async' | 'sync'`): every commit is shipped to S3 as well, so
+    another host recovers the branch with `differential_recover_branch` (in `sync` mode without losing
+    an acknowledged commit).
+  - **Followers** (`FOLLOW true` on a head path) stay current on their own: every shipped commit, or
+    every exported snapshot.
+- **Formats.** The repository layout, metadata schema, hashing, segments, local pools and S3 layout
+  (packs, `DIX2` index pages, descriptors, shipping epochs) are specified in [docs/storage-format.md](docs/storage-format.md).
 - **Topology.** One metadata store per repository and one writer process per branch.
-  There is no multi-host writer failover. Readers refresh by attaching a newer snapshot.
+  Failover of a single writer is a recovery of its shipped WAL (`same_identity => true`); readers
+  refresh by attaching a newer snapshot or follow the branch.
   Shared databases (`WRITERS 'shared'`) are written by several repositories through S3, with
   optimistic branch-head updates.
 
@@ -253,7 +263,7 @@ heads are guarded, and how to isolate tenants is in
 The sections below cover building, loading and verifying the extension before publication.
 
 The repository follows DuckDB's C++ [extension template](https://github.com/duckdb/extension-template):
-DuckDB (`duckdb/`, v1.5.6) and `extension-ci-tools/` are submodules, and CI uses the same
+DuckDB (`duckdb/`, v2.0.0) and `extension-ci-tools/` are submodules, and CI uses the same
 `extension-ci-tools` distribution pipeline as the community repository. Dependencies come from
 vcpkg at a pinned commit (`VCPKG_COMMIT` in the `Makefile`): AWS SDK for C++ 1.11.820 (S3
 only), SQLite 3.53.2 and OpenSSL 3.6.3, statically linked into the extension; their licenses
@@ -272,7 +282,7 @@ make test                        # SQL logic tests in test/sql (what community C
 ```
 
 The release loadable is `build/release/extension/differential/differential.duckdb_extension`.
-A locally built extension is unsigned: start DuckDB 1.5.6 with `-unsigned` and load it by path
+A locally built extension is unsigned: start DuckDB 2.0 with `-unsigned` and load it by path
 instead of `LOAD differential;`.
 
 See [upstream testing](docs/upstream-testing.md) for the full upstream SQLLogicTest inventory,

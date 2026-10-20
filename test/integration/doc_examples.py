@@ -23,7 +23,7 @@ endpoint, base = sys.argv[1:]
 base = Path(base) / 'doc-examples'
 base.mkdir()
 extensions = base / 'extensions'
-SECRET = (f"SET extension_directory='{extensions}'; LOAD httpfs; CREATE SECRET docs_minio (TYPE s3, KEY_ID "
+SECRET = (f"SET extension_directories=['{extensions}']; LOAD httpfs; CREATE SECRET docs_minio (TYPE s3, KEY_ID "
           f"'{os.environ['AWS_ACCESS_KEY_ID']}', SECRET '{os.environ['AWS_SECRET_ACCESS_KEY']}', ENDPOINT "
           f"'{urlparse(endpoint).netloc}', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1', "
           "SCOPE 's3://differential-sdk-test/');")
@@ -37,7 +37,7 @@ def session(repository, sql):
 
 
 setup = subprocess.run([DUCKDB_CLI, '-init', '/dev/null', '-batch', '-bail'],
-                       input=f"SET extension_directory='{extensions}'; INSTALL httpfs;", text=True,
+                       input=f"SET extension_directories=['{extensions}']; INSTALL httpfs;", text=True,
                        capture_output=True, timeout=300)
 assert setup.returncode == 0, setup.stderr
 for document in ('docs/sql-reference.md', 'docs/shared-databases.md'):

@@ -5,7 +5,7 @@
 require differential
 
 statement ok
-SET differential_repository = '__TEST_DIR__/differential_time_travel'
+SET differential_repository = '{TEST_DIR}/differential_time_travel'
 
 statement ok
 ATTACH 'differential:sales' AS sales

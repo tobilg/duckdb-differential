@@ -89,17 +89,23 @@ assert rows[-1] == [{'bounded': True}], rows[-1]
 passed('the memory layer stays within memory_limit; scans larger than memory stay correct')
 
 # Read-ahead follows each scanning thread's sequential stream, requests every chunk at most once,
-# and stays off when nothing would keep its data.
+# and stays off when nothing would keep its data. DuckDB 2.0 reads remote storage ahead itself
+# (read_ahead_depth): its larger, earlier reads leave ours little to do, so ours is checked with
+# DuckDB's off, and the default with both for the total requests.
 READAHEAD = ("SELECT metric, value FROM differential_storage_stats() WHERE metric IN ('remote_prefetched_chunks', "
              "'remote_cache_hits', 'remote_logical_read_bytes', 's3_get_calls');")
 for threads in (1, 4):
-    rows = run(f'readahead-{threads}', f"SET threads = {threads};" + EXPORT + CHECK + READAHEAD)
-    scan_ok(rows[-2])
-    m = stats(rows[-1])
-    chunks = m['remote_logical_read_bytes'] // 65536 + 1
-    assert m['remote_prefetched_chunks'] > chunks // 2, (threads, m)       # the scan is mostly read ahead
-    assert m['remote_prefetched_chunks'] <= chunks + 64, (threads, m)      # ... and nothing twice
-    assert m['remote_cache_hits'] <= 2 * chunks and m['s3_get_calls'] < chunks // 4, (threads, m)
+    for native in (False, True):
+        setup = f"SET threads = {threads};" + ("" if native else "SET read_ahead_depth = 0;")
+        rows = run(f'readahead-{threads}-{native}', setup + EXPORT + CHECK + READAHEAD)
+        scan_ok(rows[-2])
+        m = stats(rows[-1])
+        chunks = m['remote_logical_read_bytes'] // 262144 + 1
+        if not native:
+            assert m['remote_prefetched_chunks'] > chunks // 2, (threads, m)   # the scan is mostly read ahead
+        assert m['remote_prefetched_chunks'] <= chunks + 16, (threads, m)      # ... and nothing twice
+        # At most one GET per 256 KiB chunk read (ranges are coalesced up to 1 MiB, read-ahead to 4 MiB).
+        assert m['remote_cache_hits'] <= 2 * chunks and m['s3_get_calls'] < chunks, (threads, native, m)
 rows = run('readahead-off', "SET enable_external_file_cache = false;" + EXPORT + CHECK + READAHEAD)
 scan_ok(rows[-2])
 assert stats(rows[-1])['remote_prefetched_chunks'] == 0, rows[-1]

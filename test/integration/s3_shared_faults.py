@@ -195,12 +195,16 @@ passed('process death between the local drop and the tombstone: repeating the dr
 old = run('w', "SELECT min(snapshot_id) AS n FROM differential_snapshots('team');")[-1][0]['n']
 run('w', f"CALL differential_expire_snapshots('team', versions => [{old}]);", expected=CRASH,
     DIFFERENTIAL_SHARED_CRASH='expiry_recorded')
-rows = run('o', f"SELECT retired FROM differential_snapshots('team') WHERE snapshot_id = {old};")
+# The record is in S3 but its expiry log entry is not: a full listing finds it.
+rows = run('o', f"SELECT retired FROM differential_snapshots('team', refresh => 'full') WHERE snapshot_id = {old};")
 assert rows[-1] == [{'retired': True}], rows  # recorded in S3 before the local step
 run('w', f"CALL differential_expire_snapshots('team', versions => [{old}]);")
 rows = run('w', f"SELECT retired FROM differential_snapshots('team') WHERE snapshot_id = {old};")
 assert rows[-1] == [{'retired': True}], rows
-passed('process death after the expiry record: other hosts already see it; repeating the expiry finishes it')
+rows = run('c', f"SELECT retired FROM differential_snapshots('team') WHERE snapshot_id = {old};")
+assert rows[-1] == [{'retired': True}], rows  # the repeat wrote the log entry
+passed('process death after the expiry record: a full listing finds it; repeating the expiry finishes it '
+       '(also in the expiry log)')
 
 run('w', TEAM + "UPDATE team.t SET v = 'w-diverged' WHERE id = 2;")
 run('c', TEAM + "UPDATE team.t SET v = 'c-wins' WHERE id = 2; CALL differential_create_snapshot('team');")

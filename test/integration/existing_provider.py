@@ -43,7 +43,9 @@ env = dict(os.environ, DIFFERENTIAL_TEST_EXISTING_BUCKET=args.bucket,
            DIFFERENTIAL_TEST_ALLOW_HTTP=str(int(args.allow_http)))
 with tempfile.TemporaryDirectory(prefix='differential-existing-provider-') as tmp:
     result = subprocess.run([str(TEST_BINARIES / 's3_test'), args.endpoint, tmp], env=env,
-                            check=True, text=True, capture_output=True, timeout=180)
+                            text=True, capture_output=True, timeout=180)
+    if result.returncode:
+        raise RuntimeError(f's3_test failed ({result.returncode}): {result.stdout}{result.stderr}')
     print(result.stdout, end='')
     command = [sys.executable, str(ROOT / 'examples/s3.py'), '--bucket', args.bucket,
                '--prefix', prefix+'exports/', '--region', args.region,

@@ -41,6 +41,9 @@ class Relay(BaseHTTPRequestHandler):
                     break
             body=b''.join(parts)
         else:body=self.rfile.read(int(self.headers.get('Content-Length','0')))
+        if Relay.mode.startswith('corrupt-upload') and self.command=='PUT' and '/packs/' in self.path and body:
+            # One flipped payload byte: the service must reject the body against its SHA-256 checksum.
+            Relay.triggered+=1;middle=len(body)//2;body=body[:middle]+bytes([body[middle]^1])+body[middle+1:]
 
         denied=(Relay.mode=='payload-denied' and self.command=='PUT' and '/packs/' in self.path) or (Relay.mode=='descriptor-denied' and self.command=='PUT' and '/descriptors/' in self.path)
         if Relay.mode=='descriptor-unavailable' and self.command in ('HEAD','GET') and '/descriptors/' in self.path:
@@ -77,7 +80,12 @@ def run(sql,folder,expected=0):
     assert result.returncode==expected,(expected,result.returncode,result.stdout,result.stderr)
     return result
 try:
-    for mode in ('payload-denied','descriptor-denied','corrupt-verification','descriptor-response-loss','staging-full'):
+    # Export settings per mode: read-back verification catches a corrupted download; uploads are checked
+    # by the service, staged on disk or in memory.
+    settings={'corrupt-verification':"SET differential_export_verification='read_back';",
+              'corrupt-upload-memory':"SET differential_export_staging='memory';"}
+    for mode in ('payload-denied','descriptor-denied','corrupt-verification','corrupt-upload','corrupt-upload-memory',
+                 'descriptor-response-loss','staging-full'):
         folder=base/mode;folder.mkdir();Relay.mode='none';Relay.triggered=0
         S3=f"ENDPOINT '{proxy}', PATH_STYLE true, ALLOW_HTTP true"
         attach="ATTACH 'differential:sales' AS d;"
@@ -90,7 +98,7 @@ try:
             quota=(staging/'upload-Quota1').open('wb');quota.truncate(512*1024*1024);fcntl.flock(quota,fcntl.LOCK_EX)  # the largest quota (sparse)
             (staging/'upload-Stale1').write_bytes(b'derived orphan');(staging/'upload-unrelated-user-file').write_bytes(b'preserve')
         Relay.mode=mode
-        statement=attach+"CALL differential_create_snapshot('d',request_id:='publish');"
+        statement=settings.get(mode,'')+attach+"CALL differential_create_snapshot('d',request_id:='publish');"
         success=mode=='descriptor-response-loss'
         result=run(statement,folder,0 if success else 1)
         if not success:assert 'completed; S3 export remains pending' in result.stderr,result.stderr

@@ -3,7 +3,7 @@
 import json
 import os
 from pathlib import Path
-import sqlite3
+import metadata_store
 import tempfile
 import threading
 import time
@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='differential-capture-race-') as tmp:
         host.query(writer,f"LOAD '{EXT}'; ATTACH 'differential:sales' AS d; CREATE TABLE d.t(i INT); INSERT INTO d.t VALUES(1); CHECKPOINT d;")
         host.query(reader,'BEGIN; SELECT count(*) FROM d.t;')
         host.query(writer,'INSERT INTO d.t VALUES(2);')
-        with sqlite3.connect(folder/'engine.sqlite') as metadata:
+        with metadata_store.connect(folder/'engine.sqlite') as metadata:
             database,branch=metadata.execute('SELECT database_id,id FROM branches').fetchone()
         os.environ['DIFFERENTIAL_PROBE_GATE_URI']=f'diff://db/{database}/branches/{branch}'
         (folder/'gate.arm').touch();errors=[]
@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix='differential-capture-race-') as tmp:
             if time.monotonic()>deadline:raise AssertionError('checkpoint gate not reached')
             time.sleep(.01)
         host.query(writer,'INSERT INTO d.t VALUES(3);')
-        with sqlite3.connect(folder/'engine.sqlite') as metadata:
+        with metadata_store.connect(folder/'engine.sqlite') as metadata:
             assert metadata.execute("SELECT count(*) FROM files WHERE name LIKE '%.wal.checkpoint' AND size>0").fetchone()[0]==1
         (folder/'gate.release').touch();worker.join(timeout=15);assert not worker.is_alive() and not errors,errors
         host.query(history,"ATTACH 'differential:sales' AS old (SNAPSHOT_VERSION 1);")

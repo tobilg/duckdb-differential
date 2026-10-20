@@ -75,7 +75,7 @@ SELECT sequence_name,start_value,increment_by,last_value FROM duckdb_sequences()
 with tempfile.TemporaryDirectory(prefix='differential-phase0-') as tmp:
     base = Path(tmp)
     r = run('PRAGMA version; PRAGMA platform;', base)
-    assert 'v1.5.6,069cc9f9b5' in r.stdout, r.stdout
+    assert 'v2.0.0,d54cbbe3df' in r.stdout, r.stdout
     passed('stock-load', r.stdout.strip())
     # Both native routing and the native-storage alias must work.
     run("ATTACH 'diff://routing' AS d; CREATE TABLE d.t AS SELECT 1 AS i; CHECKPOINT d; DETACH d;", base)

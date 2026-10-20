@@ -7,6 +7,11 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Dependencies come from vcpkg at this commit (also set in CI and the community descriptor).
 VCPKG_COMMIT ?= cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
+# The duckdb submodule is pinned to the untagged commit the community repository builds and deploys as
+# v2.0.0 (d54cbbe3df): name its version explicitly instead of `git describe`.
+# Empty once the submodule is pinned to a release tag.
+OVERRIDE_GIT_DESCRIBE ?= v2.0.0
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
@@ -14,7 +19,14 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Integration build: test hooks compiled in, and the extension NOT linked into the CLI or
 # libduckdb, so the Python suites exercise the loadable artifact exactly as users load it.
 # Release artifacts (`make release`) never contain the hooks.
-.PHONY: integration test_integration test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness vcpkg bump-version
+.PHONY: bench-tpch integration test_integration test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness vcpkg bump-version
+
+# TPC-H benchmarks (native, Differential local, Differential on a disposable MinIO) with the release
+# extension; renders docs/benchmarks-tpch.md. TPCH_ARGS passes options (e.g. --queries 1,6 --runs 3).
+bench-tpch:
+	DIFFERENTIAL_EXTENSION=$(PROJ_DIR)build/release/extension/differential/differential.duckdb_extension \
+		python3 benchmarks/tpch.py $(TPCH_ARGS)
+	python3 benchmarks/tpch_report.py build/evidence/tpch.json
 
 bump-version:
 	@test -n "$(V)" || { echo "Usage: make bump-version V=X.Y.Z" >&2; exit 2; }

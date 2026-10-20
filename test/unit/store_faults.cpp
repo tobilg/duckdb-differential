@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -122,7 +123,12 @@ int main() {
             store.ReadRoot(root, actual.data(), actual.size(), 0);
             Require(actual == initial, "retry changed historical bytes");
         }
-        Sql(path + "/engine.sqlite", "UPDATE objects SET data=zeroblob(65536)");
+        // Payload lives in segment files: overwrite every byte of them.
+        for (auto folder : {"/segments", "/journal"})
+            for (auto &entry : std::filesystem::directory_iterator(path + folder)) {
+                std::vector<char> zeros(std::filesystem::file_size(entry));
+                std::ofstream(entry.path(), std::ios::binary | std::ios::in).write(zeros.data(), std::streamsize(zeros.size()));
+            }
         Store::DropCaches();
         {
             Store store(path);
