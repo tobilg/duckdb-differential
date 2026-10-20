@@ -5,7 +5,7 @@ All notable changes to the DuckDB differential extension are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-10-21
 
 ### Added
 
@@ -22,8 +22,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   state per transaction, no S3 request while binding. `differential_followers()` lists them.
 - Latency distributions for every timing (`_stddev`, `_p50`, `_p95`, `_p99`), S3 requests timed per
   operation type (`s3_request_*`), and the segment and metadata halves of a durable sync.
-- `benchmarks/disk_cache.py` (disk cache versus local reads) and a `ship_latency` workload in `scale.py`.
-
+- Benchmarks:
+  - `benchmarks/tpch.py` and `tpch_report.py` (`make bench-tpch`): TPC-H Q1–Q22 at a scale factor on every
+    backend and S3 read path, warm and in new processes, plus `lineitem` writes, with result hashes checked
+    against native; `tpch_report.py baseline.json after.json` compares two runs
+    ([docs/benchmarks-tpch.md](docs/benchmarks-tpch.md));
+  - `benchmarks/scale.py` and `scale_report.py`: gigabyte-scale workloads (concurrent commits, bulk load,
+    cold scans, S3 export settings, remote collection, shared history, `ship_latency`) against a
+    disk-backed MinIO, also as a manual GitHub workflow (`Benchmarks.yml`;
+    [docs/benchmarks-scale.md](docs/benchmarks-scale.md));
+  - `benchmarks/disk_cache.py`: the repository disk cache versus local reads.
 - Remote garbage collection: `differential_cleanup_remote_files(location)` condemns S3 data that no
   branch head or unexpired snapshot reaches and deletes it in a later run after a grace period
   (default a week). Exports never reference condemned data. Expiry now records exported snapshots
@@ -82,6 +90,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   typed code instead of being recognised by their message text. Messages are unchanged.
 - `SnapshotAt` (`SNAPSHOT_TIME`, `AT (TIMESTAMP => …)`) reads under a read transaction instead of
   the metadata store's write lock.
+
+- Documentation warns against opening `engine.sqlite` with a second SQLite library (DuckDB's `sqlite`
+  extension, Python's `sqlite3`) in a process that has the extension loaded: the copies ignore each
+  other's locks, which can crash the process or corrupt the store.
+- Testing on DuckDB 2.0: the upstream SQLLogicTest comparison runs each test with a 3 GB memory limit
+  (`--memory-limit`), installs the official `quack` and `encodings` extensions when a test requires
+  them, and lists the new 2.0 tests individually (exclusions audited on both backends). Integration
+  suites read the metadata store from a separate process (`test/integration/metadata_store.py`).
 
 ### Fixed
 
