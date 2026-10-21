@@ -74,7 +74,9 @@ shared from the pinned checkout.
 
 The initial host has a file path, so DuckDB's own `require noforcestorage` guards work.
 Default execution uses two DuckDB query threads, a 3 GB memory limit (`--memory-limit`) and two
-concurrent test pairs; DuckDB 2.0's SF1 workloads and some CSV/Parquet tests exceed 1 GB. Individual configurations enable the upstream 16 KiB block-size variants,
+concurrent test pairs; DuckDB 2.0's SF1 workloads and some CSV/Parquet tests exceed 1 GB. Tests that
+start a local quack server (`quack_serve`) share its default endpoint and run one at a time; all
+other tests stay concurrent. Individual configurations enable the upstream 16 KiB block-size variants,
 500000-row vacuum-rebuild threshold, latest storage for VARIANT/geometry, and larger memory
 allowances for ART, very wide joins, large CSV/Parquet buffers, giant strings and TPC-H generator
 comparisons where required. These configurations apply equally to both backends. Tests can

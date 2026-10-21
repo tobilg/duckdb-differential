@@ -272,4 +272,10 @@ with tempfile.TemporaryDirectory(prefix='upstream-bridge-test-') as tmp:
     assert result.returncode == 1 and 'STALE_SKIP' in result.stdout, result.stdout + result.stderr
     print('PASS interrupted runners cannot reproduce exclusions')
 
+# Tests that start a local quack server must not run concurrently with each other.
+assert upstream.serialized('test/sql/attach/external_resource_lifecycle.test')
+assert upstream.serialized('test/sql/connect/connect_quack.test')
+assert not upstream.serialized('test/sql/window/test_rank.test')
+print('PASS quack_serve tests run one at a time')
+
 print('Evidence:', evidence)

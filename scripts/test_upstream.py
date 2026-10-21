@@ -9,6 +9,7 @@ that reference public remote fixtures need network access.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,17 @@ from evidence import evidence_path
 
 def quote(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+# Tests that start a local quack server (`quack_serve`) share its default endpoint, so two of them
+# running concurrently can connect to each other's server ("Invalid connection id"). They run one at a
+# time; all other tests stay parallel.
+SERIAL_PATTERN = re.compile(r'\bquack_serve\s*\(')
+serial_lock = threading.Lock()
+
+
+def serialized(test):
+    return SERIAL_PATTERN.search((DUCKDB / test).read_text(errors='surrogateescape')) is not None
 
 
 def required_extensions(test):
@@ -371,10 +384,11 @@ def main():
                         validation='Pinned source hash and reviewed disk-space requirement; workload not executed.')
             return item, True
         texts = {}
-        for mode in ('native', 'differential'):
-            timeout = args.timeout
-            item[mode], texts[mode] = run_test(runner, extension, bridge, test, mode, timeout, output,
-                                              test_config=configs.get(test), extension_cache=extension_cache)
+        with serial_lock if serialized(test) else contextlib.nullcontext():
+            for mode in ('native', 'differential'):
+                timeout = args.timeout
+                item[mode], texts[mode] = run_test(runner, extension, bridge, test, mode, timeout, output,
+                                                  test_config=configs.get(test), extension_cache=extension_cache)
         if test in configs:
             item['config'] = configs[test]
         if args.audit_skips:
