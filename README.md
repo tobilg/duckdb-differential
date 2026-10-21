@@ -308,6 +308,22 @@ cp -R plugins/duckdb-differential/skills/duckdb-differential ~/.cline/skills/
 
 For project-only use, replace `~/.cline/skills/` with that project's `.cline/skills/`.
 
+**One command for several agents (third-party):** the [`skills`](https://github.com/vercel-labs/skills)
+CLI by Vercel Labs (Node.js 22.20 or later) detects installed agents and installs the skill into each
+agent's skills directory; it finds it through this repository's `.claude-plugin` manifests:
+
+```sh
+npx skills add tobilg/duckdb-differential                 # this project; asks which agents
+npx skills add tobilg/duckdb-differential -g              # all projects
+npx skills add tobilg/duckdb-differential -g -a cursor -a gemini-cli -a opencode
+```
+
+`npx skills update` and `npx skills remove` keep the copies current. It is not part of this repository
+and has not been tested with it here (see [the validation policy](#development)); its paths follow
+[its own agent table](https://github.com/vercel-labs/skills/blob/main/docs/agents.md), which can differ
+from an agent's official documentation (for Cline, prefer the directories above). The CLI collects
+anonymous usage data unless `DISABLE_TELEMETRY=1` or `DO_NOT_TRACK=1` is set.
+
 **Pi package installation:** pi can also install directly from this repository, using the skill
 path declared in [`package.json`](package.json):
 
