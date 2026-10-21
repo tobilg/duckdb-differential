@@ -273,9 +273,14 @@ with tempfile.TemporaryDirectory(prefix='upstream-bridge-test-') as tmp:
     print('PASS interrupted runners cannot reproduce exclusions')
 
 # Tests that start a local quack server must not run concurrently with each other.
-assert upstream.serialized('test/sql/attach/external_resource_lifecycle.test')
-assert upstream.serialized('test/sql/connect/connect_quack.test')
-assert not upstream.serialized('test/sql/window/test_rank.test')
+with tempfile.TemporaryDirectory(prefix='upstream-serial-test-') as tmp:
+    upstream.DUCKDB = Path(tmp)
+    tests = upstream.DUCKDB / 'test/sql'
+    tests.mkdir(parents=True)
+    (tests / 'serve.test').write_text("require quack\n\nstatement ok\nCALL quack_serve(token='test_token');\n")
+    (tests / 'plain.test').write_text('# mentions quack_serve only in a comment\nstatement ok\nSELECT 1;\n')
+    assert upstream.serialized('test/sql/serve.test')
+    assert not upstream.serialized('test/sql/plain.test')
 print('PASS quack_serve tests run one at a time')
 
 print('Evidence:', evidence)
