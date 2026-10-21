@@ -178,12 +178,10 @@ struct Stage {
                         close(candidate);
                         throw std::runtime_error("Cannot measure upload staging capacity");
                     }
+                    // Saturate instead of failing here: the sweep must reach every stale file,
+                    // whatever order the directory lists them in.
                     auto size = uint64_t(status.st_size);
-                    if (size > limit || active_bytes > limit - size) {
-                        close(candidate);
-                        throw std::runtime_error("[differential:staging_full] Upload staging capacity exhausted");
-                    }
-                    active_bytes += size;
+                    active_bytes = size > limit || active_bytes > limit - size ? limit + 1 : active_bytes + size;
                 }
                 close(candidate);
             }
