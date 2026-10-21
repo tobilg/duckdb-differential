@@ -19,7 +19,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Integration build: test hooks compiled in, and the extension NOT linked into the CLI or
 # libduckdb, so the Python suites exercise the loadable artifact exactly as users load it.
 # Release artifacts (`make release`) never contain the hooks.
-.PHONY: bench-tpch integration test_integration test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness vcpkg bump-version
+.PHONY: bench-tpch integration test_integration test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness vcpkg bump-version check_skill
 
 # TPC-H benchmarks (native, Differential local, Differential on a disposable MinIO) with the release
 # extension; renders docs/benchmarks-tpch.md. TPCH_ARGS passes options (e.g. --queries 1,6 --runs 3).
@@ -27,6 +27,13 @@ bench-tpch:
 	DIFFERENTIAL_EXTENSION=$(PROJ_DIR)build/release/extension/differential/differential.duckdb_extension \
 		python3 benchmarks/tpch.py $(TPCH_ARGS)
 	python3 benchmarks/tpch_report.py build/evidence/tpch.json
+
+# Static checks of the agent skill (references copied from docs/, metadata, links, manifests); needs
+# scripts/requirements-skill.txt and never runs a coding-agent harness (README.md#agent-skill).
+check_skill:
+	python3 scripts/sync_skill.py --check
+	python3 scripts/check_skill.py
+	python3 -m unittest discover -s test/skill -p 'test_*.py'
 
 bump-version:
 	@test -n "$(V)" || { echo "Usage: make bump-version V=X.Y.Z" >&2; exit 2; }

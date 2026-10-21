@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Runs the SQL examples of docs/sql-reference.md and docs/shared-databases.md as written, against
+"""Runs the SQL examples of docs/sql-reference.md, docs/shared-databases.md and the agent skill's SKILL.md
+as written, against
 the disposable MinIO bucket initialized by minio.py (network access for httpfs).
 
 Each ```sql block is one session (one CLI process) on the host named by its first line
@@ -40,7 +41,8 @@ setup = subprocess.run([DUCKDB_CLI, '-init', '/dev/null', '-batch', '-bail'],
                        input=f"SET extension_directories=['{extensions}']; INSTALL httpfs;", text=True,
                        capture_output=True, timeout=300)
 assert setup.returncode == 0, setup.stderr
-for document in ('docs/sql-reference.md', 'docs/shared-databases.md'):
+for document in ('docs/sql-reference.md', 'docs/shared-databases.md',
+                 'plugins/duckdb-differential/skills/duckdb-differential/SKILL.md'):
     name = Path(document).stem
     location = f's3://differential-sdk-test/docs-{name}/'
     data = base / name / 'data'

@@ -97,6 +97,12 @@ Each decision was made by the repository owner; changing one needs the owner's a
 - **S3 parallelism (2026-10-11).** `differential_s3_max_requests` (process-wide, 1–64, default 16,
   chosen from a real-AWS run of `benchmarks/s3_throughput.py`); per-location `MAX_REQUESTS` is
   an optional lower cap (0/unset = follow the setting).
+- **Agent skill validation (2026-10-21).** The agent skill is checked statically only: `make check_skill`
+  (our files, manifests and the validator's tests) in its own CI job. Do not install or execute
+  coding-agent harnesses, their loaders or model workflows for compatibility checks, locally or in CI.
+  The one exception: `claude plugin validate .`, which only reads our marketplace and plugin manifests,
+  may be run manually (never in CI). Installation instructions and manifests follow each harness's
+  official documentation. This does not restrict the DuckDB SQLLogicTest harness.
 
 ## Implementation map
 
@@ -114,6 +120,7 @@ Each decision was made by the repository owner; changing one needs the owner's a
 | Followers (polling, per-transaction state) | `src/duckdb_adapter/follow.{hpp,cpp}` |
 | Remote memory cache (DuckDB `ExternalFileCache`) | `src/duckdb_adapter/remote_cache.{hpp,cpp}` |
 | Local payload pools | `src/providers/local/` |
+| Portable agent skill and install manifests | `.claude-plugin/marketplace.json`, `package.json`, `plugins/duckdb-differential/`; setup in `README.md#agent-skill` |
 
 Storage formats (repository layout, schema, hashes, segments, S3 packs/indexes/descriptors) are
 specified in `docs/storage-format.md`. Keep it in sync with any format change, and bump the
@@ -138,6 +145,13 @@ and function with an example, and must stay complete; its examples and those of
   `duckdb_functions()`; `test/sql/differential.test` fails otherwise.
 - **Per-catalog.** `<catalog>.snapshots()/current_snapshot()/branches()` and
   `FROM t AT (VERSION|TIMESTAMP => …)`.
+- **Agent skill.** `plugins/duckdb-differential/skills/duckdb-differential/SKILL.md` is written by hand;
+  its `references/` are copies of `docs/` written by `scripts/sync_skill.py`. After changing those docs
+  or the SQL surface, run the script and update SKILL.md. `make check_skill` (CI) checks synchronization,
+  metadata, bundled links and package paths/versions; install `scripts/requirements-skill.txt` first
+  (see README). `doc_examples.py` executes SKILL.md's examples. Keep one canonical skill directory
+  across harnesses; `package.json` points pi at it. Harness testing is limited by the product
+  decision "Agent skill validation" above.
 - **Internal paths.** `diff://db/<uuid>/…` stays internal and is attachable with
   `TYPE differential`. A plain `diff://` attach gets the stock catalog: no scoped functions,
   no AT.

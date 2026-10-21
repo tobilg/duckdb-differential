@@ -1,0 +1,10 @@
+{
+  "name": "duckdb-differential-skills",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agent skill for versioned DuckDB databases with duckdb-differential",
+  "license": "MIT",
+  "pi": {
+    "skills": ["./plugins/duckdb-differential/skills"]
+  }
+}

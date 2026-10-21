@@ -683,9 +683,10 @@ Fixed bounds:
 There is no disk quota for authoritative storage. Failover and remote export expiry are not
 supported; several writers per database only as [shared databases](#shared-databases-several-writers).
 
-The local store format is 1 (header-aligned chunks) and the control format is 1. Repositories
-in any other format fail with `incompatible_format` (there are no migrations). Native DuckDB
-bytes are unchanged.
+The local store format is 2 (block-aligned chunks in append-only segments, CRC32C-verified local
+reads), the control format is 1 and the export format is `differential-export-v2`. Repositories and
+exports in any other format fail with `incompatible_format` (there are no migrations). Native
+DuckDB bytes are unchanged.
 
 Stable error prefixes use `[differential:<category>]`: `not_found`, `retired`,
 `name_conflict`, `read_only_attachment`, `writer_busy`, `stale_epoch`,

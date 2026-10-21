@@ -48,6 +48,7 @@ other platforms are untested.
 - [Installation](#installation)
 - [Durability and storage](#durability-and-storage)
 - [Processes, users and hosts](#processes-users-and-hosts): what can be shared
+- [Agent skill](#agent-skill): setup for coding agents
 - [Development](#development): building from source, tests, CI and releases
 
 ## Installation
@@ -258,6 +259,83 @@ heads work is in [docs/deployment.md](docs/deployment.md). What runs concurrentl
 heads are guarded, and how to isolate tenants is in
 [docs/concurrency-and-multitenancy.md](docs/concurrency-and-multitenancy.md).
 
+## Agent skill
+
+The repository includes one portable [Agent Skills](https://agentskills.io) skill for coding agents.
+It teaches the extension's setup, local lifecycle, S3 replication, followers,
+failover, shared writers and common pitfalls. All installations use
+[`plugins/duckdb-differential/skills/duckdb-differential`](plugins/duckdb-differential/skills/duckdb-differential),
+including its bundled `references/` directory.
+
+Installation guidance follows the linked official harness documentation, reviewed on 2026-10-21.
+Compatibility is documented on that basis. Local and CI validation checks our skill files and
+manifests; it does not install or execute coding-agent harnesses, their loaders or model workflows.
+
+**Claude Code:** install from this repository's plugin marketplace:
+
+```
+/plugin install duckdb-differential --marketplace tobilg/duckdb-differential
+```
+
+(or `/plugin marketplace add tobilg/duckdb-differential`, then
+`/plugin install duckdb-differential@duckdb-differential`).
+
+**Shared installation:** Codex, pi, Amp, Cursor, GitHub Copilot, OpenCode, Gemini CLI and
+Devin Desktop / Windsurf Cascade document discovery from `~/.agents/skills/` (personal skills) or
+a project's `.agents/skills/`. From a checkout of this repository, copy the complete skill directory:
+
+```sh
+mkdir -p ~/.agents/skills
+cp -R plugins/duckdb-differential/skills/duckdb-differential ~/.agents/skills/
+```
+
+For project-only use, replace `~/.agents/skills/` with that project's `.agents/skills/`.
+A checkout by itself does not register the nested skill. Copies must be refreshed after updating
+the checkout. Restart Codex if the skill does not appear; in pi, use `/reload`; in Gemini CLI,
+use `/skills reload`; in Amp, ask it to reload skills.
+
+For hosted agents, place the skill in the target repository or its remote environment. A local
+personal installation is not a cloud installation: Cursor explicitly does not transfer
+`~/.agents/skills/` to Cloud Agents. Copilot's repository installation can also use `.github/skills/`.
+See the official guides in the table below for each product's scope and discovery rules.
+
+**Cline:** use its documented personal skills directory instead:
+
+```sh
+mkdir -p ~/.cline/skills
+cp -R plugins/duckdb-differential/skills/duckdb-differential ~/.cline/skills/
+```
+
+For project-only use, replace `~/.cline/skills/` with that project's `.cline/skills/`.
+
+**Pi package installation:** pi can also install directly from this repository, using the skill
+path declared in [`package.json`](package.json):
+
+```sh
+pi install git:github.com/tobilg/duckdb-differential
+```
+
+Use `pi install --local git:github.com/tobilg/duckdb-differential` for a project install, or
+`pi install ./path/to/duckdb-differential` for an existing checkout. Choose either the package
+installation or the shared skill-directory installation to avoid duplicate skill names.
+
+| Agent | Finding or using the installed skill | Official guide |
+| --- | --- | --- |
+| Claude Code | `/duckdb-differential:duckdb-differential` after marketplace installation | [Skills](https://code.claude.com/docs/en/skills) |
+| Codex | `$duckdb-differential` (also listed under `/skills`) | [Skills](https://developers.openai.com/codex/skills) |
+| pi | `/skill:duckdb-differential` | [Skills](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/skills.md) |
+| Amp | `amp skills list`, then ask Amp to use the `duckdb-differential` skill | [Skills](https://ampcode.com/docs/customize/skills) |
+| Cursor | `/duckdb-differential`; view available skills in Customize → Skills | [Skills](https://cursor.com/docs/skills) |
+| GitHub Copilot | Ask Copilot to use the `duckdb-differential` skill for the task | [Agent skills](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/add-skills) |
+| OpenCode | Ask the agent to load `duckdb-differential` with its `skill` tool | [Agent skills](https://opencode.ai/docs/skills/) |
+| Gemini CLI | `/skills list`, then ask Gemini to use `duckdb-differential` | [Managing skills](https://geminicli.com/docs/cli/using-agent-skills/) |
+| Cline | Enabled when discovered (toggle it in the Skills menu); ask Cline to use it | [Skills](https://docs.cline.bot/customization/skills) |
+| Devin Desktop / Windsurf Cascade | `@duckdb-differential` | [Cascade skills](https://docs.devin.ai/desktop/cascade/skills) |
+
+Agents can also select the skill automatically when a request matches its description.
+The directory installations use the same `SKILL.md` and references directly. The Claude marketplace
+and pi package installations use the manifests already included in this repository.
+
 ## Development
 
 The sections below cover building, loading and verifying the extension before publication.
@@ -308,7 +386,26 @@ builds never contain the hooks. Scripts find artifacts through `test/integration
 override with `DIFFERENTIAL_BUILD_DIR`, `DIFFERENTIAL_EXTENSION`, `DUCKDB_BINARY` or
 `DUCKDB_LIBRARY`. Test scripts write result transcripts to `build/evidence/` (not tracked).
 
-CI runs the upstream harness checks and smaller PR profile. Run the complete suite manually
+To validate the agent skill without building DuckDB, install the pinned validation dependency
+in a virtual environment and run the same check as CI:
+
+```sh
+python3 -m venv build/skill-venv
+. build/skill-venv/bin/activate
+python3 -m pip install -r scripts/requirements-skill.txt
+make check_skill
+```
+
+This performs static checks of documentation synchronization, function coverage, YAML metadata,
+bundled link targets, manifest paths and package versions, and runs our validator's regression tests.
+It does not install or execute coding-agent harnesses, their loaders or model workflows, locally or
+in CI. Harness setup guidance is maintained from official documentation. If Claude Code is installed,
+`claude plugin validate .` can additionally check the marketplace and plugin manifests (manually, not in
+CI). After editing the bundled source docs, run `python3 scripts/sync_skill.py` to refresh the copies
+before checking them.
+
+CI runs the upstream DuckDB SQLLogicTest harness checks and smaller PR profile. Run the complete
+suite manually
 with `make test_upstream`, and audit exclusions with `make test_upstream_skips` when updating
 DuckDB, changing the adapter or reviewing exclusions. Both commands are outside CI.
 
@@ -338,6 +435,7 @@ individually documented excessive-disk workloads are excluded without executing 
 ### Versioning and DuckDB updates
 
 `make bump-version V=X.Y.Z` updates every version reference (CMake, extension configs, the
-reported version, the SQL test and the community descriptor draft in `community/`). See
+reported version, the SQL test, the community descriptor draft in `community/`, and the agent
+skill's metadata, Claude plugin manifest and pi package manifest). See
 [docs/UPDATING.md](docs/UPDATING.md) for moving to a new DuckDB release, and
 [CHANGELOG.md](CHANGELOG.md).

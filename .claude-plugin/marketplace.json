@@ -1,0 +1,15 @@
+{
+  "name": "duckdb-differential",
+  "description": "Agent skills for the duckdb-differential DuckDB extension",
+  "owner": {
+    "name": "tobilg",
+    "url": "https://github.com/tobilg"
+  },
+  "plugins": [
+    {
+      "name": "duckdb-differential",
+      "source": "./plugins/duckdb-differential",
+      "description": "Versioned DuckDB databases: snapshots, branches, time travel and replication through S3"
+    }
+  ]
+}

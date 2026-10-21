@@ -12,6 +12,9 @@ VERSION_LOCATIONS = (
     ("src/differential_extension.cpp", re.compile(rf'return "v(?P<version>{VERSION})";')),
     ("test/sql/differential.test", re.compile(rf"^v(?P<version>{VERSION})$", re.M)),
     ("community/description.yml", re.compile(rf"^  version: (?P<version>{VERSION})$", re.M)),
+    ("package.json", re.compile(rf'"version": "(?P<version>{VERSION})"')),
+    ("plugins/duckdb-differential/.claude-plugin/plugin.json", re.compile(rf'"version": "(?P<version>{VERSION})"')),
+    ("plugins/duckdb-differential/skills/duckdb-differential/SKILL.md", re.compile(rf'^  version: "(?P<version>{VERSION})"$', re.M)),
 )
 
 

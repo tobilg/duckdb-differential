@@ -1,0 +1,13 @@
+{
+  "name": "duckdb-differential",
+  "version": "1.0.0",
+  "description": "Use the duckdb-differential DuckDB extension: snapshots, branches, clones, restore, time travel, S3 exports, followers, WAL shipping, failover and shared writers",
+  "author": {
+    "name": "tobilg",
+    "url": "https://github.com/tobilg"
+  },
+  "homepage": "https://github.com/tobilg/duckdb-differential",
+  "repository": "https://github.com/tobilg/duckdb-differential",
+  "license": "MIT",
+  "keywords": ["duckdb", "versioning", "branching", "time-travel", "s3", "replication"]
+}

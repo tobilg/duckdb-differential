@@ -5,6 +5,25 @@ All notable changes to the DuckDB differential extension are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Agent skill for coding agents, published as a Claude Code plugin marketplace in this repository
+  (`/plugin marketplace add tobilg/duckdb-differential`): `SKILL.md` covers setup, the local lifecycle,
+  S3 exports, followers, WAL shipping and failover, shared writers and common pitfalls; its references
+  are copies of the docs (`scripts/sync_skill.py`, checked by `make check_skill` in CI), and its examples
+  run in `test/integration/doc_examples.py`.
+- Installation for other coding agents: the same skill directory works with agents that discover
+  `~/.agents/skills/` or `.agents/skills/` (Codex, pi, Amp, Cursor, GitHub Copilot, OpenCode, Gemini CLI,
+  Devin Desktop / Windsurf Cascade) and with Cline (`~/.cline/skills/`); a `package.json` makes the
+  repository a pi package (`pi install git:github.com/tobilg/duckdb-differential`). See
+  `README.md#agent-skill`.
+- `scripts/check_skill.py` statically validates the skill's frontmatter, bundled links and the Claude and
+  pi manifests (paths, names, versions), with regression tests in `test/skill/`; `make check_skill` runs
+  it in a separate CI job (PyYAML pinned in `scripts/requirements-skill.txt`).
+- `make bump-version` also updates the skill metadata and the plugin and pi package manifests.
+
 ## [1.0.0] - 2026-10-21
 
 ### Added

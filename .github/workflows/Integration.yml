@@ -20,6 +20,26 @@ env:
   VCPKG_INSTALL_OPTIONS: --clean-after-build
 
 jobs:
+  # Static checks of the agent skill and its manifests, once and independent of the builds. Its own
+  # job, so the Python set up here does not change the one the integration suites run with.
+  skill:
+    name: Agent skill
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the extension-ci-tools makefiles
+        run: git submodule update --init --depth 1 extension-ci-tools
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate skill files and manifests (static only)
+        run: |
+          python3 -m pip install -r scripts/requirements-skill.txt
+          make check_skill
+
   integration:
     name: Integration (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
