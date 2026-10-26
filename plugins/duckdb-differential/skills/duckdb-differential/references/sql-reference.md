@@ -36,6 +36,13 @@ test suite against MinIO (`test/integration/doc_examples.py`), except those mark
   [differential_evict_snapshots](#differential_evict_snapshots) ·
   [differential_claim_branch_heads](#differential_claim_branch_heads) ·
   [differential_resolve_conflict](#differential_resolve_conflict)
+- Branch merge: [differential_merge_snapshots_preview](#differential_merge_snapshots_preview) ·
+  [differential_merge_snapshots](#differential_merge_snapshots) ·
+  [differential_merge_branch_preview](#differential_merge_branch_preview) ·
+  [differential_merge_branch_preflight](#differential_merge_branch_preflight) ·
+  [differential_merge_branch](#differential_merge_branch) · [differential_merge_status](#differential_merge_status) ·
+  [differential_merge_resolutions](#differential_merge_resolutions) · [differential_merge_ancestry](#differential_merge_ancestry) ·
+  [differential_merge_requests](#differential_merge_requests) · [differential_abort_merge](#differential_abort_merge)
 - Import and recovery: [differential_import_database](#differential_import_database) ·
   [differential_recover_export](#differential_recover_export) ·
   [differential_recover_branch](#differential_recover_branch)
@@ -58,6 +65,7 @@ test suite against MinIO (`test/integration/doc_examples.py`), except those mark
 | `differential_group_commit` | BOOLEAN | `true` | Concurrent native syncs of different databases in this process share one durable transaction and sync (up to 16 MiB of new data each; a larger sync commits alone). Durability per sync is unchanged. Process-wide; the last value set applies. |
 | `differential_export_verification` | VARCHAR | `'checksum'` | `'checksum'`: the S3 service verifies each uploaded object's SHA-256. `'read_back'`: exports also download and hash every object they upload, for S3-compatible services that ignore upload checksums. Process-wide; the last value set applies. |
 | `differential_export_staging` | VARCHAR | `'disk'` | `'disk'`: exports stage each object as a file under the repository before uploading it (quota: 8 MiB per parallel request, 64–512 MiB). `'memory'`: uploads stream from memory within the same budget per process. Process-wide; the last value set applies. |
+| `differential_merge_max_concurrent` | BIGINT | `2` | Active merges, previews and aborts per process, 1–16, shared by all DuckDB instances. Excess calls fail with `merge_busy`. Global; the last value set applies. |
 
 ```sql
 -- main
@@ -483,13 +491,14 @@ SELECT database_name, data_path, writers FROM differential_databases();
 differential_operations()
 ```
 
-Durable records of every mutation, for request replay and inspection.
+Durable records of every mutation, for request replay and inspection, plus internal local
+`snapshot_ancestry` publication records (no caller request ID).
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `operation_id`, `request_id` | VARCHAR | The operation and its request ID (NULL when none was given). |
-| `kind` | VARCHAR | `create_database`, `snapshot`, `branch`, `clone`, `restore`, `drop_branch`, `retire`, `evict`, `retry_export`, `import_native`, `recover_export`, `resolve_conflict`, `gc`, `compact`. |
-| `state` | VARCHAR | `pending`, `complete` or `local_complete_export_pending`. |
+| `kind` | VARCHAR | `create_database`, `snapshot`, `branch`, `clone`, `restore`, `drop_branch`, `retire`, `evict`, `retry_export`, `import_native`, `recover_export`, `resolve_conflict`, `merge` (explicit snapshots), `merge_branch`, `merge_target_result` (target outcome/provenance audit), `merge_schema` (frozen schema policy), `merge_expected_inputs` (reviewed-input guard), `merge_attempt` (bounded latest-attempt diagnostics), `merge_resolutions` (frozen decision audit/reservation), `snapshot_ancestry`, `gc`, `compact`. |
+| `state` | VARCHAR | `pending`, `complete`, `local_complete_export_pending`, or terminal `aborted` for a merge. |
 | `database_id`, `branch_id` | VARCHAR | What it changed. |
 | `snapshot_id`, `preservation_snapshot_id` | BIGINT | Snapshots it published. |
 
@@ -837,7 +846,8 @@ differential_retry_export(database VARCHAR [, snapshot_id BIGINT], request_id =>
 
 Finishes pending S3 exports: all of them (lowest first), or one. Allocates no snapshot number, works
 for retired snapshots and dropped branches, and republishes the database's branch heads (shared
-databases: except diverged branches).
+databases: except diverged branches). Single-writer targets fenced by pending merge intents
+are skipped; retry the original merge to finish their publication.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -882,8 +892,9 @@ differential_claim_branch_heads(database VARCHAR, request_id => VARCHAR)
 
 Takes a single-writer database's S3 branch heads over, after a copy of the repository (a restored
 backup, a cloned VM) wrote them: pending exports whose numbers the other copy published are
-abandoned, new snapshots are numbered above the newest published one, and every head is rewritten.
-Refused for shared databases. Returns `branch_name VARCHAR`, `snapshot_id BIGINT` and `head
+abandoned, new snapshots are numbered above the newest published one, and eligible heads are rewritten.
+Targets fenced by pending merge intents are skipped and omitted from the returned rows; retry/abort
+the merge first. Refused for shared databases. Returns `branch_name VARCHAR`, `snapshot_id BIGINT` and `head
 VARCHAR` (the attachable path) per branch.
 
 ```sql
@@ -1154,7 +1165,10 @@ differential_cleanup_metadata(older_than => TIMESTAMPTZ, dry_run => BOOLEAN, req
 
 Deletes metadata the repository no longer needs: completed operation records created before
 `older_than` (their request IDs no longer replay) and history entries of expired snapshots that
-took effect before it. Pending operations are kept.
+took effect before it. Pending operations are kept. Snapshot parent records, which branch merging
+uses to select a base, are never deleted. The records of a merge request (frozen schema policy,
+expression context, guards and choices, attempts, publication and abort marker) are deleted only
+together with that request, so pending and aborted merges keep their retry and terminal state.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -1168,4 +1182,701 @@ Returns one row per table: `dry_run BOOLEAN`, `table_name VARCHAR` (`operations`
 -- main
 SELECT table_name, rows FROM differential_cleanup_metadata(older_than => now() - INTERVAL 30 DAY,
     dry_run => true);
+```
+
+## Branch merge
+
+### differential_merge_snapshots_preview
+
+```sql
+differential_merge_snapshots_preview(database VARCHAR, base BIGINT, ours BIGINT, theirs BIGINT,
+                           conflict_limit BIGINT = 100, conflict_offset BIGINT = 0,
+                           conflict_bytes BIGINT = 1048576, validate BOOLEAN = false,
+                           max_input_rows BIGINT = 10000000, max_input_bytes BIGINT = 1073741824,
+                           max_stage_write_bytes BIGINT = 1073741824, timeout_ms BIGINT = 600000,
+                          resolution_tables MAP(VARCHAR,VARCHAR) = map(), schema_mode VARCHAR = 'strict')
+```
+
+Compares explicit retained snapshots of one local or single-writer S3 database, including
+evicted S3 inputs. Preview may download inputs but publishes nothing. Returns `schema_name`,
+`table_name`, `ours_inserts`, `ours_updates`, `ours_deletes`, `theirs_inserts`,
+`theirs_updates`, `theirs_deletes`, `conflicts`, `conflict_details`, `validation_state`,
+`validation_error`, `detail_bytes`, `next_conflict_offset`, `details_truncated`,
+`base_snapshot_id`, `ours_snapshot_id`, `theirs_snapshot_id`, `selection_ms`, `ancestry_nodes`, `resolved_conflicts`,
+`schema_mode`, `schema_changes`, `schema_conflicts`, `schema_conflict_details`, `table_change`, `schema_algorithm`,
+`object_type`, `object_name`, `table_action`, and `view_change` (31 columns).
+`schema_mode` is `strict` (identical schemas, default), `additive` (nullable non-key column
+additions without defaults and supported new tables), or `catalog` (additive rules plus table/plain nullable column
+removals and whole-view merging). Additions use the supported scalar/nested type allowlist. Missing added columns are
+typed NULLs; row absence remains distinct. Same-name additions with different supported types
+produce schema conflicts. Preview returns `schema_conflicts`/`blocked_by_schema_conflicts` states
+and NULL data counts when schema conflicts prevent comparison. Catalog detail lists have
+the input/combined catalog limits; details can contain multiple versions of a definition,
+so the definition-size limit is not a result-size budget. Data conflict pagination/budgets
+do not bound catalog details.
+`schema_changes` has type `STRUCT(column_name VARCHAR, source VARCHAR, sql_type VARCHAR, action VARCHAR)[]`.
+Source is `ours`, `theirs` or `both`; action is `add`/`drop`. Catalog column drops precede additions,
+in base-column order. They are schema changes and do not count as row updates.
+See [additive scope and output types](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#additive-column-merging).
+New tables use typed empty relations for absent inputs. Identical canonical definitions merge
+their rows against an empty base; different definitions or combined object-name collisions
+are schema conflicts. `table_change` describes the proposed new table and indexes; it is NULL
+for unchanged tables. `schema_algorithm` is `strict-v1`, the current `additive-tables-v2`, or `catalog-v1`.
+See [new-table rules](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#new-tables-in-additive-mode).
+Catalog mode removes a table only when both sides remove it or its surviving definition,
+indexes and typed rows equal the base. Otherwise it reports `table_delete_modify`. Views
+reconcile canonical definitions, bound outputs and native dependency registrations using
+three-way state rules. Missing/cyclic dependencies, combined binding/output changes and
+table/view replacements are schema conflicts. No CASCADE or SQL-clause merging is performed.
+Strict/additive require unchanged view definitions, bound outputs and native dependencies.
+Every mode preserves stored dependency registrations during table rebuilding and rejects
+deferred/unbound views. CAST/TRY_CAST targets in views, defaults and CHECKs must recursively
+use supported unqualified built-in types with constant modifiers; external/custom types fail
+before binding. Temporal expressions use the caller's native `TimeZone` and `Calendar`.
+Column removal requires a nullable non-key base column with no default or dependent constraint/index.
+Both sides removing it agrees. Otherwise, retained existing-key values and the retained definition
+must equal base; new keys conflict even if the value is NULL. Retaining-side row deletion follows
+ordinary remaining-column rules. Violations are `column_delete_modify`; unsupported base columns
+fail explicitly. Views must bind with their selected output shape. See [column removal rules](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#column-removal-rules).
+The `catalog-v1` planner includes these rules.
+`schema_conflict_details` appends a bounded `reason` field alongside its native input definitions.
+`object_type` is `table` or `view`; `object_name` identifies either. Catalog view rows have
+NULL `table_name`. Views and removed tables have NULL row counts and empty data-conflict details.
+`table_action` is `add`, `drop` or NULL; for removal `table_change` describes the base definition
+and removing side. `view_change` describes additions/replacements/removals/conflicts, selected
+definition, dependencies and each input's bound columns/native tracking flag; unchanged views
+have NULL `view_change`. See [catalog rules and exact STRUCT types](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#catalog-merging-table-removal-and-views).
+Selection timing/node counts are zero for explicit snapshot calls.
+`conflict_limit` is 0–1000 across the whole preview; offset pages details in table-name
+order, then primary-key order.
+Details preserve native scalar types and distinguish missing rows from NULL cells. Supported
+values include UUID, BLOB, UHUGEINT, FLOAT/DOUBLE, all six native DuckDB v2.0.0 timestamp types,
+native times/intervals, and nested STRUCT/TUPLE/LIST/ARRAY/MAP/UNION columns with supported
+leaves. Comparisons use native null-safe equality; nested columns merge as whole values.
+Independent changes to two fields of the same STRUCT therefore conflict on that column.
+No floating-point tolerance, recursive nested merge or timestamp precision conversion is applied.
+Additional scalar payload fields and `nested_value` typed trees are specified in
+[conflict details](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#preview-and-conflict-details). Resolution tables keep the original column types
+and supply whole nested values. These additions do not widen the schema-change rules.
+`conflict_bytes` is a global conservative payload budget (0–16 MiB). Oversized details are
+not truncated or skipped; the continuation offset remains at the first unreturned conflict.
+Preview creates no branch, snapshot or operation. Its default `validation_state` is
+`not_checked` (or `data_conflicts`). With `validate => true`, it builds/checkpoints disposable
+staging and returns `valid`, `constraint_violation`, `data_conflicts`, or `blocked_by_conflicts`.
+Resource limits must be positive; input limits count distinct snapshot IDs, and the staging
+budget counts attempted writes/file growth including overwrites, not physical repository usage.
+See [branch merge](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md) for the detail STRUCT and supported scope.
+
+```sql
+-- merge prototype
+ATTACH 'differential:merge_demo' AS d;
+CREATE TABLE d.items(id INT PRIMARY KEY, label VARCHAR, amount DECIMAL(18,3));
+INSERT INTO d.items VALUES (1, 'original', 1.250);
+CALL differential_create_snapshot('d');
+CALL differential_create_branch('d', 'ours', snapshot => 1);
+CALL differential_create_branch('d', 'theirs', snapshot => 1);
+ATTACH 'differential:merge_demo' AS o (BRANCH 'ours');
+UPDATE o.items SET label = 'edited';
+CALL differential_create_snapshot('o');
+ATTACH 'differential:merge_demo' AS t (BRANCH 'theirs');
+UPDATE t.items SET amount = 2.375;
+CALL differential_create_snapshot('t');
+SELECT table_name, conflicts FROM differential_merge_snapshots_preview('d', 1, 2, 3);
+SELECT validation_state FROM differential_merge_snapshots_preview('d', 1, 2, 3, validate => true);
+```
+
+```sql
+-- whole-value nested merge
+-- expect output: cell
+-- expect output: dark
+ATTACH 'differential:nested_demo' AS d;
+CREATE TABLE d.items(id INT PRIMARY KEY, settings STRUCT(theme VARCHAR, language VARCHAR));
+INSERT INTO d.items VALUES(1,{'theme':'light','language':'en'});
+CALL differential_create_snapshot('d');
+CALL differential_create_branch('d','ours',snapshot=>1);
+CALL differential_create_branch('d','theirs',snapshot=>1);
+ATTACH 'differential:nested_demo' AS o (BRANCH 'ours');
+UPDATE o.items SET settings={'theme':'dark','language':'en'};
+CALL differential_create_snapshot('o');
+ATTACH 'differential:nested_demo' AS t (BRANCH 'theirs');
+UPDATE t.items SET settings={'theme':'light','language':'de'};
+CALL differential_create_snapshot('t');
+-- Both changed the same complete column: one conflict, even though fields differ.
+SELECT conflict_details[1].kind, conflict_details[1].columns
+FROM differential_merge_snapshots_preview('d',1,2,3);
+SELECT node.parent, node.position, node.cell.name, node.cell.text_value
+FROM (SELECT unnest(conflict_details[1].ours_values[2].nested_value) AS node
+      FROM differential_merge_snapshots_preview('d',1,2,3));
+CREATE TABLE fixes AS SELECT *, 'cells' AS _merge_action,
+    map{'settings':'ours'} AS _merge_columns FROM o.items;
+SELECT snapshot_id FROM differential_merge_snapshots('d',1,2,3,'merged',
+    request_id=>'nested-example',resolution_tables=>map{'main.items':'memory.main.fixes'});
+ATTACH 'differential:nested_demo' AS m (BRANCH 'merged');
+SELECT settings FROM m.items;
+```
+
+```sql
+-- additive column merge
+-- expect output: additive-tables-v2
+ATTACH 'differential:additive_demo' AS s_base;
+CREATE TABLE s_base.items(id INT PRIMARY KEY, label VARCHAR);
+INSERT INTO s_base.items VALUES(1,'base');
+CALL differential_create_snapshot('s_base');
+CALL differential_create_branch('s_base','ours',snapshot=>1);
+CALL differential_create_branch('s_base','theirs',snapshot=>1);
+ATTACH 'differential:additive_demo' AS s_ours (BRANCH 'ours');
+ALTER TABLE s_ours.items ADD COLUMN note VARCHAR;
+UPDATE s_ours.items SET note='reviewed';
+CALL differential_create_snapshot('s_ours');
+ATTACH 'differential:additive_demo' AS s_theirs (BRANCH 'theirs');
+ALTER TABLE s_theirs.items ADD COLUMN amount DECIMAL(10,2);
+UPDATE s_theirs.items SET amount=2.50;
+CALL differential_create_snapshot('s_theirs');
+SELECT schema_changes, schema_conflicts, conflicts, validation_state
+FROM differential_merge_snapshots_preview('s_base',1,2,3,schema_mode=>'additive',validate=>true);
+SELECT * FROM differential_merge_snapshots('s_base',1,2,3,'merged',schema_mode=>'additive',request_id=>'additive-demo');
+SELECT schema_algorithm FROM differential_merge_requests('s_base',request_id=>'additive-demo');
+DETACH s_ours;
+DETACH s_theirs;
+DETACH s_base;
+```
+
+```sql
+-- additive new-table merge
+-- expect output: additive-tables-v2
+-- expect output: 3
+ATTACH 'differential:table_merge_demo' AS n_base;
+CALL differential_create_snapshot('n_base');
+CALL differential_create_branch('n_base','ours',snapshot=>1);
+CALL differential_create_branch('n_base','theirs',snapshot=>1);
+ATTACH 'differential:table_merge_demo' AS n_ours (BRANCH 'ours');
+CREATE TABLE n_ours.items(id INT PRIMARY KEY, label VARCHAR DEFAULT 'new', CHECK(length(label)>0));
+INSERT INTO n_ours.items VALUES (1,'shared'),(2,'ours');
+CREATE INDEX items_label ON n_ours.items(label);
+CALL differential_create_snapshot('n_ours');
+ATTACH 'differential:table_merge_demo' AS n_theirs (BRANCH 'theirs');
+CREATE TABLE n_theirs.items(id INT PRIMARY KEY, label VARCHAR DEFAULT 'new', CHECK(length(label)>0));
+INSERT INTO n_theirs.items VALUES (1,'shared'),(3,'theirs');
+CREATE INDEX items_label ON n_theirs.items(label);
+CALL differential_create_snapshot('n_theirs');
+SELECT table_change, schema_algorithm, conflicts, validation_state
+FROM differential_merge_snapshots_preview('n_base',1,2,3,schema_mode=>'additive',validate=>true);
+SELECT snapshot_id FROM differential_merge_snapshots('n_base',1,2,3,'merged',schema_mode=>'additive',request_id=>'tables-demo');
+ATTACH 'differential:table_merge_demo' AS n_result (BRANCH 'merged');
+SELECT count(*) AS rows FROM n_result.items;
+DETACH n_result;
+DETACH n_theirs;
+DETACH n_ours;
+DETACH n_base;
+```
+
+```sql
+-- table removal and view merge
+-- expect output: catalog-v1
+-- expect output: retained
+ATTACH 'differential:catalog_demo' AS c_base;
+CREATE TABLE c_base.items(id INT PRIMARY KEY, label VARCHAR);
+INSERT INTO c_base.items VALUES(1,'base');
+CREATE TABLE c_base.obsolete(id INT PRIMARY KEY);
+USE c_base;
+CREATE VIEW old_view AS SELECT id FROM obsolete;
+CREATE VIEW visible AS SELECT id,label FROM items;
+USE memory;
+CALL differential_create_snapshot('c_base');
+CALL differential_create_branch('c_base','ours',snapshot=>1);
+CALL differential_create_branch('c_base','theirs',snapshot=>1);
+ATTACH 'differential:catalog_demo' AS c_ours (BRANCH 'ours');
+DROP VIEW c_ours.old_view;
+DROP TABLE c_ours.obsolete;
+CALL differential_create_snapshot('c_ours');
+ATTACH 'differential:catalog_demo' AS c_theirs (BRANCH 'theirs');
+UPDATE c_theirs.items SET label='retained';
+USE c_theirs;
+CREATE OR REPLACE VIEW visible AS SELECT id,label FROM items WHERE id>0;
+USE memory;
+CALL differential_create_snapshot('c_theirs');
+SELECT object_type,object_name,table_action,view_change,schema_conflicts,validation_state
+FROM differential_merge_snapshots_preview('c_base',1,2,3,schema_mode=>'catalog',validate=>true);
+SELECT snapshot_id FROM differential_merge_snapshots('c_base',1,2,3,'merged',schema_mode=>'catalog',request_id=>'catalog-demo');
+SELECT schema_algorithm FROM differential_merge_requests('c_base',request_id=>'catalog-demo');
+ATTACH 'differential:catalog_demo' AS c_result (BRANCH 'merged');
+SELECT * FROM c_result.visible;
+DETACH c_result;
+DETACH c_theirs;
+DETACH c_ours;
+DETACH c_base;
+```
+
+```sql
+-- plain nullable column removal with coordinated view replacement
+-- expect output: drop
+-- expect output: retained
+ATTACH 'differential:column_drop_demo' AS cd_base;
+CREATE TABLE cd_base.items(id INT PRIMARY KEY, obsolete DECIMAL(18,3), label VARCHAR);
+INSERT INTO cd_base.items VALUES(1,1.250,'base');
+USE cd_base;
+CREATE VIEW visible AS SELECT id,obsolete,label FROM items;
+USE memory;
+CALL differential_create_snapshot('cd_base');
+CALL differential_create_branch('cd_base','ours',snapshot=>1);
+CALL differential_create_branch('cd_base','theirs',snapshot=>1);
+ATTACH 'differential:column_drop_demo' AS cd_ours (BRANCH 'ours');
+UPDATE cd_ours.items SET label='retained';
+CALL differential_create_snapshot('cd_ours');
+ATTACH 'differential:column_drop_demo' AS cd_theirs (BRANCH 'theirs');
+DROP VIEW cd_theirs.visible;
+ALTER TABLE cd_theirs.items DROP COLUMN obsolete;
+USE cd_theirs;
+CREATE VIEW visible AS SELECT id,label FROM items;
+USE memory;
+CALL differential_create_snapshot('cd_theirs');
+SELECT schema_changes, schema_conflicts, validation_state
+FROM differential_merge_snapshots_preview('cd_base',1,2,3,schema_mode=>'catalog',validate=>true)
+WHERE object_type='table';
+SELECT snapshot_id FROM differential_merge_snapshots('cd_base',1,2,3,'merged',schema_mode=>'catalog',request_id=>'column-drop-demo');
+ATTACH 'differential:column_drop_demo' AS cd_result (BRANCH 'merged');
+SELECT * FROM cd_result.visible;
+DETACH cd_result;
+DETACH cd_theirs;
+DETACH cd_ours;
+DETACH cd_base;
+```
+
+### differential_merge_snapshots
+
+```sql
+differential_merge_snapshots(database VARCHAR, base BIGINT, ours BIGINT, theirs BIGINT,
+                   destination VARCHAR, request_id VARCHAR = '',
+                   max_input_rows BIGINT = 10000000, max_input_bytes BIGINT = 1073741824,
+                   max_stage_write_bytes BIGINT = 1073741824, timeout_ms BIGINT = 600000,
+                   resolution_tables MAP(VARCHAR,VARCHAR) = map(), schema_mode VARCHAR = 'strict')
+```
+
+Creates a new branch only after conflict-free reconciliation, native constraint validation
+and checkpointing in staging. Returns `operation_id`, `branch_name`, `snapshot_id`,
+`comparison_ms`, `application_ms`, `base_snapshot_id`, `ours_snapshot_id`, `theirs_snapshot_id`,
+`selection_ms`, `ancestry_nodes`, `materialization_ms`, `publication_ms`, `merge_action`,
+`target_check_ms`. Selection counters are zero for explicit snapshot calls; materialization
+is zero for local calls. Snapshot merges return `created_branch` and zero target-check time.
+Publication time includes the local commit or S3 publication, separate from staged application.
+A completed request replay returns its original result
+identity with zero timings. The new snapshot's commit metadata records all inputs and roots.
+Supports local and single-writer S3 storage. S3 requires a nonempty `request_id` for recovery.
+Evicted inputs are reconstructed locally within
+the input and staging-write limits. S3 upload and conditional destination-head creation finish
+before the request is complete. Repeat the same request after interruption: a durably prepared
+result resumes without rereading inputs, even after their expiry. Existing destinations
+(including remote tombstones), shared writers, unsupported schemas and initially expired inputs fail.
+Pending S3 results retain their output/name reservation until retry or safe abort.
+Inputs are immutable snapshots; subsequent live changes are excluded. No ancestry is inferred.
+Resource options can change between retries; the database, input IDs, destination and
+`schema_mode` cannot. Additive/catalog modes have the same scope as snapshot preview. Schema conflicts
+fail with `merge_schema_conflict`; final constraints fail separately with `merge_constraint`.
+The first data execution freezes the caller's native `TimeZone`/`Calendar` for retries that
+recompute. Preview/preflight use current settings; use the same settings for first execution.
+Prepared/completed outputs replay without reevaluation. Older pending requests capture settings
+on their first data execution with this implementation.
+Unexpected staged view binding/output/dependency failures use `merge_application`.
+See [branch merge](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md) for semantics, errors and recovery.
+
+```sql
+-- merge prototype
+-- expect output: edited
+SELECT * FROM differential_merge_snapshots('merge_demo', 1, 2, 3, 'merged', request_id => 'demo-merge');
+ATTACH 'differential:merge_demo' AS m (BRANCH 'merged');
+SELECT * FROM m.items;
+```
+
+### differential_merge_branch_preview
+
+```sql
+differential_merge_branch_preview(database VARCHAR, ours VARCHAR, theirs VARCHAR,
+                                 conflict_limit BIGINT = 100, conflict_offset BIGINT = 0,
+                                 conflict_bytes BIGINT = 1048576, validate BOOLEAN = false,
+                                 max_input_rows BIGINT = 10000000, max_input_bytes BIGINT = 1073741824,
+                                 max_stage_write_bytes BIGINT = 1073741824, timeout_ms BIGINT = 600000,
+                                 max_ancestry_nodes BIGINT = 100000,
+                                 resolution_tables MAP(VARCHAR,VARCHAR) = map(), schema_mode VARCHAR = 'strict')
+```
+
+`ours` and `theirs` are distinct active branch names in the database. Resolves published
+heads and their unique best common ancestor at execution time, without capturing live changes.
+Explicit parent records support parent/child, nested and previously merged branches. Restores
+follow the previous head; imports/clones begin a new local history. Multiple best bases return
+`merge_base_ambiguous`; insufficient ancestry or pending restore/drop intents return
+`merge_base_unavailable`. The existing direct-sibling proof remains available for older snapshots.
+An expired required base fails without substitution, even if older ancestors remain readable.
+Local and registered single-writer S3 databases are supported; shared writers and portable remote ancestry remain unsupported.
+
+Shares the snapshot preview's options and returned columns. No branch, snapshot
+or operation is added. Each call resolves current heads; for stable pagination use the returned
+three IDs with the snapshot preview. `validate => true` tests final supported constraints.
+`max_ancestry_nodes` is 1–1,000,000; exceeding it returns `merge_limit` before request creation.
+`selection_ms` measures resolution separately, and `ancestry_nodes` counts distinct visited nodes.
+`timeout_ms` includes graph selection and logical work; these metadata traversals use bounded C++
+memory outside DuckDB's buffer manager. See [ancestry and expiry](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#expiry-and-incomplete-history).
+
+```sql
+-- merge prototype
+SELECT base_snapshot_id, ours_snapshot_id, theirs_snapshot_id, validation_state
+FROM differential_merge_branch_preview('merge_demo', 'ours', 'theirs', validate => true);
+```
+
+### differential_merge_branch_preflight
+
+```sql
+differential_merge_branch_preflight(database VARCHAR, ours VARCHAR, theirs VARCHAR, destination VARCHAR,
+                                    validate BOOLEAN = true,
+                                    max_input_rows BIGINT = 10000000, max_input_bytes BIGINT = 1073741824,
+                                    max_stage_write_bytes BIGINT = 1073741824, timeout_ms BIGINT = 600000,
+                                    max_ancestry_nodes BIGINT = 100000,
+                                    resolution_tables MAP(VARCHAR,VARCHAR) = map(), schema_mode VARCHAR = 'strict')
+```
+
+Local or single-writer S3, same-database/repository branch readiness report. Selects published heads and a unique
+base, checks catalogs/data, validates native final constraints by default, then checks the requested
+destination. For `destination = ours`, checks target ownership and exact durable bytes/WAL; otherwise
+requires an unused name. It does not capture live branch writes. No branch, snapshot, request,
+writer epoch or durable target intent is created. Temporary pins, staging and a target lease are
+released after the call. Bind/PREPARE/EXPLAIN do not execute any checks.
+
+One row is returned, even for an empty catalog. `ready` means all performed checks passed;
+`validate => false` can return `ready = true` with constraints still `not_checked`. This is advisory,
+not a reservation. Use the returned input IDs as branch execution guards; execution revalidates.
+Resolution tables are read but not frozen by preflight. Pending lifecycle operations are reported
+with their owner ID and recovery action while comparing only the published input snapshots.
+The first unsupported catalog object per input is reported; there is no partial-catalog merge.
+Cancellation, deadlines and internal/fatal errors remain SQL errors. Invalid arguments or missing
+database resolution can also fail before a report is returned.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `database_id`, `destination` | VARCHAR | Resolved database UUID and requested output name. |
+| `base_snapshot_id`, `ours_snapshot_id`, `theirs_snapshot_id` | BIGINT | Selected public input IDs; NULL when selection failed. |
+| `ours_branch_id`, `theirs_branch_id` | VARCHAR | Selected branch UUIDs; NULL when selection failed. |
+| `merge_action` | VARCHAR | Expected `created_branch`, `merged`, `fast_forward`, or `already_up_to_date`; NULL without a selection. Advisory if blocked. |
+| `ready` | BOOLEAN | All performed checks passed at the time of inspection. |
+| `target_state` | VARCHAR | `not_applicable` for a free new name, `exists` for an occupied name, `reserved` for a new name held by a pending S3 merge (issue includes its operation ID and retry/abort guidance); otherwise `clean`, `busy`, `dirty`, `unsnapshotted`, `pending`, `changed`, or `not_checked`. |
+| `validation_state` | VARCHAR | `valid`, `not_checked`, `unsupported`, `schema_conflicts`, `data_conflicts`, `constraint_violation`, or `error`. |
+| `data_conflicts`, `schema_conflicts` | BIGINT | Aggregate unresolved counts. NULL when that comparison did not run. |
+| `issues` | STRUCT[] | Bounded diagnostics; fields below. |
+| `issues_truncated` | BOOLEAN | Issue count/byte/field bounds clipped detail; counts still cover all compared objects. |
+| `selection_ms`, `target_check_ms`, `comparison_ms`, `application_ms` | DOUBLE | Phase timings; application is disposable native validation, not publication. |
+| `ancestry_nodes` | BIGINT | Distinct visited nodes during base selection. |
+
+Each issue has eight nullable VARCHAR fields: `phase`, `code`, `input` (`base`/`ours`/`theirs`
+when applicable), `object_type`, `object_name`, `message`, `operation_id`, `recovery_action`.
+At most 100 issues, 1 MiB of string payload and 4,096 UTF-8 bytes per field are returned. Use the
+existing preview for paginated typed row conflicts; preflight does not duplicate row values.
+The target byte check may replay store journals/seal durable state as internal bookkeeping;
+it never opens a writable native target or checkpoints its WAL. See [preflight scope and
+recovery](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#preflight-and-guarded-execution).
+
+```sql
+-- merge prototype
+-- expect output: created_branch
+CREATE TEMP TABLE reviewed AS SELECT * FROM differential_merge_branch_preflight(
+  'merge_demo', 'ours', 'theirs', 'reviewed_merge');
+SELECT ready, merge_action, validation_state, issues FROM reviewed;
+SET VARIABLE reviewed_base = (SELECT base_snapshot_id FROM reviewed);
+SET VARIABLE reviewed_ours = (SELECT ours_snapshot_id FROM reviewed);
+SET VARIABLE reviewed_theirs = (SELECT theirs_snapshot_id FROM reviewed);
+SELECT snapshot_id, merge_action FROM differential_merge_branch(
+  'merge_demo', 'ours', 'theirs', 'reviewed_merge', request_id => 'demo-reviewed',
+  expected_base_snapshot_id => getvariable('reviewed_base'),
+  expected_ours_snapshot_id => getvariable('reviewed_ours'),
+  expected_theirs_snapshot_id => getvariable('reviewed_theirs'));
+```
+
+### differential_merge_branch
+
+```sql
+differential_merge_branch(database VARCHAR, ours VARCHAR, theirs VARCHAR, destination VARCHAR,
+                          request_id VARCHAR = '', max_input_rows BIGINT = 10000000,
+                          max_input_bytes BIGINT = 1073741824,
+                          max_stage_write_bytes BIGINT = 1073741824, timeout_ms BIGINT = 600000,
+                          max_ancestry_nodes BIGINT = 100000,
+                          resolution_tables MAP(VARCHAR,VARCHAR) = map(), schema_mode VARCHAR = 'strict',
+                          expected_base_snapshot_id BIGINT, expected_ours_snapshot_id BIGINT,
+                          expected_theirs_snapshot_id BIGINT)
+```
+
+Uses the same automatic selection as the branch preview. A new destination is published only
+after staged reconciliation, native constraint checks and checkpointing. When `destination = ours`,
+it instead updates that existing branch, preserving its UUID. The target must be detached,
+with no transaction still holding its attachment, and have no writes/WAL beyond its selected
+snapshot. Errors are `active_attachment_or_transaction`, `merge_target_dirty` or
+`merge_target_changed` (the frozen target UUID/head changed). Other existing destinations fail.
+The source is unchanged; its unsnapshotted writes are excluded.
+
+`merge_action` is `merged` for a new two-parent target snapshot, `fast_forward` for target head
+movement to the existing source snapshot, `already_up_to_date` for an incorporated source, or
+`created_branch` for a new destination. Fast-forward/no-op still validate supported scope and
+compare inputs, but skip staging and add no snapshot. `target_check_ms` measures target ownership
+and live-image verification. All timings are zero on completed replay. A pending target intent
+survives process death and fences writers until retry/abort; errors/cancellation release it before durable S3 preparation. Prepared S3 output keeps it until
+publication or safe abort.
+The final file mapping/head, ancestry, provenance and request completion commit atomically. Returns the same columns as `differential_merge_snapshots`, including the resolved
+input IDs and resolution metrics. Resource defaults match the snapshot API, with the additional
+`max_ancestry_nodes` bound. Frozen-request replay reports zero selection time and visited nodes.
+
+Local and single-writer S3 databases registered in this repository are supported. S3 mutations
+require `request_id`. An existing S3 target must be exported and owned by this repository;
+preflight checks these conditions using remote reads. Its frozen ETag guards conditional target
+publication; `head_conflict` never silently rebases. Fast-forward needs a completed source export,
+and no-op performs no head PUT. Prepared retries recover without input snapshots. Ordinary
+export/claim skips pending target merge intents. See [S3 publication](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#s3-snapshot-and-branch-merges)
+for `merge_target_unpublished`, `merge_export_required`, `merge_pending_operation`, safe abort
+and process-death behavior. Shared writers and unknown/cross-repository ancestry remain excluded.
+
+The first request durably freezes both branch UUIDs and all three snapshot IDs. Pending retries
+reuse that selection; an existing target must still have its frozen UUID/head. Expired inputs fail. Completed
+retries return the original result without reinstalling it, even if the target has advanced. Changing database, ordered branch names or destination with
+the request ID fails.
+
+The three `expected_*_snapshot_id` parameters are optional as a group. If supplied, all must
+be positive and non-NULL. They guard a reviewed preflight/preview selection: the first execution
+compares them to both published heads and the selected base in the same transaction that reserves
+the request. A mismatch raises `merge_inputs_changed` without recording a request or output.
+Guard presence/values are request identity; adding, changing or omitting them on retry fails.
+Pending retries check the original frozen selection, not current source heads. Completed retries
+replay their original result even after expiry or head changes. No pins survive between calls.
+These guards concern snapshot IDs, not branch-name incarnations, options or resolution contents;
+reuse the reviewed schema mode and resolution mapping. The target's existing UUID/head checks
+still apply after reservation. Without guards, a new call selects current heads. To deliberately
+merge an earlier selection regardless of current heads into a new branch, use the snapshot API.
+
+```sql
+-- merge prototype
+-- expect output: edited
+SELECT * FROM differential_merge_branch('merge_demo', 'ours', 'theirs', 'merged_from_branches',
+                                       request_id => 'demo-branch-merge');
+ATTACH 'differential:merge_demo' AS b (BRANCH 'merged_from_branches');
+SELECT label FROM b.items;
+```
+
+Continue a merged branch with further changes on a contributing branch:
+
+```sql
+-- merge prototype
+-- expect output: edited
+ATTACH 'differential:merge_demo' AS t (BRANCH 'theirs');
+UPDATE t.items SET amount = 3.500;
+CALL differential_create_snapshot('t');
+SELECT base_snapshot_id FROM differential_merge_branch(
+  'merge_demo', 'merged_from_branches', 'theirs', 'merged_again', request_id => 'demo-merge-again');
+ATTACH 'differential:merge_demo' AS r (BRANCH 'merged_again');
+SELECT label, amount FROM r.items;
+```
+
+The second merge uses the earlier `theirs` snapshot as its base. Both source branches keep
+their identities and heads in this new-destination example. To update the existing target:
+
+```sql
+-- merge prototype
+-- expect output: merged
+-- Run after detaching the target in every connection.
+SELECT snapshot_id, merge_action FROM differential_merge_branch(
+  'merge_demo', 'merged_from_branches', 'theirs', 'merged_from_branches', request_id => 'demo-target-merge');
+```
+
+The source may remain attached. See [target recovery](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#merge-into-an-existing-target).
+
+### Explicit resolution tables
+
+Merge, preview and preflight functions accept `resolution_tables`, a map from `main.table` to a committed local native
+`catalog.schema.table`. Source columns exactly match the target columns/types/order, followed
+by `_merge_action VARCHAR, _merge_columns MAP(VARCHAR,VARCHAR)`. For cell conflicts use
+`cells` with each conflicting column mapped to `ours`, `theirs` or `custom`. Custom values
+come from the corresponding typed source columns. For existence conflicts use a whole-row
+choice `ours`, `theirs`, `custom` or `delete`, with an empty/NULL column map.
+
+Keys must match actual conflicts, with no duplicates or NULL keys. Wrong types, invalid choices
+and stale/nonconflicting keys raise `merge_resolution`. Missing choices leave unresolved conflicts.
+Preview's `conflicts`/details describe remaining conflicts; `resolved_conflicts` counts resolved
+rows. Native constraint validation still follows reconciliation. Maximum capture: 10,000 rows,
+8 MiB conservative logical/serialized data, 64 KiB table mapping.
+
+Mutation reserves source names with its request, then freezes the first captured contents.
+Retries read frozen data even after source edits/removal. Changing a mapping with the same
+request fails; use a new request to change frozen choices. Preview reads current committed
+source tables and freezes nothing. See [full resolution semantics](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#explicit-typed-conflict-resolution).
+
+```sql
+-- merge resolutions
+ATTACH 'differential:resolve_demo' AS d;
+CREATE TABLE d.items(id INT PRIMARY KEY,label VARCHAR);
+INSERT INTO d.items VALUES(1,'base');
+CALL differential_create_snapshot('d');
+CALL differential_create_branch('d','ours',snapshot=>1);
+CALL differential_create_branch('d','theirs',snapshot=>1);
+ATTACH 'differential:resolve_demo' AS o (BRANCH 'ours');
+ATTACH 'differential:resolve_demo' AS t (BRANCH 'theirs');
+UPDATE o.items SET label='ours';
+UPDATE t.items SET label='theirs';
+CALL differential_create_snapshot('o');
+CALL differential_create_snapshot('t');
+CREATE TABLE choices(id INT,label VARCHAR,_merge_action VARCHAR,_merge_columns MAP(VARCHAR,VARCHAR));
+INSERT INTO choices VALUES(1,'reviewed','cells',map{'label':'custom'});
+SELECT conflicts,resolved_conflicts,validation_state
+FROM differential_merge_snapshots_preview('d',1,2,3,validate=>true,
+  resolution_tables=>map{'main.items':'memory.main.choices'});
+SELECT * FROM differential_merge_snapshots('d',1,2,3,'resolved',request_id=>'resolve-demo',
+  resolution_tables=>map{'main.items':'memory.main.choices'});
+ATTACH 'differential:resolve_demo' AS m (BRANCH 'resolved');
+SELECT * FROM m.items;
+```
+
+### differential_merge_resolutions
+
+```sql
+differential_merge_resolutions(database VARCHAR, request VARCHAR)
+```
+
+Reads the request's frozen typed decision audit. Returns `schema_name`, `table_name`, typed
+cell lists `key` and `values`, `action`, `columns MAP(VARCHAR,VARCHAR)`, and the frozen
+`base_snapshot_id`, `ours_snapshot_id`, `theirs_snapshot_id`. The cell shape is
+the same as conflict details, including native DATE and TIMESTAMP fields. Zero rows means no
+captured choices. The parent operation in `differential_operations()` determines whether a
+result was published; frozen choices may belong to a failed/pending merge. Values persist with
+operation history, including ignored source fields. This function creates no history or pins.
+
+```sql
+-- merge resolutions
+SELECT table_name,key,action,columns,values
+FROM differential_merge_resolutions('resolve_demo','resolve-demo');
+```
+
+### differential_merge_ancestry
+
+```sql
+differential_merge_ancestry(database VARCHAR, ours BIGINT, theirs BIGINT,
+                           max_ancestry_nodes BIGINT = 100000, timeout_ms BIGINT = 600000)
+```
+
+Inspects the reachable recorded graph of two explicit snapshots in one local or single-writer S3 database, including expired ones.
+An evicted snapshot is readable when its completed immutable export is recorded; inspection performs no S3 reads.
+Returns `snapshot_id`, `branch_id`, `kind`, `parents_known`, `parents BIGINT[]`, `reachable_from`
+(`ours`, `theirs`, `both`), `candidate`, `retired`, `readable`, `selection_state`, `selected_base`.
+Selection is `unique`, `ambiguous`, `unrelated` or `incomplete`; only `unique` has a selected base.
+Candidates in incomplete graphs are provisional. A unique expired base remains visible but
+cannot be merged. Unknown parents are not inferred, and the legacy sibling fallback is not
+applied by inspection. Corrupt/unknown-version records still error. Missing input IDs fail.
+
+Rows sort by snapshot ID only for presentation. The node bound is 1–1,000,000; timeout is
+positive milliseconds. Cancellation is checked during traversal. No new snapshot, operation,
+branch, payload pin or ancestor retention is created. Use published head IDs from
+`differential_branches()` to inspect branch history.
+
+```sql
+-- merge prototype
+SELECT snapshot_id,parents,reachable_from,candidate,selection_state,selected_base
+FROM differential_merge_ancestry('merge_demo',4,3);
+```
+
+### differential_merge_requests
+
+```sql
+differential_merge_requests(database VARCHAR, request_id VARCHAR = '', max_results BIGINT = 1000,
+                            after_operation_id VARCHAR = '')
+```
+
+Inspects durable local metadata for snapshot/branch requests without S3 access, input reads
+or retention changes. `request_id` filters exactly when nonempty. `max_results` is 1–1000;
+rows are ordered by operation UUID. Pass the final UUID as the exclusive `after_operation_id`
+cursor for the next page. Each page has its own metadata view.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `operation_id`, `request_id`, `merge_kind` | VARCHAR | Merge UUID, nullable caller identity, snapshot/branch operation kind. |
+| `state` | VARCHAR | `pending`, `target_locked`, `prepared`, `uploaded`, `publication_uncertain`, `complete`, or `aborted`. |
+| `database_id`, `destination` | VARCHAR | Database UUID and requested destination branch name. |
+| `base_snapshot_id`, `ours_snapshot_id`, `theirs_snapshot_id` | BIGINT | Frozen input IDs. |
+| `result_snapshot_id`, `result_root` | BIGINT, VARCHAR | Nullable prepared/completed result identity; a reserved number alone is not a public snapshot. |
+| `retained_logical_bytes` | BIGINT | Private result's retained logical size, excluding input/staging pins and physical overhead. |
+| `destination_reserved` | BOOLEAN | Private result owns its local reservation, or a pending target merge owns its durable fence. |
+| `remote_descriptor` | VARCHAR | Nullable verified immutable export key. |
+| `publication_attempted` | BOOLEAN | Head write may have been sent; legacy records conservatively report true. |
+| `recovery_action` | VARCHAR | Guidance for retry or abort. |
+| `created_at` | TIMESTAMPTZ | Original request creation time. |
+| `schema_mode`, `schema_algorithm` | VARCHAR | Frozen mode and planner version; legacy requests without policy records use `strict`/`strict-v1`. |
+| `merge_action` | VARCHAR | `created_branch`, `merged`, `fast_forward`, or `already_up_to_date`, derived from the frozen selection; pending state is not a completed result. |
+| `ours_branch_name`, `theirs_branch_name` | VARCHAR | Original branch names, not current names; NULL for explicit-snapshot requests. |
+| `ours_branch_id`, `theirs_branch_id` | VARCHAR | Original branch UUIDs, preserved across name reuse; NULL for explicit-snapshot requests. |
+| `inputs_guarded` | BOOLEAN | Whether all three expected snapshot IDs were supplied. Frozen IDs above are the expected values. NULL for explicit-snapshot requests. |
+| `attempt_count` | BIGINT | Number of admitted executions that acquired the request lock and durably started an attempt. Zero when none is recorded, including legacy requests. Completed replay does not increment it. |
+| `last_attempt_id` | VARCHAR | Nullable execution UUID; changes on an admitted retry. Only the latest attempt is retained. |
+| `last_attempt_state` | VARCHAR | `incomplete`, `failed`, or `succeeded`; NULL without diagnostics. `incomplete` is not a liveness indicator. |
+| `last_attempt_phase` | VARCHAR | Last durable milestone for an incomplete attempt, actual failure phase for a recorded failure, or `completed` after publication. NULL without diagnostics. |
+| `last_attempt_error_code` | VARCHAR | Allowlisted error category, such as `merge_conflict`, `merge_constraint`, `cancelled`, `merge_timeout`, or `merge_error` for an unclassified error. NULL unless failure was recorded. Never contains the exception message or row values. |
+| `last_attempt_started_at`, `last_attempt_updated_at`, `last_attempt_finished_at` | TIMESTAMPTZ | Microsecond wall-clock timestamps, clamped to be nondecreasing per request. Finished is NULL for incomplete attempts; all three are NULL without diagnostics. |
+
+Request `state` and `recovery_action` remain authoritative. An incomplete attempt may still be
+running, have lost its process, or have failed while diagnostics were unwritable. Inspect
+`differential_merge_status()` for live progress in this process. Coarse progress writes are
+bounded independently of tables/rows; diagnostics do not retain snapshots. Ordinary abort
+preserves the latest attempt. If abort recovers a published S3 result, completion and successful
+diagnostics are recorded atomically. See [attempt semantics](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#durable-attempt-diagnostics).
+
+Pending `nullable-columns-v1` requests retain the column-only planner. New additive requests
+use `additive-tables-v2`; a fresh preview does not change an existing request's planner version.
+
+```sql
+-- merge prototype
+-- expect output: complete
+SELECT operation_id, state, destination, retained_logical_bytes, attempt_count,
+       last_attempt_state, last_attempt_phase, last_attempt_error_code
+FROM differential_merge_requests('merge_demo', request_id => 'demo-merge', max_results => 10);
+```
+
+### differential_abort_merge
+
+```sql
+differential_abort_merge(database VARCHAR, operation_id VARCHAR, request_id VARCHAR = '',
+                          timeout_ms BIGINT = 600000)
+```
+
+Abandons an unpublished merge identified by its **operation UUID**, releasing its private
+retention and destination reservation. The optional `request_id` belongs to the abort action.
+It requires autocommit and serializes with attempts of that merge; waiting honors cancellation
+and timeout. It does not interrupt the active publisher. A published result is preserved and
+local recovery is completed instead. Failed S3 checks and uncertain head writes retain state.
+In particular, an absent head after write intent cannot disprove an in-flight PUT from a dead
+process. Retry the original merge when `merge_publication_uncertain` is reported.
+
+Returns `operation_id` (abort UUID), `merge_operation_id`, `state` (`aborted` or `complete`),
+and `snapshot_id` (NULL if aborted). Exact completed retries return the original outcome;
+changed arguments fail. Aborted merge requests stay terminal (`merge_aborted`) even if
+the destination is reused. A new request can reuse a released name, subject to ordinary
+destination checks; existing remote heads/tombstones are never replaced. Uploaded immutable
+objects and audit records are not deleted. See [safe abort](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#durable-requests-and-safe-abort).
+
+```sql
+-- merge prototype
+-- expect output: complete
+SET VARIABLE finished_merge=(SELECT operation_id FROM differential_merge_requests('merge_demo',request_id=>'demo-merge'));
+SELECT state FROM differential_abort_merge('merge_demo',getvariable('finished_merge'),request_id=>'demo-abort');
+```
+
+### differential_merge_status
+
+```sql
+differential_merge_status()
+```
+
+Lists active merge/preview/abort executions for this repository in the current process. It has
+no persistent effects during binding or planning. Query from another connection while a
+merge runs. Columns: `execution_id`, `operation_id`, `database_id`, `mode`, `phase`,
+`table_name`, `tables_total`, `tables_completed`, `input_rows`, `input_bytes`, `changed_rows`,
+`conflicts`, `detail_bytes`, `stage_write_bytes`, `max_stage_write_bytes`, `elapsed_ms`,
+`timeout_ms`. Entries disappear after cleanup; durable request outcomes remain in
+`differential_merge_requests()`.
+In catalog mode, table progress includes planned removals and excludes views.
+`column_drop_check`/`column_drops_checked` bracket each table's typed column-removal proof. During
+`view_created`, `table_name` carries the view's name. Removing a table does not count as
+row changes in `changed_rows`.
+
+```sql
+SELECT phase, tables_completed, tables_total, stage_write_bytes
+FROM differential_merge_status();
 ```

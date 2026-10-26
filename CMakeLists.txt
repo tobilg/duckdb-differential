@@ -25,6 +25,9 @@ set(STORE_SOURCES
     src/storage/store.cpp
     src/storage/segment.cpp
     src/metadata/control.cpp
+    src/metadata/ancestry.cpp
+    src/metadata/merge_publication.cpp
+    src/metadata/merge_target.cpp
     src/metadata/retention.cpp
     src/metadata/resolve.cpp
     src/providers/local/local_provider.cpp)
@@ -33,6 +36,9 @@ set(EXTENSION_SOURCES
     src/duckdb_adapter/probe_filesystem.cpp
     src/duckdb_adapter/durable_filesystem.cpp
     src/duckdb_adapter/control_functions.cpp
+    src/duckdb_adapter/logical_merge.cpp
+    src/duckdb_adapter/merge_types.cpp
+    src/duckdb_adapter/merge_preflight.cpp
     src/duckdb_adapter/secrets.cpp
     src/duckdb_adapter/differential_catalog.cpp
     src/duckdb_adapter/follow.cpp
@@ -63,7 +69,7 @@ if(DIFFERENTIAL_TEST_HOOKS)
   add_library(differential_store STATIC ${STORE_SOURCES})
   target_compile_definitions(differential_store PUBLIC DIFFERENTIAL_TEST_HOOKS)
   target_link_libraries(differential_store PUBLIC unofficial::sqlite3::sqlite3 OpenSSL::Crypto)
-  foreach(test store_test store_faults control_test control_races local_pools shared_test remote_gc_test)
+  foreach(test store_test store_faults control_test control_races ancestry_test local_pools shared_test remote_gc_test)
     add_executable(${test} test/unit/${test}.cpp)
     target_link_libraries(${test} PRIVATE differential_store)
     add_test(NAME ${test} COMMAND ${test})

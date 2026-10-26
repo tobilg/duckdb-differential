@@ -1,0 +1,98 @@
+# name: test/sql/merge_diagnostics.test
+# description: durable merge request identities, attempts and replay
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_diagnostics'
+
+statement ok
+PREPARE inspect AS SELECT attempt_count FROM differential_merge_requests('absent')
+
+statement ok
+EXPLAIN SELECT last_attempt_phase FROM differential_merge_requests('absent')
+
+query T
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:diagnostics' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,v VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,NULL)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','feature',snapshot=>1)
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,999,'result',request_id=>'retry')
+----
+not_found
+
+query TITTT
+SELECT state,attempt_count,last_attempt_state,last_attempt_phase,last_attempt_error_code FROM differential_merge_requests('d',request_id=>'retry')
+----
+pending	1	failed	context_frozen	not_found
+
+query III
+SELECT ours_branch_id IS NULL,inputs_guarded IS NULL,last_attempt_started_at<=last_attempt_updated_at AND last_attempt_updated_at=last_attempt_finished_at FROM differential_merge_requests('d',request_id=>'retry')
+----
+1	1	1
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,999,'result',request_id=>'retry')
+----
+not_found
+
+query I
+SELECT attempt_count FROM differential_merge_requests('d',request_id=>'retry')
+----
+2
+
+statement ok
+CALL differential_merge_branch('d','main','feature','merged',request_id=>'guarded',expected_base_snapshot_id=>1,expected_ours_snapshot_id=>1,expected_theirs_snapshot_id=>1)
+
+query TTTITTI
+SELECT state,ours_branch_name,theirs_branch_name,inputs_guarded,last_attempt_state,last_attempt_phase,attempt_count FROM differential_merge_requests('d',request_id=>'guarded')
+----
+complete	main	feature	1	succeeded	completed	1
+
+statement ok
+CREATE TEMP TABLE before AS SELECT * FROM differential_merge_requests('d')
+
+statement ok
+CALL differential_merge_branch('d','main','feature','merged',request_id=>'guarded',expected_base_snapshot_id=>1,expected_ours_snapshot_id=>1,expected_theirs_snapshot_id=>1)
+
+statement error
+SELECT * FROM differential_merge_branch('d','main','feature','merged',request_id=>'guarded')
+----
+different expected snapshot IDs
+
+query I
+SELECT count(*) FROM ((SELECT * FROM differential_merge_requests('d') EXCEPT ALL SELECT * FROM before) UNION ALL (SELECT * FROM before EXCEPT ALL SELECT * FROM differential_merge_requests('d')))
+----
+0
+
+query III
+SELECT length(last_attempt_id)=36,last_attempt_error_code IS NULL,last_attempt_started_at<=last_attempt_finished_at FROM differential_merge_requests('d',request_id=>'guarded')
+----
+1	1	1
+
+statement ok
+CALL differential_merge_branch('d','main','feature','unguarded',request_id=>'unguarded')
+
+query I
+SELECT inputs_guarded FROM differential_merge_requests('d',request_id=>'unguarded')
+----
+0
+
+statement ok
+DETACH d

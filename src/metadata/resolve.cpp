@@ -8,6 +8,31 @@ using namespace control;
 ResolvedPath Control::Resolve(const std::string &uri) {
     ResolvedPath p;
     p.canonical = uri;
+    if (uri.rfind("diff://merge_stage/", 0) == 0 || uri.rfind("diff://merge_input/", 0) == 0) {
+        bool reader = uri.rfind("diff://merge_input/", 0) == 0;
+        auto id = uri.substr(19);
+        auto dot = id.find('.');
+        if (dot != std::string::npos) {
+            p.suffix = id.substr(dot);
+            id.resize(dot);
+        }
+        std::lock_guard<std::recursive_mutex> guard(store->mutex);
+        auto found = merge_stages.find(id);
+        auto owner = found == merge_stages.end() ? nullptr : found->second.first.lock();
+        if (!owner || reader == owner->merge_stage ||
+            (p.suffix != "" && p.suffix != ".wal" && p.suffix != ".wal.checkpoint" &&
+             p.suffix != ".wal.recovery"))
+            throw std::runtime_error("[differential:merge_stage] No live merge staging owner");
+        if (reader) {
+            p.managed = p.historical = p.merge_input = true;
+            p.root = owner->root;
+            return p;
+        }
+        p.merge_stage = true;
+        p.merge_pool = found->second.second;
+        p.merge_budget = owner->merge_budget;
+        return p;
+    }
     if (uri.rfind("diff://", 0) != 0)
         throw std::runtime_error("Invalid differential URI");
     std::vector<std::string> parts;

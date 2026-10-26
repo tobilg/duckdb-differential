@@ -1,0 +1,112 @@
+# name: test/sql/merge_types.test
+# description: native scalar equality, exact timestamps and whole nested values
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_types'
+
+statement ok
+ATTACH 'differential:types' AS d
+
+statement ok
+CREATE TABLE d.x(id UUID PRIMARY KEY,v DOUBLE,ts TIMESTAMP_NS,tz TIMESTAMPTZ_NS,bytes BLOB,settings STRUCT(theme VARCHAR,language VARCHAR))
+
+statement ok
+INSERT INTO d.x VALUES('00000000-0000-0000-0000-000000000001',0,TIMESTAMP_NS '2020-01-01 00:00:00.123456789',TIMESTAMPTZ_NS '2020-01-01 00:00:00.123456789+00','\x00\xFF',{'theme':'light','language':'en'})
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','o',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','t',snapshot=>1)
+
+statement ok
+ATTACH 'differential:types' AS o (BRANCH 'o')
+
+statement ok
+ATTACH 'differential:types' AS t (BRANCH 't')
+
+statement ok
+UPDATE o.x SET v='NaN',settings={'theme':'dark','language':'en'}
+
+statement ok
+UPDATE t.x SET v='NaN',ts=TIMESTAMP_NS '2020-01-01 00:00:00.123456788',tz=TIMESTAMPTZ_NS '2020-01-01 02:00:00.123456789+02',bytes='\xFF\x00',settings={'theme':'light','language':'de'}
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query IIIIII
+SELECT conflicts,conflict_details[1].columns=['settings'],
+       conflict_details[1].key[1].uuid_value='00000000-0000-0000-0000-000000000001'::UUID,
+       isnan(conflict_details[1].ours_values[2].double_value),
+       conflict_details[1].theirs_values[3].timestamp_ns_value=TIMESTAMP_NS '2020-01-01 00:00:00.123456788',
+       conflict_details[1].theirs_values[5].blob_value='\xFF\x00'::BLOB
+FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+1	true	true	true	true	true
+
+query IIIIT
+SELECT len(conflict_details[1].ours_values[6].nested_value),
+       conflict_details[1].ours_values[6].nested_value[1].parent,
+       conflict_details[1].ours_values[6].nested_value[2].parent,
+       conflict_details[1].ours_values[6].nested_value[2].position,
+       conflict_details[1].ours_values[6].nested_value[2].cell.text_value
+FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+3	0	1	1	dark
+
+statement ok
+CREATE TABLE fixes AS SELECT *, 'cells' AS _merge_action, map{'settings':'custom'} AS _merge_columns FROM o.x
+
+statement ok
+UPDATE fixes SET settings={'theme':'dark','language':'de'}
+
+query II
+SELECT conflicts,resolved_conflicts FROM differential_merge_snapshots_preview('d',1,2,3,resolution_tables=>map{'main.x':'memory.main.fixes'},validate=>true)
+----
+0	1
+
+statement ok
+DETACH o
+
+statement ok
+DETACH t
+
+query I
+SELECT snapshot_id FROM differential_merge_branch('d','o','t','o',request_id=>'native-types',resolution_tables=>map{'main.x':'memory.main.fixes'})
+----
+4
+
+statement ok
+ATTACH 'differential:types' AS r (BRANCH 'o')
+
+query IIIII
+SELECT isnan(v),ts=TIMESTAMP_NS '2020-01-01 00:00:00.123456788',tz=TIMESTAMPTZ_NS '2020-01-01 00:00:00.123456789+00',bytes='\xFF\x00'::BLOB,settings={'theme':'dark','language':'de'} FROM r.x
+----
+true	true	true	true	true
+
+query TT
+SELECT values[6].nested_value[2].cell.text_value,values[6].nested_value[3].cell.text_value FROM differential_merge_resolutions('d','native-types')
+----
+dark	de
+
+statement ok
+DROP TABLE fixes
+
+query I
+SELECT snapshot_id FROM differential_merge_branch('d','o','t','o',request_id=>'native-types',resolution_tables=>map{'main.x':'memory.main.fixes'})
+----
+4
+
+statement ok
+DETACH r
+
+statement ok
+DETACH d

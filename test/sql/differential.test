@@ -21,7 +21,7 @@ query I
 SELECT count(DISTINCT function_name) FROM duckdb_functions()
 WHERE function_name LIKE 'differential\_%' ESCAPE '\' AND function_name <> 'differential_probe_checkpoint'
 ----
-30
+40
 
 query I
 SELECT count(*) FROM duckdb_functions()

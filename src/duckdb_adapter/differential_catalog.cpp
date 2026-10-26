@@ -51,7 +51,7 @@ class ScopedFunctionGenerator : public DefaultGenerator {
 class SnapshotSchemaEntry : public SchemaCatalogEntry {
   public:
     SnapshotSchemaEntry(Catalog &snapshot, SchemaCatalogEntry &inner, CreateSchemaInfo &info)
-        : SchemaCatalogEntry(snapshot, info), snapshot(snapshot), inner(inner) {}
+        : SchemaCatalogEntry(snapshot, info, inner.GetParentSchema()), snapshot(snapshot), inner(inner) {}
 
     optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup) override {
         return inner.LookupEntry(Own(transaction), Plain(lookup));

@@ -32,6 +32,15 @@ void SetExportVerification(bool read_back);
 void SetExportStaging(bool in_memory);
 bool ExportReadsBack();
 bool ExportStagesInMemory();
+// Export a durable private result, conditionally create/update its destination head,
+// then finalize local metadata. Never republishes unrelated input heads.
+void CheckMergeRemoteDestination(Control &, const std::string &database, const std::string &destination);
+// Read-only ownership/caught-up check. Returns the exact ETag to freeze before publication.
+std::string CheckMergeRemoteTarget(Control &, const Branch &, const std::function<void()> &check);
+Operation PublishMergeS3(Control &, const Operation &, const std::function<void(const std::string &)> &phase);
+// Caller holds the request lock. Reads the head only; never creates a destination.
+// Completes an already published result, or proves that local abandonment is safe.
+void CheckAbortMergeS3(Control &, const Operation &, const std::function<void(const std::string &)> &phase);
 
 // Branch heads: a small mutable object per exported branch, dbs/<database uuid>/branches/<branch
 // name>, naming the latest exported snapshot in the branch's history and its descriptor, so remote
@@ -205,7 +214,7 @@ class RemoteSnapshot {
     RemoteSnapshot(Control &, const std::string &provider, const std::string &descriptor, RemoteCaching caching = {});
     uint64_t Read(void *, uint64_t length, uint64_t offset);
     // Copy the exported sparse map into `file` and seal it under the descriptor's root identity.
-    Root Materialize(Store &, int64_t file);
+    Root Materialize(Store &, int64_t file, const std::function<void(uint64_t)> &check = {});
     // The exported chunks of index page `page`: logical chunk and identity, and where it is stored.
     std::vector<std::pair<ChunkRef, RemoteChunk>> Entries(uint64_t page);
     Descriptor descriptor;

@@ -1,0 +1,116 @@
+# name: test/sql/merge_branches.test
+# description: branch merges resolve ancestry and published heads at execution only
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_branches'
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('differential_merge','differential_merge_preview')
+----
+0
+
+statement ok
+PREPARE later AS SELECT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id FROM differential_merge_branch('branches','o','t','merged',request_id=>'branch-request')
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_branch_preview('missing','o','t',validate=>true)
+
+query I
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:branches' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,0,NULL)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','o',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','t',snapshot=>1)
+
+statement ok
+ATTACH 'differential:branches' AS o (BRANCH 'o')
+
+statement ok
+UPDATE o.x SET a=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:branches' AS t (BRANCH 't')
+
+statement ok
+UPDATE t.x SET b='new'
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query IIIT
+SELECT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id,validation_state FROM differential_merge_branch_preview('d','o','t',validate=>true)
+----
+1	2	3	valid
+
+# Exclude unpublished live state, including after PREPARE.
+statement ok
+UPDATE o.x SET a=99
+
+query III
+EXECUTE later
+----
+1	2	3
+
+statement ok
+ATTACH 'differential:branches' AS m (BRANCH 'merged')
+
+query IIT
+SELECT * FROM m.x
+----
+1	1	new
+
+# Completed replay does not select the newly published head.
+statement ok
+CALL differential_create_snapshot('o')
+
+query IIII
+SELECT snapshot_id,base_snapshot_id,ours_snapshot_id,theirs_snapshot_id FROM differential_merge_branch('d','o','t','merged',request_id=>'branch-request')
+----
+4	1	2	3
+
+statement error
+SELECT * FROM differential_merge_branch('d','t','o','merged',request_id=>'branch-request')
+----
+Request ID
+
+query I
+SELECT base_snapshot_id FROM differential_merge_branch_preview('d','main','o')
+----
+1
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','merged')
+----
+name_conflict
+
+statement ok
+BEGIN
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','transaction')
+----
+requires autocommit
+
+statement ok
+ROLLBACK

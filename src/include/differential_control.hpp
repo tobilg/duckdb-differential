@@ -1,6 +1,7 @@
 #pragma once
 #include "differential_store.hpp"
 #include "differential_s3.hpp"
+#include "differential_merge_budget.hpp"
 #include <condition_variable>
 #include <optional>
 #include <set>
@@ -114,6 +115,69 @@ struct Operation {
     std::string id, request, kind, payload, state, database, branch;
     int64_t snapshot = 0, preservation = 0;
 };
+// A validated S3 merge awaiting publication. The local destination is not advanced yet.
+// The companion operation and export_pending root survive process death.
+struct MergePublication {
+    Operation record;
+    Snapshot snapshot;
+    std::string merge_id, destination, provider, descriptor, write_id;
+    std::string action = "created_branch", expected_etag;
+    int64_t ours = 0, theirs = 0;
+    bool head_attempted = false;
+};
+// Bounded latest-attempt diagnostics; no roots or user error text are retained.
+struct MergeAttempt {
+    std::string id, state, phase, error_code;
+    int64_t count = 0, started_at = 0, updated_at = 0, finished_at = 0;
+};
+struct MergeRequest {
+    Operation operation;
+    std::string database, destination, state, root, descriptor, recovery;
+    std::string schema_mode, schema_algorithm, action;
+    std::string ours_branch_name, theirs_branch_name, ours_branch_id, theirs_branch_id;
+    std::optional<MergeAttempt> attempt;
+    int64_t base = 0, ours = 0, theirs = 0, result = 0, retained_bytes = 0, created_at = 0;
+    bool reserved = false, head_attempted = false, inputs_guarded = false;
+};
+struct SnapshotParents {
+    std::string kind;
+    int64_t first = 0, second = 0;
+};
+struct MergeAncestor {
+    int64_t snapshot = 0;
+    SnapshotParents parents;
+    unsigned reach = 0;
+    bool known = false, candidate = false, retired = false, readable = false;
+    std::string branch;
+};
+struct MergeAncestry {
+    std::vector<MergeAncestor> nodes;
+    std::string state;
+    int64_t selected = 0;
+};
+// A branch request resolves once to immutable inputs. Pending/completed retries use
+// the recorded IDs even when branch heads advance or names are deleted and reused.
+struct BranchMergeInputs {
+    Operation operation;
+    std::string ours_branch, theirs_branch;
+    std::string selection = "unique-base-v1";
+    int64_t base = 0, ours = 0, theirs = 0;
+    int64_t ancestry_nodes = 0;
+    double selection_ms = 0;
+};
+struct MergeExpectedInputs {
+    int64_t base = 0, ours = 0, theirs = 0; // All zero disables the guard; otherwise all positive.
+    bool Enabled() const { return base != 0 || ours != 0 || theirs != 0; }
+    void Validate() const;
+    void Check(int64_t actual_base, int64_t actual_ours, int64_t actual_theirs) const;
+};
+struct MergeDiagnostic {
+    std::string phase, code, input, object_type, object_name, message, operation_id, recovery_action;
+};
+struct MergeDestinationCheck {
+    std::string target_state = "not_checked";
+    std::vector<MergeDiagnostic> issues;
+};
 struct ResolvedPath {
     bool managed = false, historical = false;
     bool remote = false;
@@ -121,8 +185,14 @@ struct ResolvedPath {
     std::string canonical, file, root, suffix;
     Branch branch;
     Snapshot snapshot;
+    bool merge_stage = false;
+    bool merge_input = false;
+    std::string merge_pool;
+    std::shared_ptr<MergeWriteBudget> merge_budget;
 };
 struct Pin {
+    bool merge_stage = false;
+    std::shared_ptr<MergeWriteBudget> merge_budget;
     std::shared_ptr<Store> store;
     std::string id, root;
     int fd = -1;
@@ -355,10 +425,73 @@ class Control {
     Operation CompleteImport(const Operation &, const Root &, const std::string &source_database,
                              int64_t source_snapshot, const std::string &provider = "local");
     std::string Profile(const std::string &database);
+    // Process-local, pin-owned staging namespace, never a public branch.
+    std::shared_ptr<Pin> MergeStage(const std::string &root, const std::string &pool,
+                                  std::shared_ptr<MergeWriteBudget> budget);
+    std::shared_ptr<Pin> MergeReader(const std::string &root);
+    std::pair<Snapshot, std::shared_ptr<Pin>> PinMergeInput(const std::string &database, int64_t snapshot);
+    Operation BeginMerge(const std::string &database, int64_t base, int64_t ours, int64_t theirs,
+                         const std::string &name, const std::string &request, const std::string &resolution_spec = "",
+                         const std::string &schema_mode = "strict");
+    BranchMergeInputs ResolveMergeBranches(const std::string &database, const std::string &ours,
+                                           const std::string &theirs, const std::string &destination,
+                                           const std::string &request, int64_t max_nodes = 100000,
+                                           const std::function<void()> &check = {}, const std::string &resolution_spec = "",
+                                           const std::string &schema_mode = "strict",
+                                           const MergeExpectedInputs &expected = {}, bool inspect_pending = false);
+    MergeDestinationCheck InspectMergeDestination(const std::string &database, const std::string &ours,
+                                                  const std::string &theirs, const std::string &destination,
+                                                  const BranchMergeInputs *selected,
+                                                  const std::function<void()> &check);
+    Operation PublishMerge(const Operation &, const Root &, const std::string &provenance);
+    static std::string MergeAction(const Operation &);
+    std::shared_ptr<BranchLock> PrepareMergeTarget(const Operation &);
+    void CheckMergeTargetClean(const Branch &, const std::string &expected_root);
+    void ReleaseMergeTarget(const Operation &);
+    bool MergeTargetPending(const std::string &branch);
+    Operation PublishMergeTarget(const Operation &, const Branch &, const Root &, const std::string &provenance);
+    // Caller holds the metadata FULL transaction and target fence.
+    void FinishMergeTargetTx(Operation &, const Branch &, const Root &, const std::string &provenance,
+                             const Snapshot *published = nullptr);
+    std::optional<MergePublication> PendingMergePublication(const Operation &);
+    MergePublication PrepareMergePublication(const Operation &, const Root &, const std::string &provenance,
+                                              const std::string &expected_etag = "");
+    void MergeUploadComplete(const Operation &, const std::string &descriptor);
+    Operation FinishMergePublication(const Operation &);
+    void MergeHeadAttempt(const Operation &);
+    // Lock order: request lock, then S3 head lock, then short metadata transactions.
+    // Never wait for a file lock while holding store->mutex.
+    std::shared_ptr<BranchLock> LockMerge(const Operation &, const std::function<void()> &check);
+    bool MergeAborted(const Operation &);
+    void CheckMergeActive(const Operation &);
+    // Caller holds the merge request lock. Publication completes diagnostics in
+    // the same FULL transaction as the result; completed replays never start one.
+    MergeAttempt BeginMergeAttempt(const Operation &);
+    void UpdateMergeAttempt(const Operation &, const std::string &attempt_id, const std::string &phase,
+                            const std::string &error_code = "");
+    static std::string SafeMergeErrorCode(const std::string &);
+    static std::string CurrentMergeSchemaAlgorithm(const std::string &mode);
+    std::pair<std::string, std::string> MergeSchemaPolicy(const Operation &);
+    // First execution freezes native expression settings; retries reuse them.
+    std::pair<std::string, std::string> MergeExpressionContext(const Operation &,
+                                                              const std::string &timezone,
+                                                              const std::string &calendar);
+    Operation FindMergeOperation(const std::string &database, const std::string &operation_id);
+    std::vector<MergeRequest> MergeRequests(const std::string &database, const std::string &request,
+                                           const std::string &after, int64_t limit,
+                                           const std::function<void()> &check);
+    Operation BeginAbortMerge(const Operation &, const std::string &request);
+    Operation FinishAbortMerge(const Operation &abort, const Operation &merge);
+    MergeAncestry InspectMergeAncestry(const std::string &database, int64_t ours, int64_t theirs,
+                                      int64_t max_nodes, const std::function<void()> &check = {});
+    std::optional<std::string> MergeResolutions(const Operation &, const std::string &specification,
+                                               std::optional<std::string> data = std::nullopt);
+    std::string ReadMergeResolutions(const std::string &database, const std::string &request);
     static int64_t Now();
 
   private:
     std::function<int64_t()> clock;
+    std::map<std::string, std::pair<std::weak_ptr<Pin>, std::string>> merge_stages;
     std::mutex maintenance_mutex;
     std::condition_variable maintenance_signal;
     bool maintenance_requested = false, maintenance_stopping = false;
@@ -367,11 +500,27 @@ class Control {
     std::string DatabaseID(const std::string &name);
     Operation Begin(const std::string &kind, const std::string &payload, const std::string &request);
     void Complete(Operation &);
+    std::optional<MergeAttempt> ReadMergeAttempt(const Operation &);
+    void WriteMergeAttempt(const Operation &, const MergeAttempt &);
+    void CompleteMergeAttempt(const Operation &);
     void Validate(const Branch &);
     void AssignProvider(const std::string &database, const std::string &provider);
-    Snapshot Publish(const Branch &, const Root &, const SnapshotInfo &, int64_t captured_at);
+    Snapshot Publish(const Branch &, const Root &, const SnapshotInfo &, int64_t captured_at,
+                     std::optional<SnapshotParents> parents = std::nullopt);
+    void RecordAncestry(const Snapshot &, SnapshotParents);
+    void ReserveMergeResolutions(const Operation &, const std::string &specification);
+    void ReserveMergeSchema(const Operation &, const std::string &mode, bool create);
+    void ReserveMergeExpectations(const Operation &, const MergeExpectedInputs &, bool create);
+    void CheckMergeDestination(const std::string &database, const std::string &name,
+                               const std::string &owner = "");
+    std::string MergeDestinationOwner(const std::string &database, const std::string &name);
+    MergeAncestry WalkMergeAncestry(const std::string &database, int64_t ours, int64_t theirs,
+                                   int64_t max_nodes, const std::function<void()> &check);
+    int64_t FindMergeBase(const std::string &database, int64_t ours, int64_t theirs, int64_t max_nodes,
+                         const std::function<void()> &check, int64_t &visited);
     Branch NewBranch(const std::string &database, const std::string &name, const std::string &root,
-                     int64_t head, const std::string &source_db, int64_t source_snapshot);
+                     int64_t head, const std::string &source_db, int64_t source_snapshot,
+                     const std::string &reserved_id = "");
     void Event(const Branch &, int64_t snapshot, int64_t timestamp);
     int64_t RenumberTx(const std::string &database, int64_t from, int64_t taken);
     std::string ImportMapTx(const std::string &provider, const RemoteHead &);

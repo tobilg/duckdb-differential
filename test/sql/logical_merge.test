@@ -1,0 +1,162 @@
+# name: test/sql/logical_merge.test
+# description: explicit local three-way logical merging executes at scan time
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository = '__TEST_DIR__/logical_merge'
+
+statement ok
+PREPARE not_executed AS SELECT * FROM differential_merge_snapshots('missing', 1, 2, 3, 'result')
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_snapshots_preview('missing', 1, 2, 3)
+
+statement ok
+PREPARE validation_not_executed AS SELECT * FROM differential_merge_snapshots_preview('missing',1,2,3,validate=>true)
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_status()
+
+query I
+SELECT status FROM differential_status() WHERE capability = 'repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:merge' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY, a INT, b VARCHAR, amount DECIMAL(12,3))
+
+statement ok
+INSERT INTO d.x VALUES (1,0,NULL,1.250), (2,0,'delete',NULL)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','ours',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','theirs',snapshot=>1)
+
+statement ok
+ATTACH 'differential:merge' AS o (BRANCH 'ours')
+
+statement ok
+UPDATE o.x SET a=1 WHERE id=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:merge' AS t (BRANCH 'theirs')
+
+statement ok
+UPDATE t.x SET b='new',amount=2.375 WHERE id=1
+
+statement ok
+DELETE FROM t.x WHERE id=2
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query III
+SELECT ours_updates,theirs_updates,conflicts FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+1	1	0
+
+query I
+SELECT count(*) FROM differential_snapshots('d')
+----
+3
+
+query T
+SELECT validation_state FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+not_checked
+
+query T
+SELECT validation_state FROM differential_merge_snapshots_preview('d',1,2,3,validate=>true)
+----
+valid
+
+query II
+SELECT (SELECT count(*) FROM differential_snapshots('d')),
+       (SELECT count(*) FROM differential_merge_status())
+----
+3	0
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,2,3,max_input_rows=>1)
+----
+merge_limit
+
+statement error
+SET differential_merge_max_concurrent=0
+----
+must be 1..16
+
+query I
+SELECT snapshot_id FROM differential_merge_snapshots('d',1,2,3,'merged',request_id=>'sql-merge')
+----
+4
+
+query I
+SELECT snapshot_id FROM differential_merge_snapshots('d',1,2,3,'merged',request_id=>'sql-merge')
+----
+4
+
+statement ok
+ATTACH 'differential:merge' AS m (BRANCH 'merged')
+
+query IITR
+SELECT id,a,b,amount FROM m.x
+----
+1	1	new	2.375
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,2,3,'other',request_id=>'sql-merge')
+----
+Request ID
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,2,3,'merged')
+----
+name_conflict
+
+statement ok
+UPDATE o.x SET a=2 WHERE id=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+UPDATE t.x SET a=3 WHERE id=1
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query III
+SELECT conflicts,conflict_details[1].base_values[2].integer_value,
+       conflict_details[1].ours_values[2].integer_value
+FROM differential_merge_snapshots_preview('d',1,5,6)
+----
+1	0	2
+
+query IIT
+SELECT len(conflict_details),details_truncated,validation_state
+FROM differential_merge_snapshots_preview('d',1,5,6,conflict_bytes=>0,validate=>true)
+----
+0	true	data_conflicts
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,5,6,'conflict')
+----
+merge_conflict
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='conflict'
+----
+0

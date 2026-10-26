@@ -1,0 +1,99 @@
+{
+  "fixture_format": 1,
+  "label": "v1.0.0 community release",
+  "publication_status": "release",
+  "profile": "release",
+  "producer": {
+    "duckdb": "v2.0.0 (Cyanoptera) d54cbbe3df",
+    "extension_sha256": "1813ea95ad8a5cf1af0434f2a43dff636bcc17b897a0699077a33655f6febf30",
+    "extension_version": "v1.0.0",
+    "installed_from": "DuckDB community extensions repository (INSTALL differential FROM community)",
+    "test_hooks": false,
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "generator_sha256": "80fc5161a671fcd8587df054f951f36938767a9214e20913857049d8febf18bc"
+  },
+  "archive": "v1.0.0-release.tar.gz",
+  "archive_sha256": "74d41abfa1894d73fa7b7c2de8797ebae05582cf8131dc3b5eac223515914406",
+  "files": [
+    {
+      "path": "engine.sqlite",
+      "size": 368640,
+      "sha256": "22975ae2c5842a141fa0a6e18679d1a1e9b911475fc2ddd54b7c4285cf62c87a"
+    },
+    {
+      "path": "engine.sqlite-wal",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "locks/branch-122755bd-191a-4c58-bfb4-e84e20a70346",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "locks/branch-5390c7ea-075e-41cd-b62d-4b8d91019d62",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "locks/branch-62b38133-8e6f-4408-848f-eb3ad97911ad",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "locks/managed_122755bd-191a-4c58-bfb4-e84e20a70346.wal",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "locks/managed_5390c7ea-075e-41cd-b62d-4b8d91019d62.wal",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "locks/managed_62b38133-8e6f-4408-848f-eb3ad97911ad.wal",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "segments/2802c71ae057b84a",
+      "size": 1578066,
+      "sha256": "6e1efa64f83fb781574487c6d28f1c6cd022b73b02ad3f9ee8c3ac292a4b914b"
+    },
+    {
+      "path": "segments/44f54affddec541c",
+      "size": 791483,
+      "sha256": "c03e7981d226c8a517b0c90d5f464d1d86da821a91d1a3f5c01a00e730506fb1"
+    },
+    {
+      "path": "segments/53818c94c9431d88",
+      "size": 2116336,
+      "sha256": "a1f6669884b7f7bf5075228b63feaa2f883d1bf59660d19434d1c2e56e923e1f"
+    }
+  ],
+  "store_format": 2,
+  "control_format": 1,
+  "export_format": 2,
+  "operation_kinds": [
+    "branch",
+    "create_database",
+    "snapshot"
+  ],
+  "snapshots": [
+    {
+      "snapshot_id": 1,
+      "root": "7449651d8a5d75ecc4d0f9ec2cc0e353d11545d9ba5286c215a7011d33897536",
+      "retired": 0
+    },
+    {
+      "snapshot_id": 2,
+      "root": "b6351406cf5224925e8c8d2dcfff873f0a091758579617eab1da242130a743bb",
+      "retired": 0
+    },
+    {
+      "snapshot_id": 3,
+      "root": "84921be909ba370e3dd410cd8f01c40dc96da02eef6d5865f310a2f96e12404a",
+      "retired": 0
+    }
+  ]
+}

@@ -1,0 +1,179 @@
+# name: test/sql/merge_catalog.test
+# description: explicit catalog merge table removal and dependency-aware view definitions
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_catalog'
+
+statement ok
+ATTACH 'differential:catalog_merge' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,0,'base')
+
+statement ok
+CREATE TABLE d.obsolete(id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO d.obsolete VALUES(1)
+
+statement ok
+USE d
+
+statement ok
+CREATE VIEW old_view AS SELECT id FROM obsolete
+
+statement ok
+CREATE VIEW visible AS SELECT id,a,b FROM x
+
+statement ok
+USE memory
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','ours',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','theirs',snapshot=>1)
+
+statement ok
+ATTACH 'differential:catalog_merge' AS o (BRANCH 'ours')
+
+statement ok
+DROP VIEW o.old_view
+
+statement ok
+DROP TABLE o.obsolete
+
+statement ok
+UPDATE o.x SET a=7
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:catalog_merge' AS t (BRANCH 'theirs')
+
+statement ok
+USE t
+
+statement ok
+CREATE OR REPLACE VIEW visible AS SELECT id,a,b FROM x WHERE a>=0
+
+statement ok
+CREATE VIEW summary AS SELECT count(*) AS n FROM visible
+
+statement ok
+USE memory
+
+statement ok
+UPDATE t.x SET b='edited'
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,2,3,schema_mode=>'additive')
+----
+merge_unsupported
+
+statement ok
+PREPARE catalog_merge AS SELECT * FROM differential_merge_snapshots('d',1,2,3,'merged',schema_mode=>'catalog',request_id=>'catalog')
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind='merge'
+----
+0
+
+query TTTTT rowsort
+SELECT object_type,object_name,table_action,view_change.action,validation_state FROM differential_merge_snapshots_preview('d',1,2,3,schema_mode=>'catalog',validate=>true)
+----
+table	obsolete	drop	NULL	valid
+table	x	NULL	NULL	valid
+view	old_view	NULL	drop	valid
+view	summary	NULL	add	valid
+view	visible	NULL	replace	valid
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind IN ('merge','merge_schema')
+----
+0
+
+statement ok
+EXECUTE catalog_merge
+
+statement ok
+DEALLOCATE catalog_merge
+
+query TT
+SELECT schema_mode,schema_algorithm FROM differential_merge_requests('d',request_id=>'catalog')
+----
+catalog	catalog-v1
+
+statement ok
+ATTACH 'differential:catalog_merge' AS m (BRANCH 'merged')
+
+query IIT
+SELECT * FROM m.visible
+----
+1	7	edited
+
+query I
+SELECT * FROM m.summary
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='m' AND table_name='obsolete'
+----
+0
+
+query T rowsort
+SELECT view_name FROM duckdb_views() WHERE database_name='m'
+----
+summary
+visible
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,2,3,'merged',schema_mode=>'additive',request_id=>'catalog')
+----
+different schema_mode
+
+statement ok
+INSERT INTO t.obsolete VALUES(2)
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query TTTI
+SELECT object_name,table_action,schema_conflict_details[1].kind,conflicts FROM differential_merge_snapshots_preview('d',1,2,5,schema_mode=>'catalog') WHERE object_name='obsolete'
+----
+obsolete	drop	table_delete_modify	NULL
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,2,5,'bad',schema_mode=>'catalog',request_id=>'bad')
+----
+merge_schema_conflict
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='bad'
+----
+0
+
+statement ok
+DETACH m
+
+statement ok
+DETACH t
+
+statement ok
+DETACH o
+
+statement ok
+DETACH d

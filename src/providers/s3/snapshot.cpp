@@ -314,7 +314,7 @@ std::vector<unsigned char> Encode(const Descriptor &d) {
 }
 // Commit record (differential-commit-v1): one line per field; free text percent-encoded.
 std::vector<unsigned char> EncodeCommit(Control &control, const Snapshot &s, int64_t parent,
-                                        const std::string &descriptor) {
+                                        const std::string &descriptor, const std::string &branch_name = "") {
     std::ostringstream out;
     out << "differential-commit-v1\n"
         << "database " << s.database << '\n'
@@ -322,7 +322,7 @@ std::vector<unsigned char> EncodeCommit(Control &control, const Snapshot &s, int
         << "snapshot " << s.id << '\n'
         << "parent " << parent << '\n'
         << "branch " << s.branch << '\n'
-        << "branch_name " << control.BranchName(s.branch) << '\n'
+        << "branch_name " << (branch_name.empty() ? control.BranchName(s.branch) : branch_name) << '\n'
         << "published_at " << s.published_at << '\n'
         << "descriptor " << descriptor << '\n'
         << "name " << Escape(s.name) << '\n'
@@ -692,9 +692,11 @@ struct ExportLock {
     }
 };
 std::string ExportOne(Control &control, const std::string &database, int64_t &snapshot,
-                      const std::function<bool()> &cancelled, bool shared) {
+                      const std::function<bool()> &cancelled, bool shared, const MergePublication *merge = nullptr) {
     Timer timer(Metric::Export);
-    auto e = control.Export(database, snapshot);
+    auto e = merge ? ExportRecord{merge->record.id, merge->provider, database, merge->snapshot.root,
+                                  merge->descriptor.empty() ? "pending" : "complete", merge->descriptor, snapshot}
+                   : control.Export(database, snapshot);
     if (e.id.empty())
         return "";
     if (e.state == "complete")
@@ -718,7 +720,7 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
     }
     check_cancel();
     // EXPORT_PENDING already retains the complete graph in the publication transaction.
-    auto s = control.GetSnapshot(database, snapshot, false);
+    auto s = merge ? merge->snapshot : control.GetSnapshot(database, snapshot, false);
     auto provider = Client(control, e.provider);
     Descriptor d;
     auto engine = Hook("DIFFERENTIAL_TEST_ENGINE_LINE"); // test builds: simulate another writer version
@@ -744,7 +746,8 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
         auto bytes = Encode(d);
         auto hash = Hash(bytes);
         key = "descriptors/" + hash;
-        auto commit = EncodeCommit(control, s, control.ParentSnapshot(database, s.id), key);
+        auto commit = EncodeCommit(control, s, merge ? merge->ours : control.ParentSnapshot(database, s.id), key,
+                                   merge ? merge->destination : "");
         auto commit_key = CommitKey(s.database, s.id);
         if (shared) {
             // Writers of a shared database number snapshots through the commit index: a number
@@ -793,7 +796,10 @@ std::string ExportOne(Control &control, const std::string &database, int64_t &sn
     auto name = EncodeName(s.database, s.database_name);
     upload("names/" + s.database_name + "/" + s.database, name, Hash(name));
     control.StoreRemoteReferences(e.provider, references);
-    control.ExportComplete(e.id, key);
+    if (merge)
+        control.MergeUploadComplete(control.GetOperation(merge->merge_id), key);
+    else
+        control.ExportComplete(e.id, key);
     Crash("completion_committed");
     return key;
 }
@@ -1262,10 +1268,11 @@ uint64_t RemoteSnapshot::Read(void *data, uint64_t length, uint64_t offset) {
     }
     return length;
 }
-Root RemoteSnapshot::Materialize(Store &store, int64_t file) {
+Root RemoteSnapshot::Materialize(Store &store, int64_t file, const std::function<void(uint64_t)> &check) {
     // Reconstruct exact sparse extent identity; copying holes as explicit zero objects would change the
     // manifest.
     for (uint64_t page = 0; page < descriptor.pages.size(); page++) {
+        if (check) check(0);
         auto index = Index(page);
         std::vector<uint64_t> present;
         for (uint64_t slot = 0; slot < INDEX_CHUNKS; slot++) {
@@ -1276,17 +1283,20 @@ Root RemoteSnapshot::Materialize(Store &store, int64_t file) {
                 present.push_back(chunk);
         }
         for (size_t i = 0; i < present.size(); i += 64) {
+            if (check) check(0);
             std::vector<uint64_t> batch(present.begin() + int64_t(i),
                                         present.begin() + int64_t(std::min(present.size(), i + 64)));
             std::map<uint64_t, SharedBytes> fetched;
             FetchChunks(batch, fetched);
             for (auto chunk : batch) {
                 auto offset = Store::ChunkOffset(chunk);
-                store.Write(file, fetched.at(chunk)->data(), std::min(Store::ChunkLength(chunk), descriptor.size - offset),
-                            offset);
+                auto length = std::min(Store::ChunkLength(chunk), descriptor.size - offset);
+                if (check) check(length);
+                store.Write(file, fetched.at(chunk)->data(), length, offset);
             }
         }
     }
+    if (check) check(0);
     store.Truncate(file, descriptor.size);
     // The sealed copy has the exported root's identity (same chunk map, same manifest pages).
     auto root = store.Seal(file);
@@ -1561,19 +1571,156 @@ std::string WriteID() {
 // Serializes head publication of one database across this repository's processes.
 struct HeadLock {
     int fd = -1;
-    HeadLock(Control &control, const std::string &database) {
+    HeadLock(Control &control, const std::string &database, const std::function<void()> &check = {}) {
         auto path = std::filesystem::path(control.store->directory) / "locks";
         control.store->permissions.CreateDirectories(path);
         fd = control.store->permissions.Open(path / ("heads-" + database), O_RDWR | O_CLOEXEC);
-        if (fd < 0 || flock(fd, LOCK_EX))
+        if (fd < 0)
             throw std::runtime_error("Cannot lock branch-head publication");
+        try {
+            while (flock(fd, LOCK_EX | (check ? LOCK_NB : 0))) {
+                if (!check || (errno != EWOULDBLOCK && errno != EAGAIN))
+                    throw std::runtime_error("Cannot lock branch-head publication");
+                check();
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (check) check();
+        } catch (...) { close(fd); fd = -1; throw; }
     }
     ~HeadLock() {
         if (fd >= 0)
             close(fd);
     }
 };
+Head MergeHead(const MergePublication &p) {
+    Head h;
+    h.database = p.snapshot.database; h.database_name = p.snapshot.database_name;
+    h.branch = p.snapshot.branch; h.branch_name = p.destination;
+    h.snapshot = p.snapshot.id; h.published_at = p.snapshot.published_at;
+    h.descriptor = p.descriptor; h.write_id = p.write_id;
+    return h;
+}
+bool SameMergeHead(const HeadVersion &v, const Head &h) {
+    return v.head && v.head->database == h.database && v.head->branch == h.branch &&
+           v.head->branch_name == h.branch_name && v.head->snapshot == h.snapshot &&
+           v.head->descriptor == h.descriptor && v.head->write_id == h.write_id &&
+           v.head->published_at == h.published_at;
+}
 } // namespace
+
+void CheckMergeRemoteDestination(Control &control, const std::string &database, const std::string &destination) {
+    auto provider = Client(control, control.Profile(database));
+    // Includes tombstones and heads previously written by this repository: a merge
+    // never takes over an existing key, even if the local branch was dropped.
+    if (provider->TryHead("dbs/" + database + "/branches/" + destination))
+        throw std::runtime_error("[differential:name_conflict] Merge destination already exists in S3 (including tombstones)");
+}
+
+std::string CheckMergeRemoteTarget(Control &control, const Branch &branch, const std::function<void()> &check) {
+    HeadLock lock(control, branch.database, check);
+    auto provider_id = control.Profile(branch.database);
+    auto provider = Client(control, provider_id);
+    const auto key = "dbs/" + branch.database + "/branches/" + branch.name;
+    auto current = ReadHeadVersion(*provider, key);
+    auto record = control.HeadWriteFor(provider_id, key);
+    auto e = control.Export(branch.database, branch.head);
+    if (!current.head || e.state != "complete" || current.head->branch != branch.id ||
+        current.head->snapshot != branch.head || current.head->descriptor != e.descriptor)
+        throw std::runtime_error("[differential:merge_target_unpublished] S3 target must name its selected, completely exported snapshot; retry export or resolve remote ownership first");
+    if (!record || (current.etag != record->etag && current.head->write_id != record->write_id &&
+                    current.head->write_id != record->pending))
+        throw std::runtime_error("[differential:head_conflict] S3 merge target is not owned by this repository; no automatic claim is performed");
+    if (check) check();
+    return current.etag;
+}
+
+Operation PublishMergeS3(Control &control, const Operation &operation,
+                         const std::function<void(const std::string &)> &phase) {
+    control.CheckMergeActive(operation);
+    auto current_op = control.GetOperation(operation.id);
+    if (current_op.state == "complete") return current_op;
+    auto publication = control.PendingMergePublication(current_op);
+    if (!publication) throw std::runtime_error("[differential:corrupt_data] Merge publication missing");
+    auto &p = *publication;
+    if (control.Writers(p.snapshot.database) != "single" || control.Profile(p.snapshot.database) != p.provider)
+        throw std::runtime_error("[differential:merge_unsupported] S3 merge publication configuration changed");
+    phase("uploading");
+    auto number = p.snapshot.id;
+    p.descriptor = ExportOne(control, p.snapshot.database, number, [&] { phase(""); return false; }, false, &p);
+    phase("uploaded");
+    HeadLock lock(control, p.snapshot.database, [&] { phase(""); });
+    current_op = control.GetOperation(operation.id);
+    if (current_op.state == "complete") return current_op;
+    auto provider = Client(control, p.provider);
+    auto head = MergeHead(p);
+    phase("head_checking");
+    auto current = ReadHeadVersion(*provider, head.Key());
+    if (p.action == "already_up_to_date") {
+        if (!current.head || current.etag != p.expected_etag)
+            throw std::runtime_error("[differential:head_conflict] S3 target changed after merge preparation; pending result retained");
+        phase("finalizing"); // No remote write, new export or snapshot for a no-op.
+        return control.FinishMergePublication(operation);
+    }
+    if (!SameMergeHead(current, head)) {
+        if (p.action == "created_branch" && current.exists)
+            throw std::runtime_error("[differential:name_conflict] Merge destination already exists in S3; pending result retained");
+        if (p.action != "created_branch" && (!current.head || current.etag != p.expected_etag))
+            throw std::runtime_error("[differential:head_conflict] S3 target changed after merge preparation; pending result retained; abort and review new inputs");
+        // The write identity was FULL-committed with the private result, before any
+        // network I/O. A lost reply is recognized without ever overwriting a head.
+        control.MergeHeadAttempt(operation);
+        phase(p.action == "created_branch" ? "head_creating" : "head_updating");
+        auto etag = provider->PutMutable(head.Key(), EncodeHead(head), p.expected_etag);
+        if (!etag) {
+            current = ReadHeadVersion(*provider, head.Key());
+            if (!SameMergeHead(current, head))
+                throw std::runtime_error(p.action == "created_branch"
+                    ? "[differential:name_conflict] Concurrent S3 destination creation; pending result retained"
+                    : "[differential:head_conflict] Concurrent S3 target update; pending result retained");
+        } else current.etag = *etag;
+    }
+    phase("head_published");
+    control.RecordHeadWrite(p.provider, head.Key(), HeadWrite{current.etag, head.write_id, "", head.snapshot});
+    phase("finalizing");
+    return control.FinishMergePublication(operation);
+}
+
+void CheckAbortMergeS3(Control &control, const Operation &operation,
+                       const std::function<void(const std::string &)> &phase) {
+    auto publication = control.PendingMergePublication(operation);
+    if (!publication) return; // A publisher cannot upload or create a head before preparation.
+    auto &p = *publication;
+    if (control.Writers(p.snapshot.database) != "single" || control.Profile(p.snapshot.database) != p.provider)
+        throw std::runtime_error("[differential:merge_unsupported] S3 merge publication configuration changed");
+    // Abort may recover a published target. Exclude all native handles before
+    // installing it; the durable intent has fenced attachments since preparation.
+    auto target = p.action == "created_branch" ? nullptr : control.PrepareMergeTarget(operation);
+    if (p.action == "already_up_to_date") { phase("abort_checked"); return; }
+    HeadLock lock(control, p.snapshot.database, [&] { phase(""); });
+    auto provider = Client(control, p.provider);
+    auto head = MergeHead(p);
+    phase("abort_checking");
+    auto current = ReadHeadVersion(*provider, head.Key()); // Errors retain everything.
+    if (SameMergeHead(current, head)) {
+        control.RecordHeadWrite(p.provider, head.Key(), HeadWrite{current.etag, head.write_id, "", head.snapshot});
+        phase("abort_recovering");
+        control.FinishMergePublication(operation);
+        return;
+    }
+    // A crashed process may have left a PUT in flight at the provider. An absent
+    // head cannot disprove that write. A foreign existing head fences If-None-Match
+    // under the supported single-writer protocol (heads are never deleted).
+    // ReadHeadVersion deliberately tolerates unreadable objects for other head
+    // workflows. Abort must not interpret a failed GET/decode as a foreign head.
+    const bool uncertain = p.action == "created_branch"
+        ? (!current.exists && p.head_attempted) ||
+          (current.head && (current.head->branch == head.branch || current.head->write_id == head.write_id))
+        : p.head_attempted && (!current.exists || current.etag == p.expected_etag);
+    if ((current.exists && !current.head) || uncertain)
+        throw std::runtime_error("[differential:merge_publication_uncertain] Cannot abort an uncertain S3 head write; "
+                                 "retained result and reservation preserved; retry the original merge");
+    phase("abort_checked");
+}
 
 namespace {
 // Shared databases: write the heads this repository advanced, each conditionally on its base (the
@@ -1678,6 +1825,9 @@ void PublishHeads(Control &control, const std::string &database, bool claim, con
         return PublishSharedHeads(control, provider_id, desired, branch);
     auto provider = Client(control, provider_id);
     for (auto &d : desired) {
+        // A prepared target can already have advanced remotely while its local
+        // transaction is still pending. Never roll it back via retry/background export.
+        if (control.MergeTargetPending(d.branch)) continue;
         Head head;
         head.database = d.database;
         head.database_name = d.database_name;

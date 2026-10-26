@@ -23,6 +23,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pi manifests (paths, names, versions), with regression tests in `test/skill/`; `make check_skill` runs
   it in a separate CI job (PyYAML pinned in `scripts/requirements-skill.txt`).
 - `make bump-version` also updates the skill metadata and the plugin and pi package manifests.
+- Branch merging for local and single-writer S3 databases (`docs/branch-merge.md`):
+  `differential_merge_branch` (into a new branch or the detached `ours` branch, with fast-forward and
+  already-up-to-date outcomes), `differential_merge_snapshots` with an explicit base, their `_preview`
+  functions, `differential_merge_branch_preflight` with expected-snapshot guards, typed three-way cell
+  and row reconciliation with explicit `resolution_tables`, `strict`/`additive`/`catalog` schema modes,
+  automatic best-common-ancestor selection (`differential_merge_ancestry`), durable request inspection
+  and safe abort (`differential_merge_requests`, `differential_abort_merge`,
+  `differential_merge_resolutions`, `differential_merge_status`) and the
+  `differential_merge_max_concurrent` setting. Every new snapshot records its parents for base
+  selection; snapshots written by 1.0.0 have no parent records, so a repeated merge that reaches them
+  needs an explicit base (the first merge of 1.0.0 sibling branches is proven by their fork records).
+- Merge qualification tooling (`docs/merge-qualification.md`, `make test_merge_qualification`) and an
+  immutable compatibility fixture written by the published v1.0.0 release.
+
+### Changed
+
+- `differential_cleanup_metadata` never deletes snapshot parent records, and deletes the records of a
+  merge request (frozen policy, guards, choices, attempts, publication, abort marker) only together
+  with the request, so pending and aborted merges keep their retry and terminal state.
 
 ## [1.0.0] - 2026-10-21
 

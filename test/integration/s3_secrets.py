@@ -175,6 +175,24 @@ assert 'Unknown parameter "key_id"' in run('errors', "CREATE SECRET bad (TYPE di
 assert 'take no SCOPE' in run('errors', "CREATE SECRET bad (TYPE differential, DATA_PATH '/x', SCOPE 'a');", 1)
 passed('unknown or wrong-type SECRET, credentials and SCOPE in TYPE differential secrets are refused')
 
+# Explicit snapshot merges refresh S3 secrets even when invoked by database name
+# without an attachment. The process has no environment/profile credentials.
+run('merge-writer', MINIO + f"""
+    ATTACH 'differential:merge_secrets' AS d (DATA_PATH '{LOCATION}merge/');
+    CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b INT); INSERT INTO d.x VALUES(1,0,0);
+    CALL differential_create_snapshot('d');
+    CALL differential_create_branch('d','ours',snapshot=>1); CALL differential_create_branch('d','theirs',snapshot=>1);
+    ATTACH 'differential:merge_secrets' AS o (BRANCH 'ours'); UPDATE o.x SET a=1; CALL differential_create_snapshot('o');
+    ATTACH 'differential:merge_secrets' AS t (BRANCH 'theirs'); UPDATE t.x SET b=2; CALL differential_create_snapshot('t');
+""")
+merge = "SELECT snapshot_id FROM differential_merge_snapshots('merge_secrets',1,2,3,'merged',request_id=>'secret-merge');"
+run('merge-writer', merge, 1)
+assert run('merge-writer', MINIO + merge)[-1] == [{'snapshot_id': 4}]
+assert run('merge-reader', MINIO + f"ATTACH 'differential:{LOCATION}merge/heads/merge_secrets/merged' AS r; SELECT * FROM r.x;")[-1] == [{'id':1,'a':1,'b':2}]
+# Completed replay needs no current credentials or remote request.
+assert run('merge-writer', merge)[-1] == [{'snapshot_id':4}]
+passed('snapshot merge reads current S3 secrets at execution; remote reader and credential-free completed replay work')
+
 # Credentials are never written: no repository file and no status/listing contains them.
 leaked = [str(p) for p in base.rglob('*') if p.is_file() and not {'extensions', 'stored', 'profiles'} & set(p.parts)
           and PASSWORD.encode() in p.read_bytes()]

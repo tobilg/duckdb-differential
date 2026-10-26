@@ -30,6 +30,7 @@
 #include "duckdb_adapter/follow.hpp"
 #include "differential_shipping.hpp"
 #include "duckdb_adapter/spill_policy.hpp"
+#include "duckdb_adapter/logical_merge.hpp"
 #include <map>
 #include <mutex>
 #include <memory>
@@ -727,6 +728,13 @@ static void LoadInternal(ExtensionLoader &loader) {
                                   "staging directory) or 'memory'. Process-wide",
                                   duckdb::LogicalType::VARCHAR, duckdb::Value("disk"), duckdb::SetExportStaging,
                                   duckdb::SetScope::GLOBAL);
+    if (!config.HasExtensionOption("differential_merge_max_concurrent"))
+        config.AddExtensionOption("differential_merge_max_concurrent",
+                                  "Concurrent merge/preview/abort executions per process (1-16); excess calls fail with merge_busy",
+                                  duckdb::LogicalType::BIGINT, duckdb::Value::BIGINT(2),
+                                  [](duckdb::ClientContext &, duckdb::SetScope, duckdb::Value &value) {
+                                      duckdb::SetMergeConcurrency(value.GetValue<int64_t>());
+                                  }, duckdb::SetScope::GLOBAL);
     if (!config.HasExtensionOption("differential_auto_gc"))
         config.AddExtensionOption("differential_auto_gc",
                                   "Run bounded differential garbage collection after native checkpoints",

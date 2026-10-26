@@ -12,8 +12,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  publication-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_publication.py
+
   duckdb-stable-build:
     name: Build extension binaries
+    needs: publication-check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
       # The untagged DuckDB commit the community repository builds as v2.0.0; drop duckdb_commit

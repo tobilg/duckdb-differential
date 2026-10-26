@@ -1,0 +1,145 @@
+# name: test/sql/merge_tables.test
+# description: additive new-table merge previews, native constraints and schema conflicts
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_tables'
+
+statement ok
+ATTACH 'differential:table_merge' AS d
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','ours',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','theirs',snapshot=>1)
+
+statement ok
+ATTACH 'differential:table_merge' AS o (BRANCH 'ours')
+
+statement ok
+CREATE TABLE o.items(id INT PRIMARY KEY,label VARCHAR,amount DECIMAL(10,2) DEFAULT 1.25 CHECK(amount>=0))
+
+statement ok
+INSERT INTO o.items VALUES(1,NULL,2.50),(2,'ours',NULL)
+
+statement ok
+CREATE INDEX items_idx ON o.items(label)
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:table_merge' AS t (BRANCH 'theirs')
+
+statement ok
+CREATE TABLE t.items(id INT PRIMARY KEY,label VARCHAR,amount DECIMAL(10,2) DEFAULT 1.25 CHECK(amount>=0))
+
+statement ok
+INSERT INTO t.items VALUES(1,NULL,2.50),(3,'theirs',NULL)
+
+statement ok
+CREATE INDEX items_idx ON t.items(label)
+
+statement ok
+CREATE TABLE t.empty_table(id INT PRIMARY KEY,note VARCHAR)
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+table additions/deletions
+
+query TTTTIII rowsort
+SELECT table_name,table_change.source,schema_algorithm,validation_state,ours_inserts,theirs_inserts,conflicts FROM differential_merge_snapshots_preview('d',1,2,3,schema_mode=>'additive',validate=>true)
+----
+empty_table	theirs	additive-tables-v2	valid	0	0	0
+items	both	additive-tables-v2	valid	2	2	0
+
+query T
+SELECT table_change.indexes[1].index_name FROM differential_merge_branch_preview('d','ours','theirs',schema_mode=>'additive') WHERE table_name='items'
+----
+items_idx
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind IN ('merge','merge_branch','merge_schema')
+----
+0
+
+query I
+SELECT snapshot_id FROM differential_merge_snapshots('d',1,2,3,'merged',schema_mode=>'additive',request_id=>'new-tables')
+----
+4
+
+statement ok
+ATTACH 'differential:table_merge' AS m (BRANCH 'merged')
+
+query ITR
+SELECT * FROM m.items ORDER BY id
+----
+1	NULL	2.50
+2	ours	NULL
+3	theirs	NULL
+
+query I
+SELECT count(*) FROM m.empty_table
+----
+0
+
+statement ok
+INSERT INTO m.items(id,label) VALUES(9,'default')
+
+query R
+SELECT amount FROM m.items WHERE id=9
+----
+1.25
+
+statement error
+INSERT INTO m.items VALUES(10,'bad',-1)
+----
+CHECK constraint
+
+statement ok
+CREATE TABLE o.incompatible(id INT PRIMARY KEY,v INT)
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+CREATE TABLE t.incompatible(id INT PRIMARY KEY,v VARCHAR)
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query TITT
+SELECT validation_state,conflicts,schema_conflict_details[1].kind,schema_conflict_details[1].object_name FROM differential_merge_snapshots_preview('d',1,5,6,schema_mode=>'additive') WHERE table_name='incompatible'
+----
+schema_conflicts	NULL	table_definition	incompatible
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,5,6,'bad',schema_mode=>'additive',request_id=>'bad-tables')
+----
+merge_schema_conflict
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='bad'
+----
+0
+
+statement ok
+DETACH m
+
+statement ok
+DETACH o
+
+statement ok
+DETACH t
+
+statement ok
+DETACH d

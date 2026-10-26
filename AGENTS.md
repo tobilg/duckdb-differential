@@ -136,7 +136,8 @@ and function with an example, and must stay complete; its examples and those of
   `FOLLOW`/`FOLLOW_INTERVAL`. `ATTACH 'differential:s3://…/descriptors/<sha256>'`
   attaches an export, `…/heads/<db>[/<branch>]` a branch's latest export.
 - **Settings.** `SET differential_repository | differential_repository_shared | differential_auto_gc |
-  differential_snapshot_on_checkpoint | differential_remote_cache_size | differential_s3_max_requests`.
+  differential_snapshot_on_checkpoint | differential_remote_cache_size | differential_s3_max_requests |
+  differential_merge_max_concurrent`.
 - **Secrets.** `CREATE SECRET (TYPE differential, DATA_PATH …, <S3 options>)`; `TYPE s3` secrets
   (httpfs) are read for credentials and connection settings.
 - **Functions.** `differential_*` table functions take the database or alias first, plus named

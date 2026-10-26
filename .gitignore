@@ -72,8 +72,14 @@ adrs/
 
 # Private implementation notes
 /docs/implementation-status.md
+/docs/merge-release-readiness.md
+/docs/feasibility.md
+/docs/security-review.md
+/docs/internal/
+/internal/
+/ci-artifacts/
 
-# Raw benchmark results (machine-specific; docs/benchmarks.md is the published report)
+# Raw benchmark results (machine-specific; rendered reports belong in build/evidence/)
 benchmarks/*-results*.json
 
 # Project-authored build entry point and Python test artifacts

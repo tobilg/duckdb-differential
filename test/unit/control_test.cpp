@@ -99,6 +99,69 @@ int main() {
         auto cf = store->Open(cb.FileName(), false, false, false);
         Reject([&] { snapshot(cb, cf.id, "end", "", "exhausted"); });
         Check(control.Snapshots("clone").size() == 1);
+        auto merge = control.BeginMerge("sales", 2, 2, 2, "diagnostics", "diagnostics");
+        auto request_lock = control.LockMerge(merge, [] {});
+        auto inspect = [&] {
+            auto rows = control.MergeRequests("sales", "diagnostics", "", 1, [] {});
+            Check(rows.size() == 1 && rows[0].attempt.has_value());
+            return *rows[0].attempt;
+        };
+        auto first_attempt = control.BeginMergeAttempt(merge);
+        Check(first_attempt.count == 1 && first_attempt.started_at == 500);
+        clock = 450; // Wall clock regression cannot invert timestamps.
+        control.UpdateMergeAttempt(merge, first_attempt.id, "comparison");
+        Check(inspect().updated_at == 500);
+        auto second_attempt = control.BeginMergeAttempt(merge);
+        Check(second_attempt.id != first_attempt.id && second_attempt.count == 2 && second_attempt.started_at == 500);
+        control.UpdateMergeAttempt(merge, first_attempt.id, "staging", "merge_limit");
+        Check(inspect().phase == "request_locked" && inspect().state == "incomplete");
+        Reject([&] { control.UpdateMergeAttempt(merge, second_attempt.id, "untrusted phase"); });
+        control.UpdateMergeAttempt(merge, second_attempt.id, "comparison", "arbitrary sensitive error text");
+        Check(inspect().error_code == "merge_error" && inspect().state == "failed");
+        clock = 600;
+        auto third_attempt = control.BeginMergeAttempt(merge);
+        auto original = control.GetSnapshot("sales", 2);
+        auto result = control.PublishMerge(merge, {original.root, uint64_t(original.size)}, "");
+        Check(result.state == "complete" && inspect().count == 3 && inspect().state == "succeeded");
+        Check(inspect().finished_at == 600 && inspect().error_code.empty());
+        control.UpdateMergeAttempt(merge, third_attempt.id, "publishing", "cancelled");
+        Check(inspect().state == "succeeded");
+        Reject([&] { control.BeginMergeAttempt(merge); });
+        std::cout << "PASS merge attempt token fencing, clock regression, safe codes and atomic completion\n";
+        // Ancestry is committed metadata, not a second pending export operation.
+        S3Config config;
+        config.bucket = "unused-unit-bucket";
+        config.prefix = "control-test/";
+        auto provider = control.EnsureS3Provider(config, {});
+        auto remote = control.CreateDatabase("single_s3", "s3-create", provider);
+        auto remote_lease = control.Acquire(control.GetBranch(remote.database, "main"));
+        auto remote_file = store->Open(remote_lease->branch.FileName(), true, false, false);
+        snapshot(remote_lease->branch, remote_file.id, "remote", "", "s3-snapshot");
+        int pending = 0, ancestry = 0;
+        for (auto &operation : control.Operations()) {
+            if (operation.database != remote.database) continue;
+            pending += operation.state == "local_complete_export_pending";
+            if (operation.kind == "snapshot_ancestry") {
+                Check(operation.state == "complete");
+                ancestry++;
+            }
+        }
+        Check(pending == 1 && ancestry == 1);
+        pending = ancestry = 0;
+        auto cursor = control.List("operations");
+        std::vector<MetadataCell> row;
+        while (cursor->Next(row)) {
+            if (row[4].text != remote.database) continue;
+            pending += row[3].text == "local_complete_export_pending";
+            if (row[2].text == "snapshot_ancestry") {
+                Check(row[3].text == "complete");
+                ancestry++;
+            }
+        }
+        cursor.reset();
+        Check(pending == 1 && ancestry == 1);
+        remote_lease.reset();
+        std::cout << "PASS S3 ancestry stays complete in both operation listings while its export is pending\n";
         store->Verify();
         std::cout << "PASS timestamp ties, branch creation, retired candidates, interleaving, restore, "
                      "deleted UUID history, stale epoch and allocator exhaustion\n";

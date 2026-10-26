@@ -238,6 +238,7 @@ Operation Control::Begin(const std::string &kind, const std::string &payload, co
     return o;
 }
 void Control::Complete(Operation &o) {
+    if (o.kind == "merge" || o.kind == "merge_branch") CompleteMergeAttempt(o);
     Query(store->db, "UPDATE operations SET "
                      "state='complete',database_id=?,branch_id=?,snapshot_id=?,preservation=? WHERE id=?")
         .Text(1, o.database)
@@ -250,10 +251,12 @@ void Control::Complete(Operation &o) {
     Crash("reference_published");
 }
 Branch Control::NewBranch(const std::string &database, const std::string &name, const std::string &root,
-                          int64_t head, const std::string &source_db, int64_t source_snapshot) {
+                          int64_t head, const std::string &source_db, int64_t source_snapshot,
+                          const std::string &reserved_id) {
+    CheckMergeDestination(database, name);
     Branch b;
     b.database = database;
-    b.id = UUID();
+    b.id = reserved_id.empty() ? UUID() : reserved_id;
     b.name = name;
     b.state = "active";
     b.root = root;
@@ -915,7 +918,8 @@ void Control::Event(const Branch &b, int64_t snapshot, int64_t timestamp) {
         .Int(4, timestamp)
         .Run();
 }
-Snapshot Control::Publish(const Branch &b, const Root &root, const SnapshotInfo &info, int64_t captured_at) {
+Snapshot Control::Publish(const Branch &b, const Root &root, const SnapshotInfo &info, int64_t captured_at,
+                          std::optional<SnapshotParents> parents) {
     const auto &name = info.name;
     Query count(store->db, "SELECT last_snapshot FROM databases WHERE id=?");
     count.Text(1, b.database);
@@ -951,6 +955,8 @@ Snapshot Control::Publish(const Branch &b, const Root &root, const SnapshotInfo 
     Query(store->db, "UPDATE databases SET last_snapshot=? WHERE id=?").Int(1, s.id).Text(2, s.database).Run();
     Query(store->db, "UPDATE branches SET head=?,root=? WHERE id=?").Int(1, s.id).Text(2, s.root).Text(3, b.id).Run();
     auto profile = Profile(b.database);
+    if (Writers(b.database) == "single")
+        RecordAncestry(s, parents.value_or(SnapshotParents{b.head ? "linear" : "root", b.head, 0}));
     if (profile != "local") {
         auto export_id = UUID();
         Query(store->db, "INSERT INTO export_roots VALUES(?,?,'pending')").Text(1, export_id).Text(2, s.root).Run();
@@ -1037,7 +1043,7 @@ Operation Control::CreateBranch(const std::string &database, int64_t snapshot, c
     if (clone)
         o.snapshot = Publish(b, {s.root, uint64_t(s.size)},
                              {"", "", "clone of " + s.database_name + " snapshot " + std::to_string(s.id), ""},
-                             Timestamp())
+                             Timestamp(), SnapshotParents{"clone", 0, 0})
                          .id;
     else {
         o.snapshot = s.id;
@@ -1057,6 +1063,11 @@ Operation Control::Retire(const std::string &database, int64_t snapshot, const s
         return o;
     }
     auto s = GetSnapshot(id, snapshot, false);
+    Query merging(store->db, "SELECT 1 FROM operations WHERE kind='merge_publication' AND state='pending' "
+                             "AND database_id=? AND snapshot_id=?");
+    merging.Text(1, id).Int(2, snapshot);
+    if (merging.Step())
+        throw std::runtime_error("[differential:merge_pending_operation] Snapshot is the result of a pending S3 merge; retry or abort that merge before expiry");
     Query(store->db, "UPDATE snapshots SET retired=1 WHERE database_id=? AND id=?").Text(1, id).Int(2, snapshot).Run();
     o.database = id;
     o.branch = s.branch;
@@ -1230,7 +1241,12 @@ Operation Control::FinishCompound(const Operation &operation, const Branch &b, c
         Query target_id(store->db, "SELECT id FROM snapshots WHERE database_id=? AND root=? ORDER BY id DESC LIMIT 1");
         target_id.Text(1, b.database).Text(2, target);
         auto label = target_id.Step() ? "restored to snapshot " + std::to_string(target_id.Int(0)) : "restored";
-        o.snapshot = Publish(b, {target, size}, {"", "", label, ""}, Timestamp()).id;
+        // A restore is a new state change, not a merge with the copied snapshot.
+        // A newly published preservation is its parent. A same-root history event
+        // does not move the head and must never invent an ancestry edge.
+        auto current = GetBranch(b.database, b.id, true);
+        o.snapshot = Publish(current, {target, size}, {"", "", label, ""}, Timestamp(),
+                             SnapshotParents{current.head ? "restore" : "root", current.head, 0}).id;
         auto file = store->CreateFileTx(b.FileName(), size, LocalDatabasePool(b.database));
         store->InstallRootTx(file, target);
     } else {
@@ -1340,7 +1356,10 @@ std::vector<Operation> Control::Operations() {
     Query q(store->db, (std::string(OP_COLUMNS) + " ORDER BY created_at,id").c_str());
     while (q.Step()) {
         auto o = ReadOperation(q);
-        if (o.state == "complete" && (o.snapshot || o.preservation) && o.kind != "retire" && o.kind != "evict") {
+        if ((o.kind == "merge" || o.kind == "merge_branch") && MergeAborted(o))
+            o.state = "aborted";
+        if (o.state == "complete" && (o.snapshot || o.preservation) && o.kind != "retire" && o.kind != "evict" &&
+            o.kind != "snapshot_ancestry") {
             for (auto id : {o.snapshot, o.preservation})
                 if (id && Export(o.database, id).state == "pending")
                     o.state = "local_complete_export_pending";
@@ -1710,7 +1729,7 @@ Operation Control::CompleteImport(const Operation &operation, const Root &root, 
     o.branch = b.id;
     o.snapshot =
         Publish(b, root, {"", "", o.kind == "import_native" ? "imported native file" : "recovered from export", ""},
-                Timestamp())
+                Timestamp(), SnapshotParents{"import", 0, 0})
             .id;
     Query(store->db, "UPDATE files SET name=NULL WHERE name=?").Text(1, "imports/" + o.id).Run();
     Complete(o);
@@ -2022,9 +2041,40 @@ void Control::ForgetRemoteObjects(const std::string &provider, const std::vector
 std::vector<std::pair<std::string, int64_t>> Control::PruneMetadata(int64_t older_than, bool dry_run) {
     std::lock_guard<std::recursive_mutex> guard(store->mutex);
     Transaction tx(store->db);
-    // Completed operations that no pending compound intent still names.
-    const std::string operations = "SELECT id FROM operations o WHERE o.state='complete' AND o.created_at<?1 AND NOT "
-                                   "EXISTS(SELECT 1 FROM compound_intents c WHERE c.operation_id=o.id)";
+    // Completed operations that no pending compound intent still names. Snapshot ancestry is the
+    // parent graph of branch merging and is never pruned. A merge companion (frozen policy, context,
+    // guard and choices, attempt, publication, reservation, abort marker, target audit) goes only with
+    // its request: a pending or aborted merge keeps everything that defines its retry or terminal state.
+    std::set<std::string> operations;
+    std::vector<std::pair<std::string, std::string>> companions; // companion id, merge operation id
+    {
+        Query q(store->db, "SELECT id,kind,payload,branch_id FROM operations o WHERE o.state='complete' AND "
+                           "o.created_at<? AND o.kind<>'snapshot_ancestry' AND NOT EXISTS(SELECT 1 FROM "
+                           "compound_intents c WHERE c.operation_id=o.id)");
+        q.Int(1, older_than);
+        static const std::set<std::string> payload_parent = {"merge_target_result", "merge_schema",
+            "merge_expression_context", "merge_expected_inputs", "merge_attempt", "merge_publication"};
+        while (q.Step()) {
+            auto id = q.Text(0), kind = q.Text(1);
+            if (payload_parent.count(kind)) {
+                auto fields = DecodePayload(q.Text(2));
+                companions.emplace_back(id, fields.size() > 1 ? fields[1] : "");
+            } else if (kind == "merge_aborted" || kind == "merge_destination")
+                companions.emplace_back(id, q.Text(2)); // the payload is the merge operation id
+            else if (kind == "merge_resolutions")
+                companions.emplace_back(id, q.Text(3));
+            else
+                operations.insert(id);
+        }
+    }
+    Query parent(store->db, "SELECT 1 FROM operations WHERE id=?");
+    for (auto &companion : companions) {
+        parent.Text(1, companion.second);
+        if (!companion.second.empty() && (operations.count(companion.second) || !parent.Step()))
+            operations.insert(companion.first);
+        sqlite3_reset(parent.s);
+        sqlite3_clear_bindings(parent.s);
+    }
     // History of retired snapshots (time travel and branch heads only use retained ones), except
     // snapshots whose export is still pending (their commit record names a parent from history).
     const std::string history = "SELECT h.sequence FROM history h JOIN snapshots s ON s.database_id=h.database_id AND "
@@ -2037,14 +2087,14 @@ std::vector<std::pair<std::string, int64_t>> Control::PruneMetadata(int64_t olde
         q.Step();
         return q.Int(0);
     };
-    std::vector<std::pair<std::string, int64_t>> result = {{"operations", count(operations)},
+    std::vector<std::pair<std::string, int64_t>> result = {{"operations", int64_t(operations.size())},
                                                            {"history", count(history)}};
     if (!dry_run) {
-        for (auto table : {"collection_results", "compaction_details"})
-            Query(store->db, (std::string("DELETE FROM ") + table + " WHERE operation_id IN (" + operations + ")").c_str())
-                .Int(1, older_than)
-                .Run();
-        Query(store->db, ("DELETE FROM operations WHERE id IN (" + operations + ")").c_str()).Int(1, older_than).Run();
+        for (auto &id : operations) {
+            for (auto table : {"collection_results", "compaction_details"})
+                Query(store->db, (std::string("DELETE FROM ") + table + " WHERE operation_id=?").c_str()).Text(1, id).Run();
+            Query(store->db, "DELETE FROM operations WHERE id=?").Text(1, id).Run();
+        }
         Query(store->db, ("DELETE FROM history WHERE sequence IN (" + history + ")").c_str()).Int(1, older_than).Run();
     }
     tx.Commit();
@@ -2062,5 +2112,259 @@ void Control::ExportComplete(const std::string &id, const std::string &descripto
     Query(store->db, "UPDATE exports SET descriptor=? WHERE id=?").Text(1, descriptor).Text(2, id).Run();
     Query(store->db, "UPDATE export_roots SET state='complete' WHERE export_id=?").Text(1, id).Run();
     tx.Commit();
+}
+} // namespace differential
+
+namespace differential {
+std::shared_ptr<Pin> Control::MergeReader(const std::string &root) {
+    auto pin = NewPin(root);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    for (auto it = merge_stages.begin(); it != merge_stages.end();)
+        if (it->second.first.expired()) it = merge_stages.erase(it); else ++it;
+    merge_stages[pin->id] = {pin, ""};
+    return pin;
+}
+std::shared_ptr<Pin> Control::MergeStage(const std::string &root, const std::string &pool,
+                                         std::shared_ptr<MergeWriteBudget> budget) {
+    auto pin = NewPin(root);
+    pin->merge_stage = true;
+    pin->merge_budget = std::move(budget);
+    store->Fork(root, "merge_stage/" + pin->id, pool);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    for (auto it = merge_stages.begin(); it != merge_stages.end();)
+        if (it->second.first.expired())
+            it = merge_stages.erase(it);
+        else
+            ++it;
+    merge_stages[pin->id] = {pin, pool};
+    return pin;
+}
+Operation Control::BeginMerge(const std::string &database, int64_t base, int64_t ours, int64_t theirs,
+                              const std::string &name, const std::string &request, const std::string &resolution_spec,
+                              const std::string &schema_mode) {
+    control::ValidateName(name);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    auto id = DatabaseID(database);
+    if (Writers(id) != "single")
+        throw std::runtime_error(
+            "[differential:merge_unsupported] Snapshot merge requires a single-writer database");
+    if (Profile(id) != "local" && request.empty())
+        throw std::runtime_error("[differential:merge_request_required] S3 merge requires a nonempty request_id for recovery");
+    std::vector<std::string> arguments{id, std::to_string(base), std::to_string(ours),
+                                       std::to_string(theirs), name, "logical-cell-v1"};
+    // The semantic request identity is the five caller arguments. Completed records
+    // remain replayable after an algorithm upgrade; unknown pending algorithms must not
+    // be silently recomputed by a different implementation.
+    if (!request.empty()) {
+        Query previous(store->db, (std::string(OP_COLUMNS) + " WHERE request=?").c_str());
+        previous.Text(1, request);
+        if (previous.Step()) {
+            auto old = ReadOperation(previous);
+            auto fields = control::DecodePayload(old.payload);
+            if (old.kind != "merge" || fields.size() != arguments.size() ||
+                !std::equal(fields.begin(), fields.begin() + 5, arguments.begin()))
+                throw std::runtime_error("Request ID reused with different payload");
+            CheckMergeActive(old);
+            ReserveMergeSchema(old, schema_mode, false);
+            ReserveMergeResolutions(old, resolution_spec);
+            if (old.state == "complete") {
+                tx.Commit();
+                return old;
+            }
+            if (fields[5] != arguments[5])
+                throw std::runtime_error("[differential:merge_unsupported] Pending merge algorithm is unavailable");
+        }
+    }
+    auto op = Begin("merge", control::Payload({arguments[0], arguments[1], arguments[2],
+                                               arguments[3], arguments[4], arguments[5]}), request);
+    CheckMergeActive(op);
+    ReserveMergeSchema(op, schema_mode, true);
+    ReserveMergeResolutions(op, resolution_spec);
+    if (op.state != "complete") {
+        CheckMergeDestination(id, name, op.id);
+        Query exists(store->db, "SELECT 1 FROM branches WHERE database_id=? AND name=? AND state='active'");
+        exists.Text(1, id).Text(2, name);
+        if (exists.Step())
+            throw std::runtime_error("[differential:name_conflict] Merge destination already exists");
+    }
+    tx.Commit();
+    return op;
+}
+BranchMergeInputs Control::ResolveMergeBranches(const std::string &database, const std::string &ours,
+                                                const std::string &theirs, const std::string &destination,
+                                                const std::string &request, int64_t max_nodes,
+                                                const std::function<void()> &check, const std::string &resolution_spec,
+                                                const std::string &schema_mode, const MergeExpectedInputs &expected,
+                                                bool inspect_pending) {
+    expected.Validate();
+    auto started = std::chrono::steady_clock::now();
+    if (max_nodes < 1 || max_nodes > 1000000)
+        throw std::runtime_error("[differential:merge_limit] max_ancestry_nodes must be 1..1000000");
+    const bool preview = destination.empty();
+    if (inspect_pending && !preview) throw std::runtime_error("Pending-input inspection is read-only");
+    control::ValidateName(ours);
+    control::ValidateName(theirs);
+    if (!preview)
+        control::ValidateName(destination);
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    // Resolve both heads and their ancestry from one authority transaction. A
+    // mutation records that selection in the same FULL commit, before data work.
+    Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", !preview);
+    auto id = DatabaseID(database);
+    if (Writers(id) != "single")
+        throw std::runtime_error("[differential:merge_unsupported] Branch merge requires single-writer storage");
+    if (!preview && Profile(id) != "local" && request.empty())
+        throw std::runtime_error("[differential:merge_request_required] S3 merge requires a request_id");
+    auto check_destination = [&] {
+        if (preview || destination == ours)
+            return;
+        Query exists(store->db, "SELECT 1 FROM branches WHERE database_id=? AND name=? AND state='active'");
+        exists.Text(1, id).Text(2, destination);
+        if (exists.Step())
+            throw std::runtime_error("[differential:name_conflict] Merge destination already exists");
+    };
+    if (!preview && !request.empty()) {
+        Query previous(store->db, (std::string(OP_COLUMNS) + " WHERE request=?").c_str());
+        previous.Text(1, request);
+        if (previous.Step()) {
+            BranchMergeInputs result;
+            result.operation = ReadOperation(previous);
+            auto fields = control::DecodePayload(result.operation.payload);
+            if (result.operation.kind != "merge_branch" || fields.size() != 11 || fields[0] != id ||
+                fields[1] != ours || fields[2] != theirs || fields[3] != destination)
+                throw std::runtime_error("Request ID reused with different payload");
+            CheckMergeActive(result.operation);
+            ReserveMergeExpectations(result.operation, expected, false);
+            expected.Check(std::stoll(fields[8]), std::stoll(fields[9]), std::stoll(fields[10]));
+            ReserveMergeSchema(result.operation, schema_mode, false);
+            ReserveMergeResolutions(result.operation, resolution_spec);
+            if (result.operation.state != "complete") {
+                if ((fields[4] != "sibling-fork-v1" && fields[4] != "unique-base-v1") || fields[5] != "logical-cell-v1")
+                    throw std::runtime_error("[differential:merge_unsupported] Pending branch merge algorithm is unavailable");
+                check_destination();
+            }
+            result.ours_branch = fields[6];
+            result.theirs_branch = fields[7];
+            result.selection = fields[4];
+            result.base = std::stoll(fields[8]);
+            result.ours = std::stoll(fields[9]);
+            result.theirs = std::stoll(fields[10]);
+            tx.Commit();
+            return result;
+        }
+    }
+    check_destination();
+    auto left = GetBranch(id, ours);
+    auto right = GetBranch(id, theirs);
+    // Head comparison precedes traversal and operation reservation. The same FULL
+    // transaction later freezes these exact inputs, so there is no check/use gap.
+    if (expected.Enabled() && (left.head != expected.ours || right.head != expected.theirs))
+        throw std::runtime_error("[differential:merge_inputs_changed] Branch heads differ from the reviewed snapshots; "
+                                 "preview again (ours=" + std::to_string(left.head) +
+                                 ", theirs=" + std::to_string(right.head) + ")");
+    auto unavailable = [] {
+        throw std::runtime_error(
+            "[differential:merge_base_unavailable] Automatic base selection needs distinct branches with "
+            "proven ancestry and no pending lifecycle change; "
+            "use differential_merge_snapshots with an explicit base");
+    };
+    if (left.id == right.id)
+        unavailable();
+    BranchMergeInputs result;
+    result.ours = left.head;
+    result.theirs = right.head;
+    result.ours_branch = left.id;
+    result.theirs_branch = right.id;
+    for (auto &branch : {left, right}) {
+        Query pending(store->db, "SELECT 1 FROM compound_intents WHERE branch_id=?");
+        pending.Text(1, branch.id);
+        if ((pending.Step() && !inspect_pending) || branch.head <= 0)
+            unavailable();
+        auto head = GetSnapshot(id, branch.head);
+        if (head.remote || (head.evicted && (head.export_state != "complete" || head.export_key.empty())))
+            throw std::runtime_error("[differential:merge_unsupported] Branch merge inputs require local metadata and a readable snapshot or completed export");
+    }
+    result.base = FindMergeBase(id, left.head, right.head, max_nodes, check, result.ancestry_nodes);
+    if (!result.base) {
+        // Existing pre-ancestry snapshots stay unknown. Preserve only the already
+        // proven direct-sibling case, never infer a linear chain from IDs or roots.
+        if (left.source_database != id || right.source_database != id || left.source_snapshot <= 0 ||
+            left.source_snapshot != right.source_snapshot)
+            unavailable();
+        result.base = left.source_snapshot;
+        result.selection = "sibling-fork-v1";
+        for (auto &branch : {left, right}) {
+            if (check)
+                check();
+            Query birth(store->db, "SELECT payload FROM operations WHERE kind='branch' AND state='complete' "
+                                   "AND database_id=? AND branch_id=? AND snapshot_id=?");
+            birth.Text(1, id).Text(2, branch.id).Int(3, result.base);
+            if (!birth.Step() || control::DecodePayload(birth.Text(0)) !=
+                                    std::vector<std::string>{id, std::to_string(result.base), branch.name})
+                unavailable();
+            // Legacy sibling proof is valid only before any lifecycle operation
+            // that can give this branch additional or replaced ancestry. Never
+            // reuse its original fork as a substitute for an unknown merge base.
+            Query restored(store->db, "SELECT 1 FROM operations WHERE kind IN ('restore','merge_target_result') "
+                                      "AND database_id=? AND branch_id=? LIMIT 1");
+            restored.Text(1, id).Text(2, branch.id);
+            if (restored.Step() || (branch.head != result.base && GetSnapshot(id, branch.head).branch != branch.id))
+                unavailable();
+        }
+    }
+    expected.Check(result.base, result.ours, result.theirs);
+    auto base = GetSnapshot(id, result.base); // Expiry is an error, never a substitute base.
+    if (base.remote || (base.evicted && (base.export_state != "complete" || base.export_key.empty())))
+        throw std::runtime_error("[differential:merge_unsupported] Branch merge base requires a readable snapshot or completed export");
+    if (!preview) {
+        result.operation = Begin("merge_branch", control::Payload({id, ours, theirs, destination,
+                                     result.selection, "logical-cell-v1", left.id, right.id,
+                                     std::to_string(result.base), std::to_string(result.ours),
+                                     std::to_string(result.theirs)}), request);
+        ReserveMergeExpectations(result.operation, expected, true);
+        ReserveMergeSchema(result.operation, schema_mode, true);
+        ReserveMergeResolutions(result.operation, resolution_spec);
+    }
+    tx.Commit();
+    result.selection_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    return result;
+}
+Operation Control::PublishMerge(const Operation &operation, const Root &root, const std::string &provenance) {
+    std::lock_guard<std::recursive_mutex> guard(store->mutex);
+    Transaction tx(store->db);
+    CheckMergeActive(operation);
+    auto op = GetOperation(operation.id);
+    if (op.state == "complete") {
+        tx.Commit();
+        return op;
+    }
+    auto fields = control::DecodePayload(op.payload);
+    if (op.kind == "merge_branch") {
+        if (fields.size() != 11 || (fields[4] != "sibling-fork-v1" && fields[4] != "unique-base-v1") ||
+            fields[5] != "logical-cell-v1")
+            throw std::runtime_error("[differential:corrupt_data] Invalid branch merge operation");
+        fields = {fields[0], fields[8], fields[9], fields[10], fields[3], fields[5]};
+    } else if (op.kind != "merge")
+        throw std::runtime_error("[differential:corrupt_data] Invalid merge operation kind");
+    if (fields.size() != 6 || fields[5] != "logical-cell-v1")
+        throw std::runtime_error("[differential:corrupt_data] Invalid merge operation");
+    if (Profile(fields[0]) != "local" || Writers(fields[0]) != "single")
+        throw std::runtime_error("[differential:merge_unsupported] Merge requires local storage");
+    Query exists(store->db, "SELECT 1 FROM branches WHERE database_id=? AND name=? AND state='active'");
+    exists.Text(1, fields[0]).Text(2, fields[4]);
+    if (exists.Step())
+        throw std::runtime_error("[differential:name_conflict] Merge destination already exists");
+    op.database = fields[0];
+    auto branch = NewBranch(op.database, fields[4], root.id, 0, op.database, std::stoll(fields[2]));
+    op.branch = branch.id;
+    op.snapshot = Publish(branch, root, {"", "", "logical merge", provenance}, Timestamp(),
+                          SnapshotParents{"merge", std::stoll(fields[2]), std::stoll(fields[3])}).id;
+    Failpoint("DIFFERENTIAL_MERGE_CRASH", "ancestry_recorded");
+    Complete(op);
+    Failpoint("DIFFERENTIAL_MERGE_CRASH", "publication_transaction");
+    tx.Commit();
+    Failpoint("DIFFERENTIAL_MERGE_CRASH", "published");
+    return op;
 }
 } // namespace differential

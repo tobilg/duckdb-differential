@@ -38,3 +38,35 @@ tracked, published report.
 Cold means empty native/extension caches, not a purged OS/provider disk cache.
 Verified payload bytes are not complete HTTP/TLS wire bytes. These are development
 fixtures on one host, not production performance or real-AWS qualification.
+
+## Branch merge programs
+
+| Program | Workload |
+| --- | --- |
+| [logical_merge.py](logical_merge.py) | Snapshot comparison and application with sparse/dense changes |
+| [merge_acceptance.py](merge_acceptance.py) | Repeated bounded merge workloads with exact result checks |
+| [merge_history.py](merge_history.py) | Base selection over retained snapshot history |
+| [merge_resolutions.py](merge_resolutions.py) | Explicit typed conflict choices |
+| [merge_table_additions.py](merge_table_additions.py) | Added tables, overlapping inserted keys and observed spill |
+| [merge_catalog.py](merge_catalog.py) | Table removal, view merging and ordinary row changes |
+| [merge_column_removal.py](merge_column_removal.py) | Removed-column proof, native constraints and projected results |
+| [merge_target.py](merge_target.py) | Existing targets, fast-forward and already-up-to-date outcomes |
+| [merge_preflight.py](merge_preflight.py) | Comparison, full preflight and guarded target execution |
+| [merge_contention.py](merge_contention.py) | Merge interaction with ordinary reads |
+| [merge_types.py](merge_types.py) | Supported native scalar/container values and typed verification |
+| [merge_native_scale.py](merge_native_scale.py) | 100k/1M rows, 1%/20% updated keys, nullable containers and three repeats |
+| [s3_merge.py](s3_merge.py) | S3 input reconstruction, comparison, application and publication |
+| [merge_native_scale_minio.py](merge_native_scale_minio.py) | The native scale matrix with a fresh 1 GiB MinIO per sample and independent export verification |
+
+Merge programs write their reports under the untracked `build/evidence/`. For example:
+
+```sh
+DIFFERENTIAL_EXTENSION="$PWD/build/release/extension/differential/differential.duckdb_extension" \
+  python3 benchmarks/merge_native_scale.py --report build/evidence/native-scale-local.json
+python3 test/integration/minio.py --merge-benchmark          # also --merge-schema-benchmark, --merge-target-benchmark
+DIFFERENTIAL_EXTENSION="$PWD/build/release/extension/differential/differential.duckdb_extension" \
+  python3 benchmarks/merge_native_scale_minio.py --output build/evidence/native-scale-minio
+```
+
+See [merge qualification](../docs/merge-qualification.md#native-scale-and-observed-spill) for the
+native scale schema, limits and the separate spill failure tests.

@@ -1,0 +1,17 @@
+# Local notes and generated output are never part of source archives.
+/build export-ignore
+/Build export-ignore
+/build-* export-ignore
+/vcpkg_installed export-ignore
+/ci-artifacts export-ignore
+/plans export-ignore
+/adrs export-ignore
+/internal export-ignore
+/docs/internal export-ignore
+/docs/implementation-status.md export-ignore
+/docs/merge-release-readiness.md export-ignore
+/docs/feasibility.md export-ignore
+/docs/security-review.md export-ignore
+/benchmarks/*-results*.json export-ignore
+# Contributor agent instructions are useful in a checkout, not in a release archive.
+/AGENTS.md export-ignore

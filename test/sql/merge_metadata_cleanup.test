@@ -1,0 +1,129 @@
+# name: test/sql/merge_metadata_cleanup.test
+# description: metadata pruning keeps snapshot ancestry and the records of pending and aborted merges
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_metadata_cleanup'
+
+statement ok
+ATTACH 'differential:cleanup' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b INT)
+
+statement ok
+INSERT INTO d.x VALUES(1,0,0)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','ours',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','theirs',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','c1',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','c2',snapshot=>1)
+
+statement ok
+ATTACH 'differential:cleanup' AS o (BRANCH 'ours')
+
+statement ok
+UPDATE o.x SET a=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:cleanup' AS t (BRANCH 'theirs')
+
+statement ok
+UPDATE t.x SET b=1
+
+statement ok
+CALL differential_create_snapshot('t')
+
+# A completed merge (snapshot 4) records both heads as parents
+query II
+SELECT merge_action,snapshot_id FROM differential_merge_branch('d','ours','theirs','merged',request_id=>'done')
+----
+created_branch	4
+
+# A pending merge with a frozen additive schema policy (it stops on a cell conflict)
+statement ok
+ATTACH 'differential:cleanup' AS c1 (BRANCH 'c1')
+
+statement ok
+UPDATE c1.x SET a=5
+
+statement ok
+CALL differential_create_snapshot('c1')
+
+statement ok
+ATTACH 'differential:cleanup' AS c2 (BRANCH 'c2')
+
+statement ok
+UPDATE c2.x SET a=6
+
+statement ok
+CALL differential_create_snapshot('c2')
+
+statement error
+SELECT * FROM differential_merge_branch('d','c1','c2','conflicted',schema_mode=>'additive',request_id=>'pending')
+----
+merge_conflict
+
+# An aborted merge: terminal through its abort marker
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,999,'never',request_id=>'gone')
+----
+not_found
+
+statement ok
+SET VARIABLE gone=(SELECT operation_id FROM differential_merge_requests('d',request_id=>'gone'))
+
+query T
+SELECT state FROM differential_abort_merge('d',getvariable('gone'),request_id=>'abort-gone')
+----
+aborted
+
+statement ok
+CALL differential_cleanup_metadata(older_than => TIMESTAMPTZ '2999-01-01')
+
+# The completed request was pruned (its ID no longer replays); the others keep their state
+query TTT
+SELECT request_id,state,schema_mode FROM differential_merge_requests('d') ORDER BY request_id
+----
+gone	aborted	strict
+pending	pending	additive
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,999,'never',request_id=>'gone')
+----
+merge_aborted
+
+# Ancestry survived: merged (4) and theirs (3) continue, and the base is theirs' merged head
+statement ok
+ATTACH 'differential:cleanup' AS m (BRANCH 'merged')
+
+statement ok
+UPDATE m.x SET a=2
+
+statement ok
+CALL differential_create_snapshot('m')
+
+statement ok
+UPDATE t.x SET b=2
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query III
+SELECT DISTINCT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id FROM differential_merge_branch_preview('d','merged','theirs')
+----
+3	7	8

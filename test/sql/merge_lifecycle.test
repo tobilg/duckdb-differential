@@ -1,0 +1,117 @@
+# name: test/sql/merge_lifecycle.test
+# description: merge lifecycle binding, inspection and terminal abort
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_lifecycle'
+
+statement ok
+PREPARE pending AS SELECT * FROM differential_merge_requests('absent')
+
+statement ok
+PREPARE aborting AS SELECT * FROM differential_abort_merge('absent','uuid',request_id=>'abort')
+
+statement ok
+EXPLAIN SELECT * FROM differential_abort_merge('absent','uuid')
+
+query I
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:lifecycle' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT)
+
+statement ok
+INSERT INTO d.x VALUES(1,1)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,999,'merged',request_id=>'bad-input')
+----
+not_found
+
+query TTTIIII
+SELECT request_id,state,destination,base_snapshot_id,ours_snapshot_id,theirs_snapshot_id,retained_logical_bytes FROM differential_merge_requests('d')
+----
+bad-input	pending	merged	1	1	999	0
+
+# EXECUTE an abort with an execution-time UUID rather than pinning repository state at bind.
+statement ok
+SET VARIABLE merge_id=(SELECT operation_id FROM differential_merge_requests('d',request_id=>'bad-input'))
+
+query TI
+SELECT state,snapshot_id FROM differential_abort_merge('d',getvariable('merge_id'),request_id=>'abort')
+----
+aborted	NULL
+
+query TI
+SELECT state,snapshot_id FROM differential_abort_merge('d',getvariable('merge_id'),request_id=>'abort')
+----
+aborted	NULL
+
+query T
+SELECT state FROM differential_operations() WHERE request_id='bad-input'
+----
+aborted
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,999,'merged',request_id=>'bad-input')
+----
+merge_aborted
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,1,1,'different',request_id=>'bad-input')
+----
+Request ID reused
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='merged'
+----
+0
+
+query I
+SELECT count(*) FROM differential_merge_requests('d',request_id=>'missing')
+----
+0
+
+statement error
+SELECT * FROM differential_merge_requests('d',max_results=>1001)
+----
+1..1000
+
+statement ok
+CALL differential_merge_snapshots('d',1,1,1,'merged',request_id=>'good')
+
+statement ok
+SET VARIABLE complete_id=(SELECT operation_id FROM differential_merge_requests('d',request_id=>'good'))
+
+query TI
+SELECT state,snapshot_id FROM differential_abort_merge('d',getvariable('complete_id'),request_id=>'too-late')
+----
+complete	2
+
+statement error
+SELECT * FROM differential_abort_merge('d',getvariable('complete_id'),request_id=>'abort')
+----
+Request ID reused
+
+statement ok
+BEGIN
+
+statement error
+SELECT * FROM differential_abort_merge('d',getvariable('merge_id'))
+----
+autocommit
+
+statement ok
+ROLLBACK
+
+statement ok
+DETACH d

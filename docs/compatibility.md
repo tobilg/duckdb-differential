@@ -60,3 +60,16 @@ Spill files require a local `temp_directory`, including when the database is sto
 Empty paths remain valid and disable spilling. Nonlocal paths are rejected by SET after LOAD
 and by Differential ATTACH; local spill creation, an external sort and cleanup are covered
 by `test/integration/spilling.py`.
+
+## Merge support
+
+Logical merges support registered local and single-writer S3 databases. Snapshot merging takes
+explicit retained inputs; branch merging selects a recorded common ancestor or accepts an
+explicit base. Results can use a new branch or the detached existing `ours` target. Existing
+targets require exclusive ownership and a live image matching their published snapshot.
+
+Supported native scalar values use DuckDB equality; nested columns merge as whole values.
+Schema policies are strict, additive, or catalog mode for the documented table/column/view
+changes. See [branch merging](branch-merge.md#supported-scope) for the complete type, key,
+constraint, catalog and input restrictions. General schema merging, foreign keys, live-target
+replacement and shared-writer S3 merging are outside that scope.

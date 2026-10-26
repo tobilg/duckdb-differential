@@ -1,0 +1,101 @@
+# name: test/sql/merge_ancestry.test
+# description: automatic bases through parent/child and repeated merges
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_ancestry'
+
+statement ok
+ATTACH 'differential:ancestry' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b VARCHAR,c INT)
+
+statement ok
+INSERT INTO d.x VALUES(1,0,'base',0)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','feature',snapshot=>1)
+
+statement ok
+UPDATE d.x SET a=1
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+ATTACH 'differential:ancestry' AS f (BRANCH 'feature')
+
+statement ok
+UPDATE f.x SET b='first'
+
+statement ok
+CALL differential_create_snapshot('f')
+
+query III
+SELECT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id FROM differential_merge_branch('d','main','feature','integrated',request_id=>'first')
+----
+1	2	3
+
+statement ok
+ATTACH 'differential:ancestry' AS m (BRANCH 'integrated')
+
+statement ok
+UPDATE m.x SET c=7
+
+statement ok
+CALL differential_create_snapshot('m')
+
+statement ok
+UPDATE f.x SET b='second'
+
+statement ok
+CALL differential_create_snapshot('f')
+
+query III
+SELECT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id FROM differential_merge_branch('d','integrated','feature','again',request_id=>'second')
+----
+3	5	6
+
+statement ok
+ATTACH 'differential:ancestry' AS r (BRANCH 'again')
+
+query IITI
+SELECT * FROM r.x
+----
+1	1	second	7
+
+query II
+SELECT base_snapshot_id,snapshot_id FROM differential_merge_branch('d','again','feature','unchanged')
+----
+6	8
+
+# A node budget is enforced before creating a mutation record or destination.
+statement error
+SELECT * FROM differential_merge_branch('d','again','feature','limited',max_ancestry_nodes=>1)
+----
+merge_limit
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='limited'
+----
+0
+
+# An older retained ancestor cannot replace the required expired base.
+statement ok
+CALL differential_expire_snapshots('d',versions=>[3])
+
+statement error
+SELECT * FROM differential_merge_branch_preview('d','integrated','feature')
+----
+retired
+
+# Completed replay uses its fixed inputs even after that expiry.
+query III
+SELECT snapshot_id,base_snapshot_id,ancestry_nodes FROM differential_merge_branch('d','integrated','feature','again',request_id=>'second',max_ancestry_nodes=>1)
+----
+7	3	0

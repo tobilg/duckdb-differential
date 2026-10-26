@@ -243,3 +243,31 @@ and every hit re-verifies 256 KiB with SHA-256 (about half of the single-threade
 files costs roughly 0.1 s of the 2.8 s. Larger cache files would therefore save under 5%, so they
 were not implemented. The cheaper gains are a CRC32C check for cache entries (SHA-256 when filling)
 and keeping read-ahead data for the read that follows.
+
+## Merge costs
+
+Snapshot comparison reads logical table contents. A changed table is rebuilt in isolated
+native staging so that the final combined state is validated under the supported constraints.
+Indexes and affected views are recreated before checkpointing and publication. Sparse changes
+can therefore still incur full-table comparison and copying. No changed-row-only scaling is
+promised.
+
+S3 merges may additionally rehydrate evicted inputs and upload/verify the result before moving
+a branch head. Materialization, comparison, application and publication have separate timers.
+Fast-forward and already-up-to-date branch outcomes have different costs from a divergent merge.
+
+## Merge resource controls
+
+Configure DuckDB's `memory_limit`, `threads`, local `temp_directory` and
+`max_temp_directory_size`, together with the merge input/staging limits and timeout. See
+[merge resource controls](branch-merge.md#resource-controls-and-live-status).
+
+`memory_limit` is a native buffer budget, not a process RSS quota. SDK buffers, indexes and
+other allocations contribute to process memory. A query can fail an allocation while temporary
+disk remains available; some working sets must fit in memory. Nullable containers, wide rows,
+large BLOBs and concurrent queries can materially change capacity requirements.
+
+Native temporary-file cleanup is separate from Differential GC. After process death,
+abandoned spill files can remain until DuckDB initializes its temporary-file manager again.
+Use the documented [request recovery](branch-merge.md#durable-requests-and-safe-abort) behavior;
+a memory or disk failure does not make a partial merge a completed result.

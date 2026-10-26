@@ -69,6 +69,13 @@ Pin::~Pin() {
             // so release is published without a device flush.
             std::lock_guard<std::recursive_mutex> guard(store->mutex);
             Transaction tx(store->db, "DIFFERENTIAL_CONTROL_CRASH", false);
+            if (merge_stage)
+                Query(store->db, "UPDATE files SET name=NULL WHERE name IN (?,?,?,?)")
+                    .Text(1, "merge_stage/" + id)
+                    .Text(2, "merge_stage/" + id + ".wal")
+                    .Text(3, "merge_stage/" + id + ".wal.checkpoint")
+                    .Text(4, "merge_stage/" + id + ".wal.recovery")
+                    .Run();
             Query(store->db, "DELETE FROM pins WHERE id=?").Text(1, id).Run();
             tx.Commit();
             removed = true;
@@ -141,8 +148,15 @@ void Control::ReconcilePins(Collection &result, int64_t limit, bool apply) {
     }
     if (!apply)
         return;
-    for (auto &id : stale)
+    for (auto &id : stale) {
+        Query(store->db, "UPDATE files SET name=NULL WHERE name IN (?,?,?,?)")
+            .Text(1, "merge_stage/" + id)
+            .Text(2, "merge_stage/" + id + ".wal")
+            .Text(3, "merge_stage/" + id + ".wal.checkpoint")
+            .Text(4, "merge_stage/" + id + ".wal.recovery")
+            .Run();
         Query(store->db, "DELETE FROM pins WHERE id=?").Text(1, id).Run();
+    }
     result.released_pins = std::move(stale);
 }
 namespace {
@@ -531,7 +545,9 @@ LEFT JOIN branch_head_writes w ON w.key='dbs/'||b.database_id||'/branches/'||b.n
 LEFT JOIN ship_config sc ON sc.database_id=b.database_id LEFT JOIN ship_chains ch ON ch.branch_id=b.id
 WHERE b.database_id=? ORDER BY b.created_at,b.id)SQL";
     } else if (kind == "operations") {
-        sql = R"SQL(SELECT o.id,o.request,o.kind,CASE WHEN o.state='complete' AND o.kind NOT IN ('retire','evict') AND EXISTS(
+        sql = R"SQL(SELECT o.id,o.request,o.kind,CASE WHEN o.kind IN ('merge','merge_branch') AND EXISTS(
+SELECT 1 FROM operations a WHERE a.kind='merge_aborted' AND a.payload=o.id AND a.state='complete'
+) THEN 'aborted' WHEN o.state='complete' AND o.kind NOT IN ('retire','evict','snapshot_ancestry') AND EXISTS(
 SELECT 1 FROM exports e JOIN export_roots r ON r.export_id=e.id WHERE e.database_id=o.database_id AND e.snapshot_id IN(o.snapshot_id,o.preservation) AND r.state='pending'
 ) THEN 'local_complete_export_pending' ELSE o.state END,o.database_id,o.branch_id,o.snapshot_id,o.preservation FROM operations o ORDER BY o.created_at,o.id)SQL";
     } else if (kind == "databases") {

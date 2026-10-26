@@ -19,7 +19,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Integration build: test hooks compiled in, and the extension NOT linked into the CLI or
 # libduckdb, so the Python suites exercise the loadable artifact exactly as users load it.
 # Release artifacts (`make release`) never contain the hooks.
-.PHONY: bench-tpch integration test_integration test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness vcpkg bump-version check_skill
+.PHONY: bench-tpch integration test_integration test_merge_qualification test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness test_publication vcpkg bump-version check_skill
 
 # TPC-H benchmarks (native, Differential local, Differential on a disposable MinIO) with the release
 # extension; renders docs/benchmarks-tpch.md. TPCH_ARGS passes options (e.g. --queries 1,6 --runs 3).
@@ -34,6 +34,9 @@ check_skill:
 	python3 scripts/sync_skill.py --check
 	python3 scripts/check_skill.py
 	python3 -m unittest discover -s test/skill -p 'test_*.py'
+
+test_publication:
+	python3 scripts/check_publication.py
 
 bump-version:
 	@test -n "$(V)" || { echo "Usage: make bump-version V=X.Y.Z" >&2; exit 2; }
@@ -51,6 +54,10 @@ integration:
 test_integration:
 	ctest --test-dir build/integration/extension/differential --output-on-failure
 	python3 scripts/run_integration.py
+
+# Bounded local pilot rehearsal, stateful soak and immutable compatibility fixtures.
+test_merge_qualification:
+	python3 test/integration/merge_qualification.py
 
 # Unmodified DuckDB SQLLogicTests against both storage backends, with audited exclusions.
 UPSTREAM_BUILD_DIR ?= build/integration
