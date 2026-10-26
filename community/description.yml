@@ -1,7 +1,7 @@
 extension:
   name: differential
   description: Versioned DuckDB databases - snapshots, time travel, branches, clones and S3 export over native storage
-  version: 1.0.0
+  version: 1.1.0
   language: C++
   build: cmake
   license: MIT

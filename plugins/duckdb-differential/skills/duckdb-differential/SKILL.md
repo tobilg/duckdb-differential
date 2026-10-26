@@ -5,7 +5,7 @@ license: MIT
 compatibility: DuckDB 2.0 on Linux or macOS (amd64, arm64). S3 features need network access and an existing bucket.
 metadata:
   author: tobilg
-  version: "1.0.0"
+  version: "1.1.0"
   repository: https://github.com/tobilg/duckdb-differential
 ---
 

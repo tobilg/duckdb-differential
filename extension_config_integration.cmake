@@ -3,7 +3,7 @@
 # so tests LOAD the same artifact users install.
 duckdb_extension_load(differential
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
-    EXTENSION_VERSION v1.0.0
+    EXTENSION_VERSION v1.1.0
 )
 
 # Bundled dependencies used by the upstream SQLLogicTests; no extension downloads.

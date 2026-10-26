@@ -762,7 +762,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 }
 void DifferentialExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
 std::string DifferentialExtension::Name() { return "differential"; }
-std::string DifferentialExtension::Version() const { return "v1.0.0"; }
+std::string DifferentialExtension::Version() const { return "v1.1.0"; }
 } // namespace duckdb
 extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(differential, loader) { duckdb::LoadInternal(loader); }

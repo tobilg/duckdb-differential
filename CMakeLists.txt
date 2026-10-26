@@ -11,7 +11,7 @@ find_package(AWSSDK CONFIG COMPONENTS core s3 REQUIRED)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-project(${TARGET_NAME} VERSION 1.0.0)
+project(${TARGET_NAME} VERSION 1.1.0)
 
 # DuckDB's parent build sets C++11 as a normal variable; this extension needs C++17
 # (std::filesystem, std::optional, std::shared_mutex) for every target in this directory.

@@ -13,7 +13,7 @@ require differential
 query I
 SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'differential'
 ----
-v1.0.0
+v1.1.0
 
 # Every function is discoverable through duckdb_functions(): a description, an example, categories
 # and real parameter names (never col0), one per parameter type
