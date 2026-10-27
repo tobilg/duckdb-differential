@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Render benchmarks/tpch.py results into docs/benchmarks-tpch.md.
+"""Render benchmarks/tpch.py results into build/evidence/benchmarks-tpch.md.
 
-    python3 benchmarks/tpch_report.py <tpch.json> [<after.json>] [--output docs/benchmarks-tpch.md]
+    python3 benchmarks/tpch_report.py <tpch.json> [<after.json>] [--output build/evidence/benchmarks-tpch.md]
 
 With two files the first is the baseline and the second the measurement after a change (same scale
 factor, threads and runs); a change is flagged when the medians differ by more than 10% and by more
@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('files', nargs='+')
-parser.add_argument('--output', default=str(ROOT / 'docs/benchmarks-tpch.md'))
+parser.add_argument('--output', default=str(ROOT / 'build/evidence/benchmarks-tpch.md'))
 options = parser.parse_args()
 runs = [json.loads(Path(p).read_text()) for p in options.files[:2]]
 if len(runs) == 2:
@@ -210,5 +210,6 @@ lines += ['## What each S3 read path reads', '',
           '```', '',
           'Needs Docker (MinIO) and network access once (DuckDB\'s `tpch` and `httpfs` extensions, cached in '
           '`build/benchmarks/`). SF1 needs about 3 GB of free disk; `--queries`, `--suites`, `--runs` narrow a run.', '']
+Path(options.output).parent.mkdir(parents=True, exist_ok=True)
 Path(options.output).write_text('\n'.join(lines))
 print('Wrote', options.output)

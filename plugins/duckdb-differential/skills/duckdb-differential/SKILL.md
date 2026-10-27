@@ -2,7 +2,7 @@
 name: duckdb-differential
 description: Versioned DuckDB databases with the differential community extension (DuckDB 2.0) - snapshots, branches, clones, restore, branch merging, AT time travel, and replication through S3 (exports, branch heads, followers, WAL shipping, failover, shared multi-writer databases). Use when the user mentions duckdb-differential, ATTACH 'differential:...' paths or differential_* functions, or wants to version, branch, roll back, time-travel, replicate, sync or fail over DuckDB databases, including leader/follower setups on S3.
 license: MIT
-compatibility: DuckDB 2.0 on Linux or macOS (amd64, arm64). S3 features need network access and an existing bucket.
+compatibility: DuckDB 2.0 on Linux (amd64, arm64) or macOS (arm64). S3 features need network access and an existing bucket.
 metadata:
   author: tobilg
   version: "1.1.0"
@@ -232,7 +232,7 @@ forks automatically instead. Branch merging does not apply to shared databases.
   original result and never applies twice.
 - Attachments pin snapshots against garbage collection; detach what is no longer needed. Exports in S3
   are only collected by `differential_cleanup_remote_files` (two phases, a grace period apart).
-- `temp_directory` must be local. Linux and macOS only.
+- `temp_directory` must be local. Linux and macOS (Apple silicon) only.
 - Errors carry stable prefixes such as `[differential:not_found]`, `[differential:writer_busy]`,
   `[differential:branch_conflict]`, `[differential:head_conflict]`, `[differential:retired]`.
 

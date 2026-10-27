@@ -114,7 +114,7 @@ Completed retries return the original snapshot/action without checking attachmen
 heads, even after input expiry or target deletion/name reuse. They never install an old result
 again. Changed arguments still fail. `target_check_ms` separates target ownership/cleanliness
 cost; `publication_ms` measures publication separately from staged `application_ms`, including S3 upload/head update when applicable.
-Replay timings are zero. See the qualification record for measured costs and remaining limits.
+Replay timings are zero. See [performance and sizing](benchmarks.md#merge-costs) for what drives these costs.
 
 ## Preflight and guarded execution
 
@@ -307,7 +307,7 @@ when the logical engine starts; authority transactions serialize graph resolutio
   subqueries, windows and set operations are excluded. Views may reference other local views.
 * Generated columns, foreign keys, triggers, sequences, macros, custom types, extra schemas,
   explicit column compression, and table/schema/column/object comments or tags remain rejected.
-  Foreign keys need dependency-aware multi-table validation and application beyond this increment.
+  Foreign keys would need dependency-aware multi-table validation and application.
 * Catalog bounds: 1,024 tables, 1,024 views/indexes combined, 4,096 table columns, 256 columns
   per table, 1,024 UTF-8 bytes per object/column identifier, and 16 MiB of catalog definitions.
 
@@ -351,7 +351,7 @@ for array-containing tables without changing stored schemas or global optimizer 
 
 `resolution_tables` supplies an entire typed column value for a nested conflict. Its
 `_merge_columns` map names the top-level column, never a nested path. The existing schema
-rules remain unchanged: this increment permits additional column types, not type widening,
+rules remain unchanged: nested and native types are supported as column types, not type widening,
 renames, nested type evolution or changes to defaults/constraints/indexes. The same rules
 apply to local and single-writer S3 merges, preview, preflight and frozen resolution recovery.
 
@@ -856,8 +856,8 @@ rechecks the durable terminal marker and fails with `merge_aborted`. Lock files 
 `locks/`; kernel ownership is released on process death. Locks have the same repository-local
 scope as existing branch locks; this is not cross-host merge coordination. Abort uses the
 existing process admission limit and may return `merge_busy` while all slots are occupied.
-Deploy this increment after stopping older extension processes: every publisher must use
-the request lock and terminal-marker checks. Concurrent mixed-version writers are unsupported.
+When upgrading, stop every process running an older extension version first: every publisher
+must use the request lock and terminal-marker checks. Concurrent mixed-version writers are unsupported.
 
 For an unpublished local merge, abort records a terminal marker without changing branches.
 For a prepared S3 merge, it first checks the remote destination under the publication lock:
@@ -1171,7 +1171,7 @@ Comparison scans immutable snapshots and can rebuild full affected tables even w
 change. Native memory and temporary-disk budgets, table width, indexes and S3 input/output all
 contribute to cost. See [performance and sizing](benchmarks.md) for capacity considerations.
 
-Use [merge qualification](merge-qualification.md) for a pilot with independently prepared
+Use [merge validation](merge-qualification.md) for a pilot with independently prepared
 expected data, bounded scale measurements and interruption/recovery checks. Contributor test
 commands are in [CONTRIBUTING.md](../CONTRIBUTING.md). Tests and measured workloads do not
 replace validation of the intended platform, provider, filesystem and data.

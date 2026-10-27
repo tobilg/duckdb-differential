@@ -829,17 +829,10 @@ SELECT metric, value FROM differential_storage_stats();
 > store. This is SQLite's documented "multiple copies of SQLite in one application" hazard. Inspect
 > the file from a separate process, or use the SQL functions above.
 
-The formats on this page were checked against real data:
-- **Local (2026-10-10):** page, root and chunk hashes recomputed from `engine.sqlite` matched the
-  stored identities.
-- **S3 (2026-10-10):** an independent decoder rebuilt each exported snapshot's native file from
-  descriptor → index → packs, byte-identical to the local root, starting with DuckDB's `DUCK`
-  magic, on the pinned MinIO fixture.
-- **Header alignment (2026-10-13):** format 1 isolates the 12 KiB header region. The extension
-  has not been published; only this layout is implemented, with no legacy reader or migration.
-  Boundary, truncation and native allocation-size coverage is in the unit and integration suites.
-  The independent decoder in `s3_layout.py` reconstructs both MinIO snapshots byte-for-byte,
-  verifies descriptor/index/pack/chunk hashes and checks zero padding.
+The test suites check these formats against real data: local page, root and chunk hashes are
+recomputed from `engine.sqlite`, and the independent decoder in
+`test/integration/s3_layout.py` rebuilds exported snapshots from descriptors, indexes and packs,
+byte-identical to their local roots, verifying every hash and the zero padding.
 
 ## Logical merge records
 

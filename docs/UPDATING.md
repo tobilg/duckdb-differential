@@ -19,7 +19,7 @@ version, update this repository as follows:
    requirements and configurations in `test/upstream/suite.json`, then manually run
    `make test_upstream_harness test_upstream test_upstream_skips`. Review the test-only bridge
    against the new runner's load/restart semantics and inspect native-baseline failures before
-   attributing them to Differential. Recheck the source and footprint of each owner-approved
+   attributing them to Differential. Recheck the source and footprint of each maintainer-approved
    disk-space exclusion before updating its source hash; these audits never run the workload.
    New SQLLogicTest files enter full coverage automatically. CI runs only the harness checks
    and PR profile for upstream testing; the full suite and exclusion audit are manual upgrade

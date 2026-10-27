@@ -22,7 +22,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 .PHONY: bench-tpch integration test_integration test_merge_qualification test_minio test_upstream test_upstream_pr test_upstream_skips test_upstream_harness test_publication vcpkg bump-version check_skill
 
 # TPC-H benchmarks (native, Differential local, Differential on a disposable MinIO) with the release
-# extension; renders docs/benchmarks-tpch.md. TPCH_ARGS passes options (e.g. --queries 1,6 --runs 3).
+# extension; renders build/evidence/benchmarks-tpch.md. TPCH_ARGS passes options (e.g. --queries 1,6 --runs 3).
 bench-tpch:
 	DIFFERENTIAL_EXTENSION=$(PROJ_DIR)build/release/extension/differential/differential.duckdb_extension \
 		python3 benchmarks/tpch.py $(TPCH_ARGS)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render scale benchmark results (benchmarks/scale.py) into docs/benchmarks-scale.md.
+"""Render scale benchmark results (benchmarks/scale.py) into build/evidence/benchmarks-scale.md.
 
     python3 benchmarks/scale_report.py <scale.json> [<after.json>]
 
@@ -107,5 +107,7 @@ if entries:
                    ['SHIP_WAL', 'Run', 'p50 ms', 'p99 ms', 'PUTs per commit', 'Epochs', 'Shipped bytes per commit'],
                    entries)
 
-(ROOT / 'docs/benchmarks-scale.md').write_text('\n'.join(lines))
-print('Wrote docs/benchmarks-scale.md')
+output = ROOT / 'build/evidence/benchmarks-scale.md'
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text('\n'.join(lines))
+print('Wrote', output)

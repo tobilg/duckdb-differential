@@ -1,7 +1,7 @@
 # Contributing
 
-Target stock DuckDB **v2.0.0** using the pinned submodules and vcpkg dependencies. Linux and
-macOS on amd64/arm64 are supported build targets. See [compatibility](docs/compatibility.md),
+Target stock DuckDB **v2.0.0** using the pinned submodules and vcpkg dependencies. Linux on
+amd64/arm64 and macOS on arm64 (Apple silicon) are supported build targets. See [compatibility](docs/compatibility.md),
 [architecture](docs/architecture.md) and [storage formats](docs/storage-format.md).
 
 ## Build and test
@@ -45,10 +45,10 @@ python3 test/integration/minio.py --merge-native-spill-only
 
 The MinIO harness owns/removes its provider container and generates temporary test credentials.
 It does not provision cloud infrastructure. Official extension coexistence tests require network
-access. Real-AWS qualification is owner-run in an explicitly authorized disposable namespace;
-immutable exports remain until the owner cleans them up.
+access. Tests against real AWS need a disposable bucket prefix you control; the tools leave
+immutable exports there for you to clean up.
 
-[Merge qualification](docs/merge-qualification.md) documents representative-data pilots,
+[Merge validation](docs/merge-qualification.md) documents representative-data pilots,
 stateful tests, exact result verification and bounded spill/recovery cases. The
 [benchmark inventory](benchmarks/README.md) lists measurement programs. Measure with a release
 loadable, identify the exact source/artifacts, and distinguish test costs from performance
@@ -82,16 +82,11 @@ credentials and data. Never use integration binaries as release artifacts.
 
 ## Release checks
 
-Qualify one clean committed candidate with reproducible release builds and SQL/integration
-checks on all four supported platforms. Run the full upstream inventory and exclusion audit
-manually. Complete an independently verified representative-data pilot, owner-run AWS tests
-for the supported S3 scope, and host/filesystem durability qualification appropriate to the
-native-equivalent durability claim. MinIO and process-death checks do not replace AWS or
-physical power-loss validation.
-
-Keep candidate-specific receipts and release decisions private. A passing local qualification
-report does not approve a release. Preserve the licenses and third-party notices in any
-distribution. Submit the community descriptor only when the owner requests publication.
+A release is built from one clean commit, with reproducible release builds and the SQL and
+integration checks passing on all four supported platforms. Run the full upstream inventory and
+exclusion audit manually, the S3 checks against AWS for the supported S3 scope, and a pilot with
+representative data. MinIO and process-death checks do not replace AWS or physical power-loss
+validation. Preserve the licenses and third-party notices in any distribution.
 
 `make bump-version V=X.Y.Z` updates coordinated version references. Follow
 [UPDATING.md](docs/UPDATING.md) when changing the DuckDB pin; released data-format changes

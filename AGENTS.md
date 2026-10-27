@@ -2,7 +2,7 @@
 
 - Target DuckDB v2.0.0 (the community repository's current stable; pinned to commit d54cbbe3df,
   which the community repository builds as v2.0.0, until the tag exists). One C++ extension on
-  DuckDB's C++ extension template, native storage semantics. Linux and macOS only.
+  DuckDB's C++ extension template, native storage semantics. Linux and macOS (Apple silicon) only.
 - All S3 operations must use the AWS SDK for C++ pinned through vcpkg (`VCPKG_COMMIT`).
 - Preserve native sync/namespace ordering, durable mappings, and all retention roots.
 - Never perform persistent management actions during bind or planning. The one approved
@@ -39,7 +39,7 @@ Each decision was made by the repository owner; changing one needs the owner's a
 - **Community extension (2026-10-11).** Prepared for publication through duckdb/community-extensions:
   - built with DuckDB's C++ extension template; the standalone build is retired;
   - dependencies from vcpkg at `cd61e1e` (AWS SDK 1.11.820, SQLite 3.53.2, OpenSSL 3.6.3);
-  - Linux amd64/arm64 and macOS amd64/arm64 only;
+  - Linux amd64/arm64 and macOS arm64 only (no Intel Macs);
   - export descriptors record the writer's DuckDB version, but readers accept any version.
 - **Sharing (2026-10-11).**
   - Repositories are private by default. `differential_repository_shared` creates a
@@ -170,7 +170,7 @@ make integration && make test_integration # hooks build; C++ unit tests + Python
 make test_upstream_harness test_upstream_pr # adapter checks and PR coverage
 make test_upstream test_upstream_skips     # full SQLLogicTest inventory and exclusion audit
 make test_minio                           # S3 suites, disposable MinIO (Docker)
-make bench-tpch                           # TPC-H SF1, native vs Differential local/S3 -> docs/benchmarks-tpch.md
+make bench-tpch                           # TPC-H SF1, native vs Differential local/S3 -> build/evidence/benchmarks-tpch.md
 ```
 
 - `make integration` compiles failpoints and probes (`-DDIFFERENTIAL_TEST_HOOKS=ON`) and does not

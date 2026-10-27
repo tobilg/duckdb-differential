@@ -71,11 +71,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `benchmarks/tpch.py` and `tpch_report.py` (`make bench-tpch`): TPC-H Q1–Q22 at a scale factor on every
     backend and S3 read path, warm and in new processes, plus `lineitem` writes, with result hashes checked
     against native; `tpch_report.py baseline.json after.json` compares two runs
-    ([docs/benchmarks-tpch.md](docs/benchmarks-tpch.md));
+    (`docs/benchmarks-tpch.md` at the time);
   - `benchmarks/scale.py` and `scale_report.py`: gigabyte-scale workloads (concurrent commits, bulk load,
     cold scans, S3 export settings, remote collection, shared history, `ship_latency`) against a
     disk-backed MinIO, also as a manual GitHub workflow (`Benchmarks.yml`;
-    [docs/benchmarks-scale.md](docs/benchmarks-scale.md));
+    `docs/benchmarks-scale.md` at the time);
   - `benchmarks/disk_cache.py`: the repository disk cache versus local reads.
 - Remote garbage collection: `differential_cleanup_remote_files(location)` condemns S3 data that no
   branch head or unexpired snapshot reaches and deletes it in a later run after a grace period

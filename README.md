@@ -34,14 +34,14 @@ other platforms are untested.
 | [SQL reference](docs/sql-reference.md) | Every statement, ATTACH option, setting and function: parameters, defaults, result columns and an example each |
 | [SQL API](docs/api.md) | Semantics and rules: ATTACH, time travel, S3 profile, caching, secrets, shared databases, limits and errors |
 | [Branch merging](docs/branch-merge.md) | Local and single-writer S3 merges into new or detached existing targets: typed three-way conflicts, preflight and guards, schema and view changes, ancestry and durable recovery |
-| [Merge qualification](docs/merge-qualification.md) | Deployment pilots, exact result verification and bounded resource/recovery checks |
+| [Merge validation](docs/merge-qualification.md) | Deployment pilots, exact result verification and bounded resource/recovery checks |
 | [Deployment](docs/deployment.md) | Processes, users and hosts; local storage vs S3; branch heads |
 | [Concurrency and multitenancy](docs/concurrency-and-multitenancy.md) | What runs concurrently, guarded heads, shared databases, tenant isolation |
 | [Durability and recovery](docs/durability-and-recovery.md) | The durable write path and the evidence for crash recovery |
 | [Storage formats](docs/storage-format.md) | Repository layout, metadata schema, hashes, segments, S3 layout and formats |
 | [Architecture](docs/architecture.md) | How the extension sits below DuckDB's native storage |
 | [Security](docs/security.md) · [Contributing](CONTRIBUTING.md) | Credentials, data access and diagnostics; development, testing and publication boundaries |
-| [Compatibility](docs/compatibility.md) · [Benchmarks](docs/benchmarks.md) ([TPC-H](docs/benchmarks-tpch.md)) | Verified DuckDB build, dependencies and platforms; measurements |
+| [Compatibility](docs/compatibility.md) · [Performance and sizing](docs/benchmarks.md) | Supported DuckDB build, dependencies and platforms; performance and sizing |
 | [Changelog](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) | |
 
 ## Contents
@@ -272,7 +272,7 @@ failover, shared writers and common pitfalls. All installations use
 [`plugins/duckdb-differential/skills/duckdb-differential`](plugins/duckdb-differential/skills/duckdb-differential),
 including its bundled `references/` directory.
 
-Installation guidance follows the linked official harness documentation, reviewed on 2026-10-21.
+Installation guidance follows the linked official harness documentation.
 Compatibility is documented on that basis. Local and CI validation checks our skill files and
 manifests; it does not install or execute coding-agent harnesses, their loaders or model workflows.
 
@@ -367,7 +367,7 @@ DuckDB (`duckdb/`, v2.0.0) and `extension-ci-tools/` are submodules, and CI uses
 vcpkg at a pinned commit (`VCPKG_COMMIT` in the `Makefile`): AWS SDK for C++ 1.11.820 (S3
 only), SQLite 3.53.2 and OpenSSL 3.6.3, statically linked into the extension; their licenses
 and notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-Linux (amd64, arm64) and macOS (amd64, arm64) are supported; Windows and wasm are not.
+Linux (amd64, arm64) and macOS (arm64, Apple silicon) are supported; Intel Macs, Windows and wasm are not.
 
 ### Build
 

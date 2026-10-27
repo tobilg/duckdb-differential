@@ -1,10 +1,11 @@
-# Merge qualification
+# Merge validation
 
-The qualification tools exercise the existing merge implementation on stock DuckDB **v2.0.0**.
-They add operator verification and repeatable acceptance evidence; they do not change merge
-semantics, storage formats or publication. Linux and macOS are supported.
+These tools validate branch merging on your platform and with your data: a pilot that merges a
+disposable copy of real data and verifies the result against an independently prepared expected
+database, a stateful soak, and native scale and spill tests. They do not change merge semantics,
+storage formats or publication. Linux and macOS are supported.
 
-## Run the local gate
+## Run the local checks
 
 Build `make integration`, then run:
 
@@ -15,37 +16,23 @@ python3 scripts/qualify_merge.py --seeds 7 29 97 --steps 40 --rows 32 \
   --timeout-seconds 900 --output build/evidence/merge-qualification-long
 ```
 
-The default local gate runs the generated pilot rehearsal, the original scalar and new native-type
-stateful profiles (12 rounds each, seed 7), and every immutable compatibility fixture (currently
-data written by the published v1.0.0 release).
-`make test_merge_qualification` also tests rejection
-of invalid evidence and execution/resource limits. The same entry point is included in
-`make test_integration`, so the existing four-platform Integration workflow runs it. The full
-upstream inventory and exclusion audit remain manual.
+The default run covers a generated pilot rehearsal, the scalar and native-type stateful profiles
+(12 rounds each, seed 7) and every immutable compatibility fixture (currently data written by the
+published v1.0.0 release). It also checks that incomplete reports and execution/resource limits
+are rejected. `make test_integration` includes it.
 
-The separate native scale and spill tests below cover larger nullable container values. Their
-reports supplement the qualification gate; a successful benchmark does not approve a release.
+Each run writes a report directory under `build/evidence/` with an `acceptance.json`, and
+`latest.json` holds a copy of the newest outcome; component reports sit alongside. A report
+records the source commit and a fingerprint of the sources used (implementation, tests, scripts,
+benchmarks and build inputs, including uncommitted files), the DuckDB pin, platform, extension and
+CLI SHA-256, fixture hashes, component outcomes and durations. The fingerprint describes what was
+used; it does not prove that a binary was built from those sources, and reports are not signed.
+A run only accepts components produced by itself, for the same sources and artifacts.
 
-Each invocation creates a separate report directory, with a UUID and an `acceptance.json`;
-`latest.json` points to the latest outcome by containing a copy of that report. Component reports
-are retained alongside it. The report records the commit, dirty-workspace flag, source fingerprint,
-stock DuckDB pin, platform/architecture, extension and CLI SHA-256, compatibility library hash,
-fixture hashes, component outcomes and durations. The source fingerprint covers the working
-implementation, tests, scripts, benchmarks and build/workflow inputs, including untracked files;
-it excludes documentation and build outputs. It is an observation of the sources and binaries
-used, **not proof that a particular binary was compiled from that source**. A release candidate
-still needs a clean, reproducible build.
-
-Receipts must come from this invocation, match the candidate identity and checksum, contain all
-required checks, and contain no unexecuted scenarios. Artifacts, sources and fixtures are checked
-again during the run. Old transcripts cannot satisfy the gate. These are local evidence records,
-not signed attestations against malicious modification.
-
-`status: passed` means that the requested gate passed for its recorded storage/platform. `release_ready` stays false;
-the report lists outstanding release gates separately. Generated data is only a pilot rehearsal.
-The runner does not dispatch CI, publish release artifacts, or approve a release. The default
-gate uses local storage. The explicit S3 mode below creates and publishes synthetic databases;
-real AWS invocation is reserved for the owner.
+`status: passed` means every requested check passed for the recorded storage and platform.
+It does not cover other platforms, providers or data, and the report's `release_ready` field is
+always false. The S3 mode below creates and publishes synthetic databases in a location you
+choose.
 
 ## Run a representative pilot
 
@@ -191,8 +178,8 @@ is required for a passing full soak; running a release artifact does not silentl
 Reports include per-round comparison/application/publication timings, peak child RSS, child I/O
 block counters, sampled disk usage and quiescent storage counts. Sampling may miss brief peaks;
 zero OS I/O counters are not proof of zero device I/O. Process-death tests are not power-loss tests.
-The long run still needs to be repeated with representative catalogs/data volumes and on every
-release platform. See [performance and sizing](benchmarks.md) and the [release checks](../CONTRIBUTING.md#release-checks).
+Repeat the long run with representative catalogs and data volumes on every platform you deploy
+to. See [performance and sizing](benchmarks.md).
 
 ## Native-type stateful profile
 
@@ -225,16 +212,16 @@ request replay, input isolation, expiry and GC. Quiescence checks pins, staging,
 pending exports/reservations and local retained-root mappings. Bounds are the same as the
 original profile; generated input alphabets and row maps are explicitly bounded.
 
-## S3 qualification gate
+## S3 checks
 
 The disposable MinIO entry point sets up the pinned provider fixture and runs the complete
-S3 gate. It is also included in the full MinIO and merge-only suites:
+S3 checks. It is also included in the full MinIO and merge-only suites:
 
 ```sh
 python3 test/integration/minio.py --merge-qualification-only
 ```
 
-The gate runs the S3 pilot rehearsal, the native stateful profile on S3 and all immutable
+They run the S3 pilot rehearsal, the native stateful profile on S3 and all immutable
 **local** compatibility fixtures. The latter do not establish immutable S3 compatibility.
 The pilot covers new/existing destinations, guarded execution, original-export replay,
 wrong expected data, unsupported shared writers, interrupted/prepared/published recovery,
@@ -242,10 +229,10 @@ safe and uncertain aborts, and frozen nested choices. The S3 soak checks a fresh
 after each round. Prepared new destinations must report their reservation owner without
 changing publication metadata; abort must release the name and retry must publish once.
 It also exercises evicted inputs and interruption after the conditional head PUT.
-Receipt checks reject local-only evidence, missing fresh remote verification and missing
-reservation checks. These are exercised against copies of the actual S3 gate's receipts.
+Reports without fresh remote verification or reservation checks, or with only local evidence,
+are rejected.
 
-For an existing disposable provider, the owner can explicitly run:
+Against a disposable prefix in an existing bucket (AWS S3 or another provider), run:
 
 ```sh
 python3 scripts/qualify_merge.py --s3-location s3://BUCKET/disposable-merge-qualification/ \
@@ -256,15 +243,13 @@ python3 scripts/qualify_merge.py --s3-location s3://BUCKET/disposable-merge-qual
 Each generated case/seed creates a fresh UUID namespace below the supplied prefix. S3 object
 operations all go through the extension. The helper deletes no S3 objects: completed exports
 and immutable uploads remain under the generated prefixes. The MinIO container is removed by
-its outer fixture; real-provider retention/cleanup belongs to the owner. The local disk/time
+its outer fixture; on a real provider, clean up the prefix yourself. The local disk/time
 budgets do not constitute a bucket quota. Reports identify generated namespaces and the exact
-candidate, without credentials or row values. No real AWS run is implied by a MinIO success.
+sources and artifacts, without credentials or row values. No real AWS run is implied by a MinIO success.
 
-Local and S3 receipts have distinct required components and storage scopes. Validation rejects
-missing native/remote verification, wrong provider scope, missing reservation checks, incomplete
-rounds, missing current fixtures and mixed candidate identities. A passing S3 gate also leaves
-`release_ready: false`; platform qualification, representative data and owner-run AWS evidence
-remain separate requirements.
+Local and S3 reports have distinct required components and storage scopes. Validation rejects
+missing native/remote verification, the wrong provider scope, missing reservation checks,
+incomplete rounds, missing fixtures and components from different sources or artifacts.
 
 ## Native scale and observed spill
 
@@ -312,7 +297,7 @@ removed afterward. The common base is exported, evicted and proven reclaimed loc
 the merge; input heads remain local. The result's exact immutable export is independently
 verified in a fresh reader repository. All S3 operations use the extension's AWS SDK path.
 The benchmark also accepts an existing `--s3-location` plus the same connection options as the
-pilot, but real-provider execution is owner-only and leaves immutable objects for owner cleanup.
+pilot; on a real provider it leaves immutable objects under the prefix for you to clean up.
 
 Reports separate selection, target checking, input materialization, comparison, application
 and publication timers. They include whole-merge process wall time/RSS, observed native spill
@@ -321,7 +306,7 @@ Merge timers exclude fixture setup, verification, replay and cleanup. Initial ba
 row verification have separate process measurements; not every setup/catalog-check call is timed
 individually. Run the matrices without competing test workloads;
 OS caches are not flushed. Sampling can miss peaks, and logical/SDK counters are not device or
-wire throughput. Candidate identities are checked throughout; reports are private under
+wire throughput. Source and artifact identities are checked throughout; reports are written under
 `build/evidence/`. See [performance and sizing](benchmarks.md).
 
 The spill suite uses 100,000 rows/20% changes and tests both new branches and existing targets.

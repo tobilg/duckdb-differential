@@ -1266,7 +1266,7 @@ budget counts attempted writes/file growth including overwrites, not physical re
 See [branch merge](branch-merge.md) for the detail STRUCT and supported scope.
 
 ```sql
--- merge prototype
+-- merging
 ATTACH 'differential:merge_demo' AS d;
 CREATE TABLE d.items(id INT PRIMARY KEY, label VARCHAR, amount DECIMAL(18,3));
 INSERT INTO d.items VALUES (1, 'original', 1.250);
@@ -1478,7 +1478,7 @@ Unexpected staged view binding/output/dependency failures use `merge_application
 See [branch merge](branch-merge.md) for semantics, errors and recovery.
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: edited
 SELECT * FROM differential_merge_snapshots('merge_demo', 1, 2, 3, 'merged', request_id => 'demo-merge');
 ATTACH 'differential:merge_demo' AS m (BRANCH 'merged');
@@ -1515,7 +1515,7 @@ three IDs with the snapshot preview. `validate => true` tests final supported co
 memory outside DuckDB's buffer manager. See [ancestry and expiry](branch-merge.md#expiry-and-incomplete-history).
 
 ```sql
--- merge prototype
+-- merging
 SELECT base_snapshot_id, ours_snapshot_id, theirs_snapshot_id, validation_state
 FROM differential_merge_branch_preview('merge_demo', 'ours', 'theirs', validate => true);
 ```
@@ -1571,7 +1571,7 @@ it never opens a writable native target or checkpoints its WAL. See [preflight s
 recovery](branch-merge.md#preflight-and-guarded-execution).
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: created_branch
 CREATE TEMP TABLE reviewed AS SELECT * FROM differential_merge_branch_preflight(
   'merge_demo', 'ours', 'theirs', 'reviewed_merge');
@@ -1645,7 +1645,7 @@ still apply after reservation. Without guards, a new call selects current heads.
 merge an earlier selection regardless of current heads into a new branch, use the snapshot API.
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: edited
 SELECT * FROM differential_merge_branch('merge_demo', 'ours', 'theirs', 'merged_from_branches',
                                        request_id => 'demo-branch-merge');
@@ -1656,7 +1656,7 @@ SELECT label FROM b.items;
 Continue a merged branch with further changes on a contributing branch:
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: edited
 ATTACH 'differential:merge_demo' AS t (BRANCH 'theirs');
 UPDATE t.items SET amount = 3.500;
@@ -1671,7 +1671,7 @@ The second merge uses the earlier `theirs` snapshot as its base. Both source bra
 their identities and heads in this new-destination example. To update the existing target:
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: merged
 -- Run after detaching the target in every connection.
 SELECT snapshot_id, merge_action FROM differential_merge_branch(
@@ -1767,7 +1767,7 @@ branch, payload pin or ancestor retention is created. Use published head IDs fro
 `differential_branches()` to inspect branch history.
 
 ```sql
--- merge prototype
+-- merging
 SELECT snapshot_id,parents,reachable_from,candidate,selection_state,selected_base
 FROM differential_merge_ancestry('merge_demo',4,3);
 ```
@@ -1820,7 +1820,7 @@ Additive requests use `additive-tables-v2`; a fresh preview does not change an e
 planner version.
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: complete
 SELECT operation_id, state, destination, retained_logical_bytes, attempt_count,
        last_attempt_state, last_attempt_phase, last_attempt_error_code
@@ -1850,7 +1850,7 @@ destination checks; existing remote heads/tombstones are never replaced. Uploade
 objects and audit records are not deleted. See [safe abort](branch-merge.md#durable-requests-and-safe-abort).
 
 ```sql
--- merge prototype
+-- merging
 -- expect output: complete
 SET VARIABLE finished_merge=(SELECT operation_id FROM differential_merge_requests('merge_demo',request_id=>'demo-merge'));
 SELECT state FROM differential_abort_merge('merge_demo',getvariable('finished_merge'),request_id=>'demo-abort');

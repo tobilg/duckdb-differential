@@ -9,7 +9,7 @@ This repository's source license is in LICENSE. Dependencies are not re-licensed
 | AWS SDK for C++ (`s3` component) with its AWS CRT and curl dependencies | 1.11.820 (vcpkg) | Apache-2.0 (curl: curl license) |
 | SQLite | 3.53.2 (vcpkg) | Public domain / blessing |
 | OpenSSL | 3.6.3 (vcpkg) | Apache-2.0 |
-| MinIO (external disposable test endpoint only) | RELEASE.2025-09-07T16-13-09Z | AGPLv3 |
+| MinIO (external disposable test endpoint only) | RELEASE.2025-10-15T17-29-55Z (`ghcr.io/coollabsio/minio`, pinned by digest) | AGPLv3 |
 
 Library versions are those of vcpkg commit `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3`
 (`VCPKG_COMMIT` in the `Makefile`), declared in `vcpkg.json`. They are linked statically into

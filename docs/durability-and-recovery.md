@@ -1,4 +1,4 @@
-# Durability and recovery evidence
+# Durability and recovery
 
 ## Durable local byte store
 
@@ -73,9 +73,9 @@ Public snapshot publication, request IDs, UUID-based ownership/epochs and compou
 restore/delete now live in transactional control metadata. A completed checkpoint capture
 is pinned until publication. Restore/delete persist an intent under exclusive ownership,
 recover native WAL on a separate connection, and atomically preserve/replace or tombstone.
-Four compound process-death points passed, including native acknowledged WAL preservation.
-The same points pass with an additional payload pool and when a pending restore's
-target is retired before retry. Its durable intent retains the target independently.
+Tests kill the process at four compound points, including native acknowledged WAL
+preservation, also with an additional payload pool and when a pending restore's target
+is retired before retry. Its durable intent retains the target independently.
 Pending branch deletions reserve a surviving unfenced branch; another deletion cannot
 remove that survivor while the first is awaiting recovery.
 
@@ -89,8 +89,8 @@ automatically after checkpoints on a background worker. Retired segments are del
 references them (file before row), and sparse ones are compacted first: live payload is copied,
 verified and synced into a new segment that takes over the references in one transaction; reads
 that race with it retry on fresh metadata. SQLite pages remain reusable. Incremental
-compaction uses the repository's SQLite incremental auto-vacuum mode, set at creation. Two
-compaction crash/retry points passed while a historical reader remained live.
+compaction uses the repository's SQLite incremental auto-vacuum mode, set at creation. Tests
+crash and retry compaction at two points while a historical reader remains live.
 
 ## S3 boundary
 
@@ -301,5 +301,5 @@ orphan scan also removes unpublished hashes and abandoned `write-*` files in the
 registered repository/provider namespace. Unknown names and other namespaces remain
 untouched. Identical hashes conservatively retain every registered local replica while
 any map still references the hash. Keep both the metadata store and provider volumes; local
-pool files alone do not replace the metadata store. Native compound-recovery tests passed
-four process-death points with the database and WAL payloads in an additional pool.
+pool files alone do not replace the metadata store. Native compound-recovery tests cover
+the four process-death points with the database and WAL payloads in an additional pool.
