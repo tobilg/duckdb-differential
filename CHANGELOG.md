@@ -5,7 +5,7 @@ All notable changes to the DuckDB differential extension are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-10-27
 
 ### Added
 
@@ -49,6 +49,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `differential_cleanup_metadata` never deletes snapshot parent records, and deletes the records of a
   merge request (frozen policy, guards, choices, attempts, publication, abort marker) only together
   with the request, so pending and aborted merges keep their retry and terminal state.
+
+### Removed
+
+- Intel Macs (`osx_amd64`) are no longer supported or built. Supported platforms are Linux amd64/arm64
+  and macOS arm64 (Apple silicon).
 
 ## [1.0.0] - 2026-10-21
 

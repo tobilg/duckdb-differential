@@ -83,7 +83,7 @@ credentials and data. Never use integration binaries as release artifacts.
 ## Release checks
 
 A release is built from one clean commit, with reproducible release builds and the SQL and
-integration checks passing on all four supported platforms. Run the full upstream inventory and
+integration checks passing on all three supported platforms. Run the full upstream inventory and
 exclusion audit manually, the S3 checks against AWS for the supported S3 scope, and a pilot with
 representative data. MinIO and process-death checks do not replace AWS or physical power-loss
 validation. Preserve the licenses and third-party notices in any distribution.
