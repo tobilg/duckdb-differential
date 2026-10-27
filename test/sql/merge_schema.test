@@ -1,0 +1,167 @@
+# name: test/sql/merge_schema.test
+# description: additive schema planning, binding, preview and publication
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_schema'
+
+statement ok
+PREPARE snap AS SELECT * FROM differential_merge_snapshots('absent',1,2,3,'merged',schema_mode=>'additive')
+
+statement ok
+PREPARE branch AS SELECT * FROM differential_merge_branch('absent','ours','theirs','merged',schema_mode=>'additive')
+
+statement ok
+PREPARE preview AS SELECT * FROM differential_merge_snapshots_preview('absent',1,2,3,schema_mode=>'additive',validate=>true)
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_branch_preview('absent','ours','theirs',schema_mode=>'additive',validate=>true)
+
+query T
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('absent',1,2,3,schema_mode=>'anything')
+----
+schema_mode
+
+statement ok
+ATTACH 'differential:schema_merge' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,v VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,NULL),(2,'original')
+
+statement ok
+CREATE TABLE d.empty_table(id INT PRIMARY KEY)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','ours',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','theirs',snapshot=>1)
+
+statement ok
+ATTACH 'differential:schema_merge' AS o (BRANCH 'ours')
+
+statement ok
+ALTER TABLE o.x ADD COLUMN z BOOLEAN
+
+statement ok
+UPDATE o.x SET z=true WHERE id=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:schema_merge' AS t (BRANCH 'theirs')
+
+statement ok
+ALTER TABLE t.x ADD COLUMN a DECIMAL(10,2)
+
+statement ok
+UPDATE t.x SET a=2.50 WHERE id=1
+
+statement ok
+ALTER TABLE t.empty_table ADD COLUMN note VARCHAR
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+schema mismatch
+
+query TTTIII rowsort
+SELECT table_name,schema_mode,validation_state,len(schema_changes),schema_conflicts,conflicts FROM differential_merge_branch_preview('d','ours','theirs',schema_mode=>'ADDITIVE',validate=>true)
+----
+empty_table	additive	valid	1	0	0
+x	additive	valid	2	0	0
+
+query TTTT
+SELECT schema_changes[1].column_name,schema_changes[1].source,schema_changes[2].column_name,schema_changes[2].source FROM differential_merge_snapshots_preview('d',1,2,3,schema_mode=>'additive') WHERE table_name='x'
+----
+a	theirs	z	ours
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind IN ('merge','merge_branch','merge_schema')
+----
+0
+
+query I
+SELECT snapshot_id FROM differential_merge_branch('d','ours','theirs','merged',schema_mode=>'additive',request_id=>'schema')
+----
+4
+
+query TT
+SELECT schema_mode,schema_algorithm FROM differential_merge_requests('d',request_id=>'schema')
+----
+additive	additive-tables-v2
+
+statement error
+SELECT * FROM differential_merge_branch('d','ours','theirs','merged',request_id=>'schema')
+----
+different schema_mode
+
+statement ok
+ATTACH 'differential:schema_merge' AS m (BRANCH 'merged')
+
+query ITRT
+SELECT * FROM m.x ORDER BY id
+----
+1	NULL	2.50	true
+2	original	NULL	NULL
+
+query I
+SELECT count(*) FROM m.empty_table WHERE note IS NOT NULL
+----
+0
+
+statement ok
+ALTER TABLE o.x ADD COLUMN incompatible INT
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ALTER TABLE t.x ADD COLUMN incompatible VARCHAR
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query TTIIT rowsort
+SELECT table_name,validation_state,schema_conflicts,conflicts,schema_conflict_details[1].column_name FROM differential_merge_snapshots_preview('d',1,5,6,schema_mode=>'additive',validate=>true)
+----
+empty_table	blocked_by_schema_conflicts	0	NULL	NULL
+x	schema_conflicts	1	NULL	incompatible
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,5,6,'conflicted',schema_mode=>'additive',request_id=>'conflict')
+----
+merge_schema_conflict
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='conflicted'
+----
+0
+
+statement ok
+DETACH m
+
+statement ok
+DETACH o
+
+statement ok
+DETACH t
+
+statement ok
+DETACH d

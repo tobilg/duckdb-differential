@@ -1,0 +1,70 @@
+# name: test/sql/s3_merge_scope.test
+# description: S3 merge scope and recovery identity checks execute without network at bind
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/s3_merge_scope'
+
+statement ok
+PREPARE pending AS SELECT * FROM differential_merge_snapshots('absent',1,2,3,'merged')
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_snapshots_preview('absent',1,2,3,validate=>true)
+
+query I
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:s3_merge' AS d (DATA_PATH 's3://unused-test-bucket/merge/',ENDPOINT 'http://127.0.0.1:9',PATH_STYLE true,ALLOW_HTTP true)
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,2,3,'merged')
+----
+merge_request_required
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,2,3,'merged',request_id=>'missing')
+----
+not_found
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,2,3)
+----
+not_found
+
+statement error
+SELECT * FROM differential_merge_branch_preview('d','ours','theirs')
+----
+not_found
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind='merge_publication'
+----
+0
+
+query I
+SELECT count(*) FROM differential_snapshots('d')
+----
+0
+
+statement error
+ATTACH 'diff://merge_input/00000000-0000-0000-0000-000000000000' AS invalid (READ_ONLY)
+----
+No live merge staging owner
+
+statement error
+SELECT * FROM differential_merge_branch('d','ours','theirs','ours')
+----
+merge_request_required
+
+statement ok
+PREPARE branch_merge AS SELECT * FROM differential_merge_branch('absent','ours','theirs','ours',request_id=>'target')
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_branch_preflight('absent','ours','theirs','ours')
+
+statement ok
+DETACH d

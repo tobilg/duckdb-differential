@@ -1,0 +1,151 @@
+# name: test/sql/merge_resolutions.test
+# description: typed conflict resolution, native schema objects and ancestry inspection
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_resolutions'
+
+statement ok
+ATTACH 'differential:resolutions' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,v INT DEFAULT 7 CHECK(v>0),day DATE,ts TIMESTAMP)
+
+statement ok
+CREATE UNIQUE INDEX ux ON d.x(v)
+
+statement ok
+USE d
+
+statement ok
+CREATE VIEW visible AS SELECT id,v FROM x
+
+statement ok
+USE memory
+
+statement ok
+INSERT INTO d.x VALUES(1,1,DATE '2020-01-01',NULL)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','o',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','t',snapshot=>1)
+
+statement ok
+ATTACH 'differential:resolutions' AS o (BRANCH 'o')
+
+statement ok
+ATTACH 'differential:resolutions' AS t (BRANCH 't')
+
+statement ok
+UPDATE o.x SET v=2,day=DATE '2021-01-01'
+
+statement ok
+UPDATE t.x SET v=3,ts=TIMESTAMP '2022-01-01 12:34:56.123456'
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement ok
+CREATE TABLE fixes(id INT,v INT,day DATE,ts TIMESTAMP,_merge_action VARCHAR,_merge_columns MAP(VARCHAR,VARCHAR))
+
+statement ok
+INSERT INTO fixes VALUES(1,42,NULL,NULL,'cells',map{'v':'custom'})
+
+query III
+SELECT conflicts,resolved_conflicts,validation_state='valid' FROM differential_merge_snapshots_preview('d',1,2,3,resolution_tables=>map{'main.x':'memory.main.fixes'},validate=>true)
+----
+0	1	true
+
+query III
+SELECT snapshot_id,parents_known,selected_base FROM differential_merge_ancestry('d',2,3) WHERE candidate
+----
+1	true	1
+
+query III
+SELECT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id FROM differential_merge_branch('d','o','t','resolved',request_id=>'resolution',resolution_tables=>map{'main.x':'memory.main.fixes'})
+----
+1	2	3
+
+statement ok
+ATTACH 'differential:resolutions' AS r (BRANCH 'resolved')
+
+query IITT
+SELECT * FROM r.x
+----
+1	42	2021-01-01	2022-01-01 12:34:56.123456
+
+query II
+SELECT * FROM r.visible
+----
+1	42
+
+query TII
+SELECT action,key[1].integer_value,values[2].integer_value FROM differential_merge_resolutions('d','resolution')
+----
+cells	1	42
+
+statement ok
+DROP TABLE fixes
+
+query I
+SELECT snapshot_id FROM differential_merge_branch('d','o','t','resolved',request_id=>'resolution',resolution_tables=>map{'main.x':'memory.main.fixes'})
+----
+4
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','resolved',request_id=>'resolution')
+----
+different resolution_tables
+
+statement ok
+INSERT INTO r.x(id) VALUES(2)
+
+query I
+SELECT v FROM r.x WHERE id=2
+----
+7
+
+statement error
+UPDATE r.x SET v=42 WHERE id=2
+----
+Duplicate
+
+statement error
+UPDATE r.x SET v=-1 WHERE id=2
+----
+CHECK
+
+query T
+SELECT parents::VARCHAR FROM differential_merge_ancestry('d',4,3) WHERE snapshot_id=4
+----
+[2, 3]
+
+statement ok
+PREPARE ancestry_plan AS SELECT * FROM differential_merge_ancestry('does_not_exist',1,2)
+
+statement ok
+PREPARE resolution_plan AS SELECT * FROM differential_merge_snapshots('does_not_exist',1,2,3,'new',resolution_tables=>map{'main.x':'memory.main.absent'})
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_resolutions('does_not_exist','absent')
+
+statement ok
+DETACH r
+
+statement ok
+DETACH t
+
+statement ok
+DETACH o
+
+statement ok
+DETACH d

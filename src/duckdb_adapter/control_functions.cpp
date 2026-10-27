@@ -23,12 +23,14 @@
 #include "differential_catalog.hpp"
 #include "follow.hpp"
 #include "differential_shipping.hpp"
+#include "logical_merge.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include <openssl/evp.h>
 #include <array>
+#include <chrono>
 #include <filesystem>
 
 namespace duckdb {
@@ -46,6 +48,13 @@ enum class Command {
     WRITERS,
     FOLLOWERS,
     STATS,
+    MERGE_STATUS,
+    MERGE_ANCESTRY,
+    MERGE_RESOLUTIONS,
+    MERGE_REQUESTS,
+    MERGE_PREVIEW,
+    MERGE_BRANCH_PREFLIGHT,
+    MERGE_BRANCH_PREVIEW,
     // lifecycle
     CREATE_SNAPSHOT,
     CREATE_BRANCH,
@@ -60,6 +69,9 @@ enum class Command {
     IMPORT_DATABASE,
     RECOVER_EXPORT,
     RECOVER_BRANCH,
+    MERGE,
+    MERGE_BRANCH,
+    ABORT_MERGE,
     // maintenance
     CLEANUP_OLD_FILES,
     DELETE_ORPHANED_FILES,
@@ -67,7 +79,11 @@ enum class Command {
     CLEANUP_REMOTE_FILES,
     CLEANUP_METADATA
 };
-bool ReadOnly(Command c) { return c <= Command::STATS; }
+bool ReadOnly(Command c) { return c <= Command::MERGE_BRANCH_PREVIEW; }
+bool IsMerge(Command c) {
+    return c == Command::MERGE || c == Command::MERGE_PREVIEW ||
+           c == Command::MERGE_BRANCH || c == Command::MERGE_BRANCH_PREVIEW || c == Command::MERGE_BRANCH_PREFLIGHT;
+}
 struct Info : TableFunctionInfo {
     std::shared_ptr<differential::Repository> repository;
     Command command;
@@ -82,12 +98,14 @@ struct Binding : TableFunctionData {
     vector<Value> args;
     vector<LogicalType> types;
     string request;
+    string after;
     differential::SnapshotInfo snapshot_info;
     std::optional<int64_t> snapshot, older_than;
     vector<int64_t> versions;
     string branch, keep;
     bool dry_run = false, cleanup_all = false, defer_export = false, full_refresh = false, same_identity = false;
     int64_t limit = 1000;
+    MergeOptions merge;
     DataPathOptions data;
 };
 struct State : GlobalTableFunctionState {
@@ -135,6 +153,7 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
     auto b = make_uniq<Binding>();
     b->repository = info.repository;
     b->command = info.command;
+    if (info.command == Command::MERGE_BRANCH_PREFLIGHT) b->merge.validate = true;
     b->args = input.inputs;
     if (info.catalog)
         b->args.insert(b->args.begin(), Value(info.catalog->GetName()));
@@ -144,10 +163,23 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
     for (auto &entry : input.named_parameters) {
         auto name = StringUtil::Lower(entry.first.GetIdentifierName());
         auto &value = entry.second;
+        const bool expected_id = name == "expected_base_snapshot_id" || name == "expected_ours_snapshot_id" || name == "expected_theirs_snapshot_id";
+        if (expected_id && (value.IsNull() || value.GetValue<int64_t>() <= 0))
+            throw InvalidInputException("Expected snapshot IDs must be positive and not NULL");
         if (value.IsNull())
             continue;
-        if (name == "request_id")
+        if (name == "expected_base_snapshot_id") b->merge.expected.base = value.GetValue<int64_t>();
+        else if (name == "expected_ours_snapshot_id") b->merge.expected.ours = value.GetValue<int64_t>();
+        else if (name == "expected_theirs_snapshot_id") b->merge.expected.theirs = value.GetValue<int64_t>();
+        else if (name == "request_id")
             b->request = value.ToString();
+        else if (name == "after_operation_id")
+            b->after = value.ToString();
+        else if (name == "schema_mode") {
+            b->merge.schema_mode = StringUtil::Lower(value.ToString());
+            if (b->merge.schema_mode != "strict" && b->merge.schema_mode != "additive" && b->merge.schema_mode != "catalog")
+                throw InvalidInputException("schema_mode must be 'strict', 'additive' or 'catalog'");
+        }
         else if (name == "name")
             b->snapshot_info.name = value.ToString();
         else if (name == "author")
@@ -180,8 +212,34 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
             b->cleanup_all = value.GetValue<bool>();
         else if (name == "same_identity")
             b->same_identity = value.GetValue<bool>();
-        else if (name == "max_objects" || name == "max_pages")
+        else if (name == "max_objects" || name == "max_pages" || name == "max_results")
             b->limit = value.GetValue<int64_t>();
+        else if (name == "resolution_tables") {
+            for (auto &pair : ListValue::GetChildren(value)) {
+                auto &fields = StructValue::GetChildren(pair);
+                if (fields[0].IsNull() || fields[1].IsNull())
+                    throw InvalidInputException("resolution_tables entries must not be NULL");
+                b->merge.resolution_tables.emplace(fields[0].GetValue<string>(), fields[1].GetValue<string>());
+            }
+        }
+        else if (name == "conflict_limit")
+            b->merge.conflict_limit = value.GetValue<int64_t>();
+        else if (name == "conflict_offset")
+            b->merge.conflict_offset = value.GetValue<int64_t>();
+        else if (name == "conflict_bytes")
+            b->merge.conflict_bytes = value.GetValue<int64_t>();
+        else if (name == "validate")
+            b->merge.validate = value.GetValue<bool>();
+        else if (name == "max_input_rows")
+            b->merge.max_input_rows = value.GetValue<int64_t>();
+        else if (name == "max_input_bytes")
+            b->merge.max_input_bytes = value.GetValue<int64_t>();
+        else if (name == "max_stage_write_bytes")
+            b->merge.max_stage_write_bytes = value.GetValue<int64_t>();
+        else if (name == "timeout_ms")
+            b->merge.timeout_ms = value.GetValue<int64_t>();
+        else if (name == "max_ancestry_nodes")
+            b->merge.max_ancestry_nodes = value.GetValue<int64_t>();
         else if (name == "export_mode") {
             auto mode = value.ToString();
             if (mode != "sync" && mode != "deferred")
@@ -190,7 +248,66 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
         } else if (!b->data.Take(name, value))
             throw InvalidInputException("Unknown parameter %s", name);
     }
+    if (info.command == Command::MERGE_REQUESTS && (b->limit < 1 || b->limit > 1000))
+        throw InvalidInputException("Merge request limit must be 1..1000");
+    if (IsMerge(info.command) || info.command == Command::MERGE_ANCESTRY || info.command == Command::ABORT_MERGE) {
+        auto &m = b->merge;
+        m.expected.Validate();
+        if (m.conflict_limit < 0 || m.conflict_limit > 1000 || m.conflict_offset < 0 ||
+            m.conflict_offset > INT64_MAX - 1000 || m.conflict_bytes < 0 || m.conflict_bytes > 16777216)
+            throw InvalidInputException("conflict_limit must be 0..1000; conflict_offset must be nonnegative "
+                                        "and below BIGINT_MAX-1000; conflict_bytes must be 0..16777216");
+        if (m.max_input_rows < 1 || m.max_input_bytes < 1 || m.max_stage_write_bytes < 1 || m.timeout_ms < 1)
+            throw InvalidInputException("merge input, staging write and timeout limits must be positive");
+        if (m.max_ancestry_nodes < 1 || m.max_ancestry_nodes > 1000000)
+            throw InvalidInputException("max_ancestry_nodes must be 1..1000000");
+    }
     switch (info.command) {
+    case Command::MERGE_REQUESTS:
+        names = {"operation_id", "request_id", "merge_kind", "state", "database_id", "destination",
+                 "base_snapshot_id", "ours_snapshot_id", "theirs_snapshot_id", "result_snapshot_id", "result_root",
+                 "retained_logical_bytes", "destination_reserved", "remote_descriptor", "publication_attempted",
+                 "recovery_action", "created_at", "schema_mode", "schema_algorithm", "merge_action",
+                 "ours_branch_name", "theirs_branch_name", "ours_branch_id", "theirs_branch_id", "inputs_guarded",
+                 "attempt_count", "last_attempt_id", "last_attempt_state", "last_attempt_phase", "last_attempt_error_code",
+                 "last_attempt_started_at", "last_attempt_updated_at", "last_attempt_finished_at"};
+        types = {V, V, V, V, V, V, I, I, I, I, V, I, B, V, B, V, T, V, V, V,
+                 V, V, V, V, B, I, V, V, V, V, T, T, T};
+        break;
+    case Command::ABORT_MERGE:
+        names = {"operation_id", "merge_operation_id", "state", "snapshot_id"};
+        types = {V, V, V, I};
+        break;
+    case Command::MERGE_ANCESTRY:
+        names = {"snapshot_id", "branch_id", "kind", "parents_known", "parents", "reachable_from",
+                 "candidate", "retired", "readable", "selection_state", "selected_base"};
+        types = {I, V, V, B, LogicalType::LIST(I), V, B, B, B, V, I};
+        break;
+    case Command::MERGE_RESOLUTIONS:
+        names = StringsToIdentifiers(MergeResolutionNames());
+        types = MergeResolutionTypes();
+        break;
+    case Command::MERGE_STATUS:
+        names = StringsToIdentifiers(MergeStatusNames());
+        types = MergeStatusTypes();
+        break;
+    case Command::MERGE_BRANCH_PREFLIGHT:
+        names = StringsToIdentifiers(MergePreflightNames());
+        types = MergePreflightTypes();
+        break;
+    case Command::MERGE_PREVIEW:
+    case Command::MERGE_BRANCH_PREVIEW:
+        names = StringsToIdentifiers(MergePreviewNames());
+        types = MergePreviewTypes();
+        break;
+    case Command::MERGE:
+    case Command::MERGE_BRANCH:
+        names = {"operation_id", "branch_name", "snapshot_id", "comparison_ms", "application_ms",
+                 "base_snapshot_id", "ours_snapshot_id", "theirs_snapshot_id", "selection_ms", "ancestry_nodes",
+                 "materialization_ms", "publication_ms", "merge_action", "target_check_ms"};
+        types = {V, V, I, LogicalType::DOUBLE, LogicalType::DOUBLE, I, I, I, LogicalType::DOUBLE, I,
+                 LogicalType::DOUBLE, LogicalType::DOUBLE, V, LogicalType::DOUBLE};
+        break;
     case Command::SNAPSHOTS:
         names = SnapshotNames();
         types = SnapshotTypes();
@@ -606,6 +723,113 @@ void Run(ClientContext &context, const Binding &b, State &state) {
             "[differential:active_attachment_or_transaction] Differential management requires autocommit");
     auto active_control = b.repository->Get();
     auto &c = *active_control;
+    if (b.command == Command::MERGE_REQUESTS || b.command == Command::ABORT_MERGE) {
+        auto database = ResolveTarget(context, c, b.args[0].GetValue<string>()).database;
+        if (b.command == Command::ABORT_MERGE) {
+            auto id = b.args[1].GetValue<string>();
+            auto action = AbortLogicalMerge(context, c, database, id, b.request, b.merge);
+            state.rows.push_back({Value(action.id), Value(id), Value(action.snapshot ? "complete" : "aborted"),
+                                  action.snapshot ? Value::BIGINT(action.snapshot) : Value(I)});
+        } else {
+            for (auto &r : c.MergeRequests(database, b.request, b.after, b.limit, [&] {
+                if (context.IsInterrupted()) throw InterruptException();
+            })) {
+                state.rows.push_back({Value(r.operation.id), Optional(r.operation.request), Value(r.operation.kind),
+                    Value(r.state), Value(r.database), Value(r.destination), Value::BIGINT(r.base),
+                    Value::BIGINT(r.ours), Value::BIGINT(r.theirs), r.result ? Value::BIGINT(r.result) : Value(I),
+                    Optional(r.root), Value::BIGINT(r.retained_bytes), Value(r.reserved), Optional(r.descriptor),
+                    Value(r.head_attempted), Value(r.recovery), Time(r.created_at), Value(r.schema_mode), Value(r.schema_algorithm), Value(r.action),
+                    Optional(r.ours_branch_name), Optional(r.theirs_branch_name), Optional(r.ours_branch_id), Optional(r.theirs_branch_id),
+                    r.operation.kind == "merge_branch" ? Value(r.inputs_guarded) : Value(B),
+                    Value::BIGINT(r.attempt ? r.attempt->count : 0), r.attempt ? Value(r.attempt->id) : Value(V),
+                    r.attempt ? Value(r.attempt->state) : Value(V), r.attempt ? Value(r.attempt->phase) : Value(V),
+                    r.attempt ? Optional(r.attempt->error_code) : Value(V), Time(r.attempt ? r.attempt->started_at : 0),
+                    Time(r.attempt ? r.attempt->updated_at : 0), Time(r.attempt ? r.attempt->finished_at : 0)});
+            }
+        }
+        return;
+    }
+    if (b.command == Command::MERGE_STATUS) {
+        state.rows = MergeStatus(c);
+        return;
+    }
+    if (b.command == Command::MERGE_ANCESTRY || b.command == Command::MERGE_RESOLUTIONS) {
+        auto database = ResolveTarget(context, c, b.args[0].GetValue<string>()).database;
+        if (b.command == Command::MERGE_RESOLUTIONS) {
+            state.rows = MergeResolutionRows(c.ReadMergeResolutions(database, b.args[1].GetValue<string>()));
+            return;
+        }
+        auto start = std::chrono::steady_clock::now();
+        auto ancestry = c.InspectMergeAncestry(database, b.args[1].GetValue<int64_t>(), b.args[2].GetValue<int64_t>(),
+            b.merge.max_ancestry_nodes, [&] {
+                if (context.IsInterrupted()) throw InterruptException();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count() >= b.merge.timeout_ms)
+                    throw IOException("[differential:merge_timeout] Ancestry inspection deadline exceeded");
+            });
+        for (auto &node : ancestry.nodes) {
+            vector<Value> parents;
+            for (auto id : {node.parents.first, node.parents.second}) if (id) parents.push_back(Value::BIGINT(id));
+            state.rows.push_back({Value::BIGINT(node.snapshot), Optional(node.branch),
+                Value(node.known ? node.parents.kind : "unknown"), Value(node.known), Value::LIST(I, std::move(parents)),
+                Value(node.reach == 3 ? "both" : node.reach == 1 ? "ours" : "theirs"), Value(node.candidate),
+                Value(node.retired), Value(node.readable), Value(ancestry.state),
+                ancestry.selected ? Value::BIGINT(ancestry.selected) : Value(I)});
+        }
+        return;
+    }
+    if (IsMerge(b.command)) {
+        auto database = ResolveTarget(context, c, b.args[0].GetValue<string>()).database;
+        if (b.command == Command::MERGE_BRANCH_PREFLIGHT) {
+            if (b.args[3].GetValue<string>().empty()) throw InvalidInputException("Merge destination must not be empty");
+            state.rows.push_back(MergePreflight(context, c, database, b.args[1].GetValue<string>(),
+                                               b.args[2].GetValue<string>(), b.args[3].GetValue<string>(), b.merge));
+            return;
+        }
+        const bool branch = b.command == Command::MERGE_BRANCH || b.command == Command::MERGE_BRANCH_PREVIEW;
+        const bool preview = b.command == Command::MERGE_PREVIEW || b.command == Command::MERGE_BRANCH_PREVIEW;
+        auto destination = preview ? string() : b.args[branch ? 3 : 4].GetValue<string>();
+        if (!preview && destination.empty())
+            throw InvalidInputException("Merge destination must not be empty");
+        LogicalMergeResult result;
+        if (branch) {
+            auto started = std::chrono::steady_clock::now();
+            auto elapsed = [&] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+            };
+            auto check = [&] {
+                if (context.IsInterrupted())
+                    throw InterruptException();
+                if (elapsed() >= b.merge.timeout_ms)
+                    throw IOException("[differential:merge_timeout] Merge ancestry selection deadline exceeded");
+            };
+            auto inputs = c.ResolveMergeBranches(database, b.args[1].GetValue<string>(),
+                                                b.args[2].GetValue<string>(), destination, b.request,
+                                                b.merge.max_ancestry_nodes, check, MergeResolutionSpecification(b.merge), b.merge.schema_mode, b.merge.expected);
+            auto options = b.merge;
+            if (inputs.operation.state != "complete") {
+                check();
+                options.timeout_ms -= elapsed();
+            }
+            if (!preview && inputs.operation.state != "complete")
+                differential::Failpoint("DIFFERENTIAL_MERGE_CRASH", "resolved");
+            result = LogicalMerge(context, c, database, inputs.base, inputs.ours, inputs.theirs,
+                                  destination, b.request, options, &inputs);
+        } else
+            result = LogicalMerge(context, c, database, b.args[1].GetValue<int64_t>(),
+                                  b.args[2].GetValue<int64_t>(), b.args[3].GetValue<int64_t>(), destination,
+                                  b.request, b.merge);
+        if (preview)
+            state.rows = std::move(result.preview);
+        else
+            state.rows.push_back({Value(result.operation.id), Value(destination),
+                                  Value::BIGINT(result.operation.snapshot), Value(result.comparison_ms),
+                                  Value(result.application_ms), Value::BIGINT(result.base),
+                                  Value::BIGINT(result.ours), Value::BIGINT(result.theirs),
+                                  Value(result.selection_ms), Value::BIGINT(result.ancestry_nodes),
+                                  Value(result.materialization_ms), Value(result.publication_ms), Value(result.action), Value(result.target_check_ms)});
+        return;
+    }
     // Secrets are read at execution: current credentials for every S3 provider, and defaults
     // from the differential secret for options this call did not give.
     RefreshS3Credentials(context, c);
@@ -801,6 +1025,7 @@ void Run(ClientContext &context, const Binding &b, State &state) {
         differential::ClaimDatabase(c, database); // abandoned exports show as export_state 'abandoned'
         auto config = c.Provider(provider).config;
         for (auto &h : c.ExportedHeads(database, provider)) {
+            if (c.MergeTargetPending(h.branch)) continue; // Not claimed while its merge owns publication.
             differential::Head head;
             head.database = h.database;
             head.database_name = h.database_name;
@@ -1126,6 +1351,67 @@ struct FunctionDoc {
 };
 const vector<FunctionDoc> &FunctionDocs() {
     static const vector<FunctionDoc> docs = {
+        {"differential_merge_ancestry",
+         "Inspects recorded local snapshot parents and best common ancestor candidates, including expired history. "
+         "Incomplete and ambiguous history is reported without guessing a base.",
+         "SELECT * FROM differential_merge_ancestry('sales', 2, 3);",
+         {"database", "ours", "theirs"}, {"differential", "introspection"}},
+        {"differential_merge_resolutions",
+         "Reads the frozen typed resolution choices of a merge request. Does not read mutable resolution source tables.",
+         "SELECT * FROM differential_merge_resolutions('sales', 'merge-1');",
+         {"database", "request"}, {"differential", "introspection"}},
+        {"differential_merge_branch_preflight",
+         "Checks local or single-writer S3 branch merge readiness without publishing or recording a request. Returns selected input IDs, "
+         "expected action, destination/target state, conflict counts and bounded diagnostics including pending recovery operations. "
+         "Native final-state validation defaults to true. Checks are advisory; use expected snapshot IDs when executing.",
+         "SELECT * FROM differential_merge_branch_preflight('sales', 'ours', 'theirs', 'ours');",
+         {"database", "ours", "theirs", "destination"}, {"differential", "introspection"}},
+        {"differential_merge_branch_preview",
+         "Previews published branch heads using a unique proven best common ancestor. "
+         "Returns resolved input IDs, counts and bounded typed conflicts; validate => true checks final constraints. "
+         "schema_mode => 'additive' allows supported new tables and nullable column additions; 'catalog' also merges table/nullable-column removals and view definitions. Catalog conflicts are reported separately.",
+         "SELECT * FROM differential_merge_branch_preview('sales', 'ours', 'theirs', validate => true);",
+         {"database", "ours", "theirs"}, {"differential", "introspection"}},
+        {"differential_merge_branch",
+         "Merges published local or single-writer S3 branch heads using a unique proven best common ancestor. "
+         "Destination equal to ours updates that detached, clean target; otherwise creates a new branch. "
+         "Returns merge_action (created_branch, merged, fast_forward, already_up_to_date). "
+         "Optional expected_base_snapshot_id/expected_ours_snapshot_id/expected_theirs_snapshot_id must be supplied together and guard the reviewed selection. "
+         "The request records its input snapshot selection and schema_mode once; source live changes are excluded. "
+         "schema_mode => 'additive' allows supported new tables and nullable column additions; 'catalog' also merges table/nullable-column removals and view definitions.",
+         "SELECT * FROM differential_merge_branch('sales', 'ours', 'theirs', 'merged', request_id => 'merge-1');",
+         {"database", "ours", "theirs", "destination"}, {"differential", "lifecycle"}},
+        {"differential_merge_snapshots_preview",
+         "Compares three explicit snapshots of a local or single-writer S3 database using typed, cell-level merge rules. Returns "
+         "per-table counts and byte-bounded typed conflict details; validate => true checks final constraints in disposable staging. "
+         "schema_mode => 'additive' allows supported new tables and nullable column additions; 'catalog' also merges table/nullable-column removals and view definitions. Catalog conflicts are reported separately.",
+         "SELECT * FROM differential_merge_snapshots_preview('sales', 1, 2, 3);",
+         {"database", "base", "ours", "theirs"},
+         {"differential", "introspection"}},
+        {"differential_merge_status",
+         "Lists active merges and previews in this process and repository, with phase, progress and resource counters. "
+         "Durable request outcomes are in differential_merge_requests().",
+         "SELECT phase, tables_completed, tables_total FROM differential_merge_status();",
+         {}, {"differential", "introspection"}},
+        {"differential_merge_requests",
+         "Inspects a bounded page of durable merge requests without S3 access. Includes inputs, destination, retained "
+         "result, frozen schema policy, original branch identities, input guards, target fences and recovery guidance. "
+         "Latest-attempt diagnostics include a count, phase, safe error code and timestamps; incomplete does not imply liveness. "
+         "Ordered by operation_id; after_operation_id is an exclusive pagination cursor.",
+         "SELECT * FROM differential_merge_requests('sales', request_id => 'merge-1');",
+         {"database"}, {"differential", "introspection"}},
+        {"differential_abort_merge",
+         "Aborts an unpublished merge by operation_id, releasing its target fence, reservation and retained result. Recovers a "
+         "published S3 result instead; uncertain remote outcomes retain state. Serialized with merge attempts.",
+         "SELECT * FROM differential_abort_merge('sales', 'merge-operation-uuid', request_id => 'abort-1');",
+         {"database", "operation_id"}, {"differential", "lifecycle"}},
+        {"differential_merge_snapshots",
+         "Merges three explicit snapshots into a new branch after native constraint validation and checkpointing. "
+         "Supports local and single-writer S3 storage; S3 publication is synchronous and recoverable. Conflicts prevent publication. "
+         "schema_mode => 'catalog' also merges table/nullable-column removals and view definitions; 'additive' only allows supported table/column additions. The default is strict.",
+         "SELECT * FROM differential_merge_snapshots('sales', 1, 2, 3, 'merged', request_id => 'merge-1');",
+         {"database", "base", "ours", "theirs", "destination"},
+         {"differential", "lifecycle"}},
         {"differential_snapshots",
          "Lists every snapshot of a differential database (for a shared database also other writers' snapshots, "
          "read from S3) with commit metadata, publication and S3 export state.",
@@ -1375,6 +1661,30 @@ void RegisterControlFunctions(ExtensionLoader &loader, std::shared_ptr<different
         add("differential_remote_heads", Command::REMOTE_HEADS, {V}, s3);
     }
     // Lifecycle
+    vector<std::pair<const char *, LogicalType>> merge_limits = {
+        {"max_input_rows", I}, {"max_input_bytes", I}, {"max_stage_write_bytes", I}, {"timeout_ms", I},
+        {"resolution_tables", LogicalType::MAP(V, V)}, {"schema_mode", V}};
+    add("differential_merge_snapshots", Command::MERGE, {V, I, I, I, V}, merge_limits);
+    auto branch_limits = merge_limits;
+    branch_limits.emplace_back("max_ancestry_nodes", I);
+    auto guarded_branch = branch_limits;
+    guarded_branch.insert(guarded_branch.end(), {{"expected_base_snapshot_id", I}, {"expected_ours_snapshot_id", I},
+                                                {"expected_theirs_snapshot_id", I}});
+    add("differential_merge_branch", Command::MERGE_BRANCH, {V, V, V, V}, guarded_branch);
+    auto preflight_options = branch_limits;
+    preflight_options.emplace_back("validate", B);
+    add("differential_merge_branch_preflight", Command::MERGE_BRANCH_PREFLIGHT, {V, V, V, V}, preflight_options);
+    merge_limits.insert(merge_limits.end(), {{"conflict_limit", I}, {"conflict_offset", I},
+                                            {"conflict_bytes", I}, {"validate", B}});
+    add("differential_merge_snapshots_preview", Command::MERGE_PREVIEW, {V, I, I, I}, merge_limits);
+    branch_limits.insert(branch_limits.end(), {{"conflict_limit", I}, {"conflict_offset", I},
+                                              {"conflict_bytes", I}, {"validate", B}});
+    add("differential_merge_branch_preview", Command::MERGE_BRANCH_PREVIEW, {V, V, V}, branch_limits);
+    add("differential_merge_status", Command::MERGE_STATUS, {}, {});
+    add("differential_merge_requests", Command::MERGE_REQUESTS, {V}, {{"request_id", V}, {"max_results", I}, {"after_operation_id", V}});
+    add("differential_abort_merge", Command::ABORT_MERGE, {V, V}, {{"timeout_ms", I}});
+    add("differential_merge_ancestry", Command::MERGE_ANCESTRY, {V, I, I}, {{"max_ancestry_nodes", I}, {"timeout_ms", I}});
+    add("differential_merge_resolutions", Command::MERGE_RESOLUTIONS, {V, V}, {});
     add("differential_create_snapshot", Command::CREATE_SNAPSHOT, {V},
         {{"name", V}, {"author", V}, {"message", V}, {"extra_info", V}, {"export_mode", V}});
     add("differential_create_branch", Command::CREATE_BRANCH, {V, V}, {{"snapshot", I}, {"branch", V}});

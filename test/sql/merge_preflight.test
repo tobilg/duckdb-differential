@@ -1,0 +1,191 @@
+# name: test/sql/merge_preflight.test
+# description: destination-aware preflight and guarded branch merge selection
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_preflight'
+
+# Binding and planning neither open the repository nor freeze input selection.
+statement ok
+PREPARE review AS SELECT ready FROM differential_merge_branch_preflight('review','o','t','o')
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_branch_preflight('review','o','t','o')
+
+statement ok
+PREPARE guarded AS SELECT snapshot_id,merge_action FROM differential_merge_branch('review','o','t','o',request_id=>'reviewed',expected_base_snapshot_id=>1,expected_ours_snapshot_id=>2,expected_theirs_snapshot_id=>3)
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_branch('review','o','t','o',expected_base_snapshot_id=>1,expected_ours_snapshot_id=>2,expected_theirs_snapshot_id=>3)
+
+query T
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:review' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,0,'base')
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','o',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','t',snapshot=>1)
+
+statement ok
+ATTACH 'differential:review' AS o (BRANCH 'o')
+
+statement ok
+UPDATE o.x SET a=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:review' AS t (BRANCH 't')
+
+statement ok
+UPDATE t.x SET b='theirs'
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query ITT
+SELECT ready,target_state,issues[1].code FROM differential_merge_branch_preflight('d','o','t','o')
+----
+0	busy	active_attachment_or_transaction
+
+statement ok
+DETACH o
+
+query I
+EXECUTE review
+----
+1
+
+query IIIITTTI
+SELECT base_snapshot_id,ours_snapshot_id,theirs_snapshot_id,ready,merge_action,target_state,validation_state,len(issues) FROM differential_merge_branch_preflight('d','o','t','o')
+----
+1	2	3	1	merged	clean	valid	0
+
+query ITT
+SELECT ready,merge_action,target_state FROM differential_merge_branch_preflight('d','o','t','new')
+----
+1	created_branch	not_applicable
+
+query ITT
+SELECT ready,target_state,issues[1].code FROM differential_merge_branch_preflight('d','o','t','t')
+----
+0	exists	name_conflict
+
+query IT
+SELECT ready,validation_state FROM differential_merge_branch_preflight('d','o','t','o',validate=>false)
+----
+1	not_checked
+
+query II
+SELECT (SELECT count(*) FROM differential_snapshots('d')),(SELECT count(*) FROM differential_merge_requests('d'))
+----
+3	0
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','o',expected_ours_snapshot_id=>2)
+----
+all three
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','o',expected_base_snapshot_id=>NULL)
+----
+positive
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','o',expected_base_snapshot_id=>0,expected_ours_snapshot_id=>2,expected_theirs_snapshot_id=>3)
+----
+positive
+
+# The review and PREPARE saw source=3; new committed source=4 must be rejected.
+statement ok
+UPDATE t.x SET b='newer'
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement error
+EXECUTE guarded
+----
+merge_inputs_changed
+
+query I
+SELECT count(*) FROM differential_merge_requests('d')
+----
+0
+
+query I
+SELECT head_snapshot_id FROM differential_branches('d') WHERE branch_name='o'
+----
+2
+
+statement ok
+CREATE TEMP TABLE reviewed AS SELECT * FROM differential_merge_branch_preflight('d','o','t','o')
+
+statement ok
+SET VARIABLE reviewed_base=(SELECT base_snapshot_id FROM reviewed)
+
+statement ok
+SET VARIABLE reviewed_ours=(SELECT ours_snapshot_id FROM reviewed)
+
+statement ok
+SET VARIABLE reviewed_theirs=(SELECT theirs_snapshot_id FROM reviewed)
+
+query IT
+SELECT snapshot_id,merge_action FROM differential_merge_branch('d','o','t','o',request_id=>'reviewed',expected_base_snapshot_id=>getvariable('reviewed_base'),expected_ours_snapshot_id=>getvariable('reviewed_ours'),expected_theirs_snapshot_id=>getvariable('reviewed_theirs'))
+----
+5	merged
+
+statement ok
+ATTACH 'differential:review' AS o (BRANCH 'o')
+
+query IIT
+SELECT * FROM o.x
+----
+1	1	newer
+
+# Completed replay returns the old result even with the target attached.
+query IT
+SELECT snapshot_id,merge_action FROM differential_merge_branch('d','o','t','o',request_id=>'reviewed',expected_base_snapshot_id=>1,expected_ours_snapshot_id=>2,expected_theirs_snapshot_id=>4)
+----
+5	merged
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','o',request_id=>'reviewed')
+----
+different expected snapshot IDs
+
+statement error
+SELECT * FROM differential_merge_branch('d','o','t','o',request_id=>'reviewed',expected_base_snapshot_id=>1,expected_ours_snapshot_id=>2,expected_theirs_snapshot_id=>3)
+----
+different expected snapshot IDs
+
+statement ok
+DETACH o
+
+query IT
+SELECT ready,merge_action FROM differential_merge_branch_preflight('d','o','t','o')
+----
+1	already_up_to_date
+
+statement ok
+DETACH t
+
+statement ok
+DETACH d

@@ -41,6 +41,7 @@ struct DurableHandle : FileHandle {
     string follow_suffix;
     uint64_t root_size = 0;
     std::shared_ptr<differential::Pin> pin;
+    std::shared_ptr<differential::MergeWriteBudget> merge_budget;
     uint64_t position = 0;
     int lock_fd = -1;
     bool closed = false;
@@ -155,14 +156,15 @@ class DurableFileSystem : public FileSystem {
     }
     differential::ResolvedPath Resolve(const string &uri) {
         if (!Probes() && uri.find("/branches/") == string::npos && uri.find("/snapshots/") == string::npos &&
-            uri.find("/snapshot-names/") == string::npos && uri.rfind("diff://export/", 0) != 0)
+            uri.find("/snapshot-names/") == string::npos && uri.rfind("diff://export/", 0) != 0 &&
+            uri.rfind("diff://merge_stage/", 0) != 0 && uri.rfind("diff://merge_input/", 0) != 0)
             throw IOException("Expected a managed database branch or public snapshot URI");
         std::call_once(initialized, [&] {
             control = repository->Get();
             store = control->store;
         });
         auto path = control->Resolve(uri);
-        if (!path.managed && !Probes())
+        if (!path.managed && !path.merge_stage && !Probes())
             throw IOException("Expected a managed database branch or public snapshot URI");
         return path;
     }
@@ -209,6 +211,7 @@ class DurableFileSystem : public FileSystem {
             name = resolved.file;
         ProbeEvent("open", uri, flags.GetFlagsInternal(), static_cast<idx_t>(flags.Lock()));
         auto h = make_uniq<DurableHandle>(*this, uri, flags, store, control);
+        h->merge_budget = resolved.merge_budget;
         Value setting;
         if (FileOpener::TryGetCurrentSetting(opener, "differential_auto_gc", setting) && !setting.IsNull())
             h->maintain = setting.GetValue<bool>();
@@ -242,10 +245,11 @@ class DurableFileSystem : public FileSystem {
             }
             if (flags.OpenForWriting())
                 throw IOException("[differential:read_only_attachment] Immutable root is read-only");
-            h->pin = resolved.historical ? control->NewPin("", resolved.snapshot.database, resolved.snapshot.id)
+            h->pin = resolved.merge_input ? control->NewPin(resolved.root)
+                     : resolved.historical ? control->NewPin("", resolved.snapshot.database, resolved.snapshot.id)
                                          : control->NewPin(name.substr(6));
             h->root = h->pin->root;
-            if (resolved.historical)
+            if (resolved.historical && !resolved.merge_input)
                 h->pool = control->LocalDatabasePool(resolved.snapshot.database);
             h->root_size = store->RootSize(h->root);
             return std::move(h);
@@ -328,7 +332,8 @@ class DurableFileSystem : public FileSystem {
         h->inode = store
                        ->Open(name, flags.CreateFileIfNotExists() || flags.OverwriteExistingFile(),
                               flags.ExclusiveCreate(), flags.OverwriteExistingFile(), h->pin->id,
-                              resolved.managed ? control->LocalDatabasePool(resolved.branch.database) : "")
+                              resolved.managed ? control->LocalDatabasePool(resolved.branch.database)
+                                               : resolved.merge_pool)
                        .id;
         h->main = resolved.managed ? resolved.suffix.empty() : name.find('.') == string::npos;
         if (flags.OpenForAppending())
@@ -370,6 +375,12 @@ class DurableFileSystem : public FileSystem {
         if (n < 0 || !h.flags.OpenForWriting() || !H(h).root.empty() || H(h).remote || H(h).follow)
             throw IOException("[differential:read_only_attachment] Invalid write or read-only root");
         ProbeEvent("pwrite", h.path, n, p);
+        if (H(h).merge_budget) {
+            H(h).merge_budget->Reserve(uint64_t(n));
+            if (auto fault = differential::Hook("DIFFERENTIAL_MERGE_IO_FAULT"))
+                if (string(fault) == "write")
+                    throw IOException("[differential:merge_io] Injected staging write failure");
+        }
         store->Write(H(h).inode, b, uint64_t(n), p);
         // DuckDB writes its alternating database headers after syncing all checkpoint blocks;
         // the sync that follows a header write completes a checkpoint (internal generation).
@@ -386,6 +397,10 @@ class DurableFileSystem : public FileSystem {
     void FileSync(FileHandle &h) override {
         auto &handle = H(h);
         ProbeEvent("sync.begin", h.path);
+        if (handle.merge_budget)
+            if (auto fault = differential::Hook("DIFFERENTIAL_MERGE_IO_FAULT"))
+                if (string(fault) == "sync")
+                    throw IOException("[differential:merge_io] Injected staging sync failure");
         if (handle.inode >= 0 && h.flags.OpenForWriting()) {
             bool checkpoint = handle.header_written;
             if (handle.header_written) {
@@ -424,6 +439,11 @@ class DurableFileSystem : public FileSystem {
         if (n < 0 || !h.flags.OpenForWriting() || !H(h).root.empty() || H(h).remote || H(h).follow)
             throw IOException("[differential:read_only_attachment] Invalid truncate or read-only root");
         ProbeEvent("truncate", h.path, n);
+        if (H(h).merge_budget) {
+            auto old_size = GetFileSize(h);
+            if (n > old_size)
+                H(h).merge_budget->Reserve(uint64_t(n - old_size));
+        }
         store->Truncate(H(h).inode, uint64_t(n));
     }
     bool Trim(FileHandle &, idx_t, idx_t) override { return false; } // Native hint; preserve all stored bytes.

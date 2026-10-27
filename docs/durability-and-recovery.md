@@ -1,4 +1,4 @@
-# Durability and recovery evidence
+# Durability and recovery
 
 ## Durable local byte store
 
@@ -73,9 +73,9 @@ Public snapshot publication, request IDs, UUID-based ownership/epochs and compou
 restore/delete now live in transactional control metadata. A completed checkpoint capture
 is pinned until publication. Restore/delete persist an intent under exclusive ownership,
 recover native WAL on a separate connection, and atomically preserve/replace or tombstone.
-Four compound process-death points passed, including native acknowledged WAL preservation.
-The same points pass with an additional payload pool and when a pending restore's
-target is retired before retry. Its durable intent retains the target independently.
+Tests kill the process at four compound points, including native acknowledged WAL
+preservation, also with an additional payload pool and when a pending restore's target
+is retired before retry. Its durable intent retains the target independently.
 Pending branch deletions reserve a surviving unfenced branch; another deletion cannot
 remove that survivor while the first is awaiting recovery.
 
@@ -89,8 +89,8 @@ automatically after checkpoints on a background worker. Retired segments are del
 references them (file before row), and sparse ones are compacted first: live payload is copied,
 verified and synced into a new segment that takes over the references in one transaction; reads
 that race with it retry on fresh metadata. SQLite pages remain reusable. Incremental
-compaction uses the repository's SQLite incremental auto-vacuum mode, set at creation. Two
-compaction crash/retry points passed while a historical reader remained live.
+compaction uses the repository's SQLite incremental auto-vacuum mode, set at creation. Tests
+crash and retry compaction at two points while a historical reader remains live.
 
 ## S3 boundary
 
@@ -148,6 +148,119 @@ only by an explicit `differential_cleanup_remote_files`, one grace period after 
 unreachable. A reader that attached an export descriptor directly loses it once its snapshot
 expired and was collected.
 
+## Local existing-target merge recovery
+
+Twenty-three byte-store crash cases include rename replacement, unlink, truncate,
+manifest/generation installation before and after commit, completed-unsynced writes, a
+torn segment and lost-unsynced-segment emulation. SQLite VFS FULL injection at the sync boundary
+leaves the durable state unchanged, keeps the accepted overlay, and the retry publishes
+it. Corrupt payloads, missing references
+and damaged manifests fail verification. GC and compaction each pass pre/post-commit
+process death and idempotent replay. Pin/retirement/GC/compaction races exercise both legal
+attachment outcomes without a read-after-reclaim gap in the tested schedules.
+`differential_merge_branch` with `destination = ours` takes the target's exclusive branch lease,
+replays abandoned segments and records a `compound_intents` fence before comparing the durable
+live image with its selected snapshot. Nonempty native sidecars or different bytes fail explicitly;
+merging never recovers and then discards unsnapshotted target changes. Other branches and immutable
+snapshot readers can stay open, but transactions retaining the target attachment block ownership.
+
+A diverged result is rebuilt, constrained and checkpointed in private staging. One FULL metadata
+transaction installs its native mapping and updates the target head, ancestry, outcome/provenance
+companion and completed request, then removes the intent. Fast-forward installs the source image
+and reuses its snapshot; no-op only completes the audit/request and releases ownership. No export
+or background publication occurs. Ancestry is not borrowed from restore.
+
+Failure/cancellation before publication clears the intent while still owning the lease.
+The final metadata transaction is not interrupted mid-commit; cancellation can race successful
+completion, so inspect/replay the request to determine its durable outcome. If cleanup cannot
+commit, or the process dies before publication, target writes remain fenced until the original
+request retries or `differential_abort_merge` clears it. Retry requires retained original inputs,
+a supported planner, and the unchanged target UUID/head. It recomputes disposable staging; expired
+inputs never select another base. Abort can release the intent without those inputs. A publication
+transaction either commits all mappings/history/ancestry/completion or none. Completed retries
+return their original result without touching a target that may since have advanced or been replaced.
+See [target scope](branch-merge.md#merge-into-an-existing-target).
+
+Destination-aware branch preflight does not acquire a lasting reservation. Its temporary
+target lease checks the same durable bytes/WAL rule without advancing epochs or writing an
+intent; comparison/validation uses ordinary temporary reader pins and disposable staging.
+It reports existing pending lifecycle operations and recovery actions without performing them.
+The optional expected base/ours/theirs snapshot IDs are checked atomically with initial branch
+request reservation; a mismatch leaves no request/output. A small `merge_expected_inputs`
+companion records guard identity in that transaction. Retry requires the identical guard and
+uses frozen inputs; a completed replay still needs no retained inputs. No input retention is
+extended between preflight and execution. See [guarded execution](branch-merge.md#preflight-and-guarded-execution).
+
+Each admitted merge execution has bounded durable latest-attempt diagnostics, exposed through
+`differential_merge_requests`. Start and coarse milestones use short FULL transactions under
+the existing request lock. Success is part of the result-publication transaction, including
+S3 recovery; caught failures record an allowlisted error code without exception text. Failed
+diagnostic writes never hide the original execution error. A crash or unwritable failure log
+can leave `last_attempt_state='incomplete'`; this does not indicate process liveness, and
+request `state`/`recovery_action` remain authoritative. Abort preserves diagnostics unless it
+recovers completed S3 publication. Completed replay and preflight add no attempts or retention.
+[Immutable compatibility fixtures](../test/fixtures/merge/README.md) cover merging data written
+by the published v1.0.0 release, from copied repository bytes.
+
+## S3 merge recovery
+
+Merge requests freeze their schema mode/planner in a versioned companion operation in the
+same FULL transaction as their input selection. Additive schema planning writes no user data;
+supported new tables and column additions are rebuilt and validated in private native staging. Local
+publication commits the new branch/snapshot atomically. Before durable S3 preparation, retry
+requires retained inputs and the same planner; afterward it resumes the frozen validated
+result without replanning. Policy records retain no input payload. Changing mode with the
+same request fails, including after failure. Preview creates no policy operation.
+
+Additive requests record `additive-tables-v2`; a retry never changes a request's recorded
+planner. Prepared S3 output and completed results remain replayable without recomputation.
+These planner records add no ancestry or indefinite input-retention root.
+
+Opt-in `catalog` requests freeze `catalog-v1`. They also reconcile table/plain nullable column removals and whole
+view definitions. A typed comparison proves that a table removed by one side is unchanged
+on the other; conflicting edits prevent publication. Planned views bind against empty native
+table definitions in an isolated temporary catalog. Column removal additionally proves that
+the retaining side has unchanged existing-key values and no inserted keys (including NULL-valued
+inserts); retaining-side deletes use ordinary remaining-column row rules. Private result staging drops the original
+views in reverse dependency order, removes planned tables, rebuilds retained/added tables,
+then recreates views in dependency order. It preserves selected native dependency registrations
+and checks bound output names/types before checkpointing. No CASCADE or constraint disabling
+is used. Failures before publication leave input branches intact; retries recompute from
+retained inputs until the existing durable S3 preparation boundary. Catalog policy records
+do not retain input payloads.
+Column projection preserves native constraints/indexes and remaps positional constraints;
+`column_drop_check`/`column_drops_checked` expose the bounded typed proof before row reconciliation.
+Pending catalog recomputation uses its supported planner rules; frozen prepared/completed
+outputs do not change.
+
+Single-writer S3 merges have a separate publication boundary from ordinary snapshot/export
+calls. A validated, checkpointed result is FULL-committed as a private publication record
+with a retained output root and reserved destination. New output is absent from public branch
+and snapshot listings; an existing target retains its old local head under a durable target fence. Upload/verification and FULL-committed head-write intent precede a
+conditional create of a new S3 head, or an `If-Match` update of an existing target from its
+frozen, verified ETag. Fast-forward reuses an export; no-op verifies the target and writes no head.
+That head makes the remote result visible, after which one local FULL transaction exposes
+the branch/snapshot and completes the request. No transaction spans SQLite and S3.
+
+A nonempty `request_id` is required. Its durable write identity recognizes a successful
+head PUT whose reply was lost. Repeating the call resumes the same prepared result, including
+after input expiry, and completes local bookkeeping after a crash in the remote/local
+publication window. Before preparation, retry recomputes from retained inputs. Ordinary
+export retries do not publish private merge results. Background/retry-export/claim head publication
+skips merge-fenced targets, including after the remote head advanced but before local completion. Pending results/reservations remain
+retained until retry or safe abort. `differential_merge_requests` inspects durable states
+without remote reads. `differential_abort_merge` takes the same per-request lock as merge,
+then checks any prepared result's remote head: it recovers already-published output, releases
+provably unpublished output, or retains uncertain state. A head absent after write intent
+may still arrive from a killed process's in-flight PUT. An unchanged old target ETag likewise
+cannot disprove an in-flight conditional update. Neither permits abandonment; a different remote
+version fences that old condition, or observing the exact result permits local completion. Prepared
+fast-forward/no-op output snapshots cannot expire until completion/abort; ancestor inputs are not
+retained indefinitely. Before/after-commit abort crashes roll back/replay atomically; terminal markers
+prevent retries from recreating an aborted result. See the
+[merge publication contract](branch-merge.md#s3-snapshot-and-branch-merges) and
+[metadata representation](storage-format.md#private-s3-merge-publication-s3-merge-publication-v3).
+
 ## Fault and import coverage
 
 Twenty-three byte-store crash cases include rename replacement, unlink, truncate,
@@ -188,5 +301,5 @@ orphan scan also removes unpublished hashes and abandoned `write-*` files in the
 registered repository/provider namespace. Unknown names and other namespaces remain
 untouched. Identical hashes conservatively retain every registered local replica while
 any map still references the hash. Keep both the metadata store and provider volumes; local
-pool files alone do not replace the metadata store. Native compound-recovery tests passed
-four process-death points with the database and WAL payloads in an additional pool.
+pool files alone do not replace the metadata store. Native compound-recovery tests cover
+the four process-death points with the database and WAL payloads in an additional pool.

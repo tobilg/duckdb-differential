@@ -33,12 +33,15 @@ other platforms are untested.
 | [Shared databases](docs/shared-databases.md) | Several hosts writing one database through S3: joining, publishing, conflicts and recovery strategies, failure playbook |
 | [SQL reference](docs/sql-reference.md) | Every statement, ATTACH option, setting and function: parameters, defaults, result columns and an example each |
 | [SQL API](docs/api.md) | Semantics and rules: ATTACH, time travel, S3 profile, caching, secrets, shared databases, limits and errors |
+| [Branch merging](docs/branch-merge.md) | Local and single-writer S3 merges into new or detached existing targets: typed three-way conflicts, preflight and guards, schema and view changes, ancestry and durable recovery |
+| [Merge validation](docs/merge-qualification.md) | Deployment pilots, exact result verification and bounded resource/recovery checks |
 | [Deployment](docs/deployment.md) | Processes, users and hosts; local storage vs S3; branch heads |
 | [Concurrency and multitenancy](docs/concurrency-and-multitenancy.md) | What runs concurrently, guarded heads, shared databases, tenant isolation |
 | [Durability and recovery](docs/durability-and-recovery.md) | The durable write path and the evidence for crash recovery |
 | [Storage formats](docs/storage-format.md) | Repository layout, metadata schema, hashes, segments, S3 layout and formats |
 | [Architecture](docs/architecture.md) | How the extension sits below DuckDB's native storage |
-| [Compatibility](docs/compatibility.md) · [Benchmarks](docs/benchmarks.md) ([TPC-H](docs/benchmarks-tpch.md)) | Verified DuckDB build, dependencies and platforms; measurements |
+| [Security](docs/security.md) · [Contributing](CONTRIBUTING.md) | Credentials, data access and diagnostics; development, testing and publication boundaries |
+| [Compatibility](docs/compatibility.md) · [Performance and sizing](docs/benchmarks.md) | Supported DuckDB build, dependencies and platforms; performance and sizing |
 | [Changelog](CHANGELOG.md) · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) | |
 
 ## Contents
@@ -84,6 +87,7 @@ The full reference is [docs/api.md](docs/api.md).
 | `differential_export_verification` | `'checksum'` | `'read_back'` also downloads and hashes every uploaded object (for S3-compatible services that ignore upload checksums). |
 | `differential_export_staging` | `'disk'` | `'memory'` uploads without staging files on disk. |
 | `differential_remote_cache_size` | `0` (off) | Keep data read from S3 in a disk cache in the repository, up to this size (e.g. `'4GB'`). |
+| `differential_merge_max_concurrent` | `2` | Active merges, previews and aborts per process (1–16); excess calls fail with `merge_busy`. |
 
 ### ATTACH
 
@@ -175,6 +179,7 @@ Every mutation accepts `request_id => '…'`, making it safely retryable.
 | Import and recover | `differential_import_database(path, name, data_path =>)`, `differential_recover_export('s3://…/descriptors/<sha256>', name)`, `differential_recover_branch('s3://…/heads/<db>/<branch>', name, same_identity =>)` |
 | S3 | `differential_retry_export(db [, snapshot_id])` (also republishes branch heads), `differential_evict_snapshots(db, versions =>, older_than =>, dry_run =>)`, `differential_remote_heads('s3://bucket/prefix/')`, `differential_claim_branch_heads(db)` |
 | Shared databases | `differential_resolve_conflict(db, keep => 'branch' \| 'remote', branch =>, name =>)`, `differential_writers(db)` |
+| Merge | `differential_merge_branch_preview(db, ours, theirs)`, `differential_merge_branch_preflight(db, ours, theirs, destination)`, `differential_merge_branch(db, ours, theirs, destination)`, `differential_merge_snapshots_preview(db, base, ours, theirs)`, `differential_merge_snapshots(db, base, ours, theirs, destination)`, `differential_merge_ancestry(db, ours, theirs)`, `differential_merge_requests(db)`, `differential_merge_resolutions(db, request_id)`, `differential_merge_status()`, `differential_abort_merge(db, operation_id)` |
 | Maintenance | `differential_cleanup_old_files(dry_run =>, cleanup_all =>, max_objects =>)`, `differential_delete_orphaned_files(dry_run =>)`, `differential_compact(max_pages =>)` |
 
 Functions that take S3 options also accept `secret => 'name'` for a `TYPE differential` secret.
@@ -184,7 +189,7 @@ Rules:
 - Management functions run only in autocommit mode, and only when executed. Binding,
   `PREPARE` and `EXPLAIN` change nothing.
 - Errors carry stable prefixes such as `[differential:not_found]`.
-- Merging branches and deleting a whole database are not supported.
+- Branch merging follows the [supported merge scope](docs/branch-merge.md). Deleting a whole database is not supported.
 
 ## Usage lifecycle
 
@@ -267,7 +272,7 @@ failover, shared writers and common pitfalls. All installations use
 [`plugins/duckdb-differential/skills/duckdb-differential`](plugins/duckdb-differential/skills/duckdb-differential),
 including its bundled `references/` directory.
 
-Installation guidance follows the linked official harness documentation, reviewed on 2026-10-21.
+Installation guidance follows the linked official harness documentation.
 Compatibility is documented on that basis. Local and CI validation checks our skill files and
 manifests; it does not install or execute coding-agent harnesses, their loaders or model workflows.
 
@@ -362,7 +367,7 @@ DuckDB (`duckdb/`, v2.0.0) and `extension-ci-tools/` are submodules, and CI uses
 vcpkg at a pinned commit (`VCPKG_COMMIT` in the `Makefile`): AWS SDK for C++ 1.11.820 (S3
 only), SQLite 3.53.2 and OpenSSL 3.6.3, statically linked into the extension; their licenses
 and notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-Linux (amd64, arm64) and macOS (amd64, arm64) are supported; Windows and wasm are not.
+Linux (amd64, arm64) and macOS (arm64, Apple silicon) are supported; Intel Macs, Windows and wasm are not.
 
 ### Build
 

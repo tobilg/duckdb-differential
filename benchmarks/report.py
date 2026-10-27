@@ -13,7 +13,7 @@ local, lifecycle, operations, s3 = [load(name) for name in ('local', 'lifecycle'
 lines = [
     '# Benchmark observations', '',
     'Gigabyte-scale runs (concurrent commits, bulk load, cold scans, S3 export settings, remote',
-    'garbage collection, shared history) are in [benchmarks-scale.md](benchmarks-scale.md).', '',
+    'garbage collection, shared history) are rendered by benchmarks/scale_report.py.', '',
     'Measured on macOS 26.7 arm64 with stock DuckDB 1.5.6 and a release build without',
     'test hooks. These are development measurements, not release performance promises.',
     'Native sync points remain durability boundaries: every native FileSync commits the',
@@ -121,5 +121,7 @@ lines += ['', 'Request counts are SDK API calls and bytes are successfully verif
           'created. Deep-history/large-metadata-store scale, WAN latency, physical-disk-cold',
           'performance and full wire-I/O attribution remain unmeasured. There is no',
           'claimed optimum for chunk/cache/request sizes and no asserted throughput SLO.', '']
-(ROOT / 'docs/benchmarks.md').write_text('\n'.join(lines))
-print('Wrote docs/benchmarks.md from measured JSON results')
+output = ROOT / 'build/evidence/benchmark-report.md'
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text('\n'.join(lines))
+print(f'Wrote {output} from measured JSON results')

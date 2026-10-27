@@ -51,7 +51,7 @@ class ScopedFunctionGenerator : public DefaultGenerator {
 class SnapshotSchemaEntry : public SchemaCatalogEntry {
   public:
     SnapshotSchemaEntry(Catalog &snapshot, SchemaCatalogEntry &inner, CreateSchemaInfo &info)
-        : SchemaCatalogEntry(snapshot, info), snapshot(snapshot), inner(inner) {}
+        : SchemaCatalogEntry(snapshot, info, inner.GetParentSchema()), snapshot(snapshot), inner(inner) {}
 
     optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup) override {
         return inner.LookupEntry(Own(transaction), Plain(lookup));
@@ -135,7 +135,7 @@ optional_ptr<SchemaCatalogEntry> DifferentialCatalog::LookupSchema(CatalogTransa
             throw BinderException("AT (...) is not available on a follower (FOLLOW true): it reads the newest state");
         auto &context = transaction.GetContext();
         if (auto state = follower->Choose(context))
-            return state->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup.GetEntryIdentifier(),
+            return state->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup,
                                                                                   if_not_found);
         return DuckCatalog::LookupSchema(transaction, schema_lookup, if_not_found);
     }
@@ -230,22 +230,23 @@ optional_ptr<SchemaCatalogEntry> DifferentialCatalog::LookupSchema(CatalogTransa
         std::lock_guard<std::mutex> guard(mutex);
         hidden.insert(name);
     }
-    return attached->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup.GetEntryIdentifier(),
+    return attached->GetCatalog().Cast<DifferentialCatalog>().SnapshotSchema(context, schema_lookup,
                                                                              if_not_found);
 }
 
-optional_ptr<SchemaCatalogEntry> DifferentialCatalog::SnapshotSchema(ClientContext &context, const Identifier &schema,
+optional_ptr<SchemaCatalogEntry> DifferentialCatalog::SnapshotSchema(ClientContext &context, const EntryLookupInfo &schema_lookup,
                                                                      OnEntryNotFound if_not_found) {
     // Starting this catalog's transaction also keeps the attachment alive for the query.
     auto own = GetCatalogTransaction(context);
-    auto inner = DuckCatalog::LookupSchema(own, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(schema)), if_not_found);
+    // The full schema path (nested schemas included), without the AT clause this catalog resolved.
+    auto inner = DuckCatalog::LookupSchema(own, EntryLookupInfo(schema_lookup, nullptr), if_not_found);
     if (!inner)
         return nullptr;
     std::lock_guard<std::mutex> guard(mutex);
-    auto &facade = facades[inner->name.GetIdentifierName()];
+    auto &facade = facades[inner->GetSchemaName()];
     if (!facade) {
         CreateSchemaInfo info;
-        info.SetQualifiedName(QualifiedName({inner->name}, Identifier()));
+        info.SetQualifiedName(QualifiedName::FromCatalogSchema(GetName(), inner->GetSchemaPath(), Identifier()));
         facade = make_uniq<SnapshotSchemaEntry>(*this, *inner, info);
     }
     return facade.get();

@@ -158,7 +158,7 @@ Lifecycle results contain `operation_id`, `database_id`, `branch_id`, `snapshot_
 per selected snapshot (`snapshot_id`, `snapshot_time`, `snapshot_name`, `dry_run`,
 `operation_id`, `export_locator`). Restore and drop require DETACH and exclusive branch
 ownership. A crash leaves a resumable intent that fences new writers; retry the original
-request. Neither whole-database deletion nor branch merge is provided.
+request. Whole-database deletion is not provided. Merges publish a new branch or update a detached local target; see [branch merge](#branch-merge).
 
 Collection limits are 1–10000 work units: each examined queued candidate or deleted
 mapping row costs one unit. A step returns `candidate_objects` (deleted plus still queued),
@@ -713,3 +713,136 @@ creates neither the directory nor the repository. An empty string disables spill
 ```sql
 SET temp_directory = '/tmp/duckdb-spill';
 ```
+
+## Branch merge
+
+`differential_merge_branch(database, ours VARCHAR, theirs VARCHAR, destination, request_id => '...')`
+supports one local or single-writer S3 database registered in this repository. It selects published
+heads and their unique best common ancestor from recorded snapshot parents.
+Parent/child, nested branches and repeated merges are supported. Imports/clones start local roots;
+restores follow the previous head, not the copied target's history. Live state is never captured.
+`differential_merge_branch_preview(database, ours, theirs, validate => true)` uses the same selection
+without adding a branch, snapshot or operation. Both expose resolved input IDs, `selection_ms`
+and `ancestry_nodes`; `max_ancestry_nodes` bounds graph traversal (default 100,000, maximum 1,000,000).
+Ambiguous bases or insufficient ancestry require explicit snapshots. Expired best bases fail without
+substitution. Small parent records survive expiry without retaining payload. Existing proven sibling
+forks remain supported when older ancestry is absent. A request freezes its selection across retries.
+
+When `destination = ours`, this function merges into that existing branch. It preserves
+the target UUID, rejects active attachments/transactions and unsnapshotted native bytes/WAL,
+and atomically replaces the file mapping/head only after successful validation. Other existing
+destinations are rejected. `merge_action` is `merged`, `fast_forward`, `already_up_to_date`, or
+`created_branch`. Fast-forward reuses the source snapshot; no-op leaves the head unchanged.
+A changed target UUID/head invalidates a pending request. Interrupted target requests remain
+fenced for retry/abort; completed retries never reinstall old output. See
+[existing targets](branch-merge.md#merge-into-an-existing-target) for exact rules.
+
+For S3, `request_id` is required. Preflight also reads destination state/target ownership in S3.
+The detached target must be fully exported and match the selected head. Publication freezes that
+ETag and uses `If-Match`; a new destination uses `If-None-Match: *`. Prepared target failures retain
+the result and target fence for retry/safe abort; ordinary export/claim skips that fence. No-op
+writes no remote head and fast-forward reuses the source export. Unknown older S3 ancestry requires
+explicit snapshots; shared writers and cross-repository ancestry remain unsupported. See
+[S3 publication and recovery](branch-merge.md#s3-snapshot-and-branch-merges).
+
+`differential_merge_branch_preflight(database, ours, theirs, destination, validate => true)`
+adds destination-aware readiness checks: selected IDs, expected action, catalog/data/constraint
+diagnostics, target attachment/dirty state, and pending operations with recovery guidance.
+It returns one bounded report without publishing, reserving a request or advancing writer epochs.
+Its `ready` result is advisory; `validate => false` explicitly leaves constraints unchecked.
+Pass its three IDs (or branch preview's IDs) to `differential_merge_branch` as
+`expected_base_snapshot_id`, `expected_ours_snapshot_id`, `expected_theirs_snapshot_id` to
+reject drift before the first request is reserved. All three positive IDs are required together.
+Guard presence/values are request identity; retries check the original frozen inputs, and completed
+retries still replay after expiry/head movement. No long-lived input pins are added.
+See [preflight and guards](branch-merge.md#preflight-and-guarded-execution) for bounds and limits.
+
+`differential_merge_snapshots_preview(database, base, ours, theirs, conflict_limit => 100,
+conflict_offset => 0, conflict_bytes => 1048576, validate => false)` returns per-table
+change/conflict counts and byte-bounded typed details. `validate => true` checks final
+constraints in disposable staging without publishing; validation state and paging metadata
+are explicit output columns.
+`differential_merge_snapshots(database, base, ours, theirs, destination, request_id => '...')`
+publishes a validated new branch from three explicit retained snapshots of one local or
+single-writer S3 database. Evicted S3 inputs are downloaded into bounded local staging.
+S3 requires a nonempty `request_id`. Results are uploaded and conditionally published to a new head before local completion;
+retry the same request to recover an interrupted publication. Automatic branch merging and
+base selection use the repository's local ancestry records; shared-writer S3 merging is unsupported. Declared primary keys
+are required. All merge/preview/preflight APIs default to `schema_mode => 'strict'` (identical supported schemas).
+Opt-in `schema_mode => 'additive'` combines nullable, non-key column additions without defaults
+and new supported tables. Same-name new tables require identical canonical definitions and
+merge rows against an empty base. Opt-in `schema_mode => 'catalog'` additionally reconciles
+table/plain nullable column removal and whole local-view definitions. Removing a table conflicts with changes to
+its rows, definition or indexes on the other side. Views use three-way definition/presence
+rules; the combined dependency graph, native dependency registrations and bound output types
+are validated before row comparison. There is no implicit cascade or SQL-clause merge.
+Strict/additive modes require unchanged view definitions, outputs and native dependencies;
+all modes preserve those dependencies when rebuilding tables. Cast targets in views, defaults
+and CHECKs must recursively use supported, unqualified built-in types. Temporal expressions
+use the caller's native `TimeZone`/`Calendar`; mutation freezes those settings before its first
+data execution and reuses them on retry. Preview/preflight use the caller's current settings.
+Other schema changes remain unsupported. Preview separately
+returns `schema_changes`, `schema_conflicts`, `schema_conflict_details`, `table_change` and
+`schema_algorithm`, plus `object_type`, `object_name`, `table_action` and `view_change`.
+Catalog mode emits view rows with NULL `table_name` and row counts; table removals also have
+NULL row counts. Definition/name/dependency conflicts block row comparison and
+publication; data counts are NULL when comparison was skipped. Typed row choices use the
+planned combined schema. See [additive column merging](branch-merge.md#additive-column-merging)
+for name alignment, typed NULLs, views and exact conflict rules. See [branch merge](branch-merge.md)
+for the supported type/catalog scope, exact semantics, constraints and recovery behavior.
+See [table removal and view merging](branch-merge.md#catalog-merging-table-removal-and-views)
+for catalog conflicts, preview types and staging order.
+Column removal requires a nullable non-key base column without defaults or dependent
+constraints/indexes. The retaining side must preserve its definition and existing-key values;
+new retaining-side rows conflict even with NULL. Retaining-side deletes use ordinary remaining-column
+row rules. Details use `column_delete_modify`; `schema_changes` includes an `action` field
+(`add`/`drop`). See [column removal](branch-merge.md#column-removal-rules) for exact scope and views.
+All merge and preview functions accept input row/byte, staging-write and execution-time limits.
+`differential_merge_status()` reports active execution progress in the current process and
+repository; `differential_merge_max_concurrent` bounds admission across the process.
+Mutation results include `materialization_ms` for S3 input reconstruction, `publication_ms`
+for local/remote publication, `target_check_ms` for target ownership/cleanliness, and `merge_action`,
+separately from comparison and staged application. Prepared S3 results retain
+their output and destination reservation until retry completes or safe abort releases them.
+Preflight reports a reserved new S3 destination as `target_state = 'reserved'`, with
+`merge_pending_operation`, the owner's operation ID and recovery guidance.
+
+`differential_merge_requests(database, request_id => '', max_results => 1000,
+after_operation_id => '')` lists a bounded page of durable requests, including inputs,
+destination, retained result, state, frozen `schema_mode`/`schema_algorithm` and recovery guidance, without S3 access.
+Original branch names/UUIDs and `inputs_guarded` explain the frozen selection. `attempt_count`
+and the `last_attempt_*` fields expose the latest admitted execution, safe error code and
+timestamps. An `incomplete` attempt is not proof of a live or dead process; request state is
+still authoritative. Completed retries and preflight leave diagnostics unchanged. See
+[durable attempt semantics](branch-merge.md#durable-attempt-diagnostics). Use the last
+operation UUID as the exclusive next-page cursor. `differential_abort_merge(database,
+operation_id, request_id => '', timeout_ms => 600000)` serializes with merge attempts and
+aborts unpublished output. It completes recovery instead if the remote result is already
+published. Uncertain remote outcomes retain the result and reservation. Aborted merge
+requests are terminal; a new merge needs a new request identity. Changing `schema_mode` with
+the same request fails; prepared/completed results replay without replanning. See
+[lifecycle and recovery](branch-merge.md#durable-requests-and-safe-abort) for exact guarantees.
+Additive requests use `additive-tables-v2`. See [new-table semantics](branch-merge.md#new-tables-in-additive-mode).
+Catalog requests use `catalog-v1`; pending strict/additive requests retain their original scope.
+Pending catalog recomputation uses the current rules, including column removal.
+Prepared/completed outputs are replayed unchanged.
+
+All four merge/preview functions accept `resolution_tables => map{'main.table':'catalog.schema.choices'}`
+for explicit typed conflict choices. Preview reports remaining `conflicts` and `resolved_conflicts`;
+mutation freezes choices with its request before reconciliation and still validates native constraints.
+`differential_merge_resolutions(database, request)` reads their durable typed audit.
+Supported values include UUID, BLOB, all integer widths, FLOAT/DOUBLE, DECIMAL, native dates,
+times/intervals, all six pinned DuckDB v2.0.0 timestamp types, and nested STRUCT/TUPLE/LIST/ARRAY/MAP/UNION
+columns containing supported types. Equality is DuckDB's native null-safe equality, including
+NaN, signed zero and container ordering; nested columns merge as whole values, with no field
+or element merging. Typed conflict/audit details preserve precision and expose nested values
+as bounded flat trees. Dynamic VARIANT, JSON, custom types, nested primary keys and non-default
+collations remain excluded. The [complete allowlist and bounds](branch-merge.md#supported-scope)
+also apply to additive/catalog modes, whose schema-evolution rules are unchanged.
+Supported CHECK/default expressions and simple ART indexes are preserved.
+Local views must remain unchanged in strict/additive mode and use whole-definition
+reconciliation in catalog mode. See [resolution and catalog scope](branch-merge.md).
+
+`differential_merge_ancestry(database, ours BIGINT, theirs BIGINT, max_ancestry_nodes => 100000,
+timeout_ms => 600000)` exposes recorded parents, candidates, selection state and availability,
+including expired history. It does not guess missing edges or retain snapshot payloads.

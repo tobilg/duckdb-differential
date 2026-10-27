@@ -1,0 +1,172 @@
+# name: test/sql/merge_catalog_safety.test
+# description: native expression context, cast closure and unchanged view dependencies
+# group: [differential]
+require differential
+
+require icu
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_catalog_safety'
+
+statement ok
+SET TimeZone='America/New_York'
+
+statement ok
+SET enable_view_dependencies=true
+
+statement ok
+ATTACH 'differential:catalog_safety' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b INT,ts TIMESTAMPTZ,day DATE,allowed BOOLEAN,CHECK(allowed OR CAST(ts AS DATE)=day))
+
+statement ok
+INSERT INTO d.x VALUES(1,0,0,TIMESTAMPTZ '2020-01-02 01:00:00+00',DATE '2020-01-01',true)
+
+statement ok
+USE d
+
+statement ok
+CREATE VIEW v AS SELECT * FROM x
+
+statement ok
+USE memory
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','o',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','t',snapshot=>1)
+
+statement ok
+ATTACH 'differential:catalog_safety' AS o (BRANCH 'o')
+
+statement ok
+ATTACH 'differential:catalog_safety' AS t (BRANCH 't')
+
+statement ok
+UPDATE o.x SET a=1
+
+statement ok
+UPDATE t.x SET b=2
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+CALL differential_create_snapshot('t')
+
+# Worker must preserve stored dependencies, independent of this caller setting.
+statement ok
+SET enable_view_dependencies=false
+
+query TI
+SELECT validation_state,conflicts FROM differential_merge_snapshots_preview('d',1,2,3,validate=>true)
+----
+valid	0
+
+query I
+SELECT snapshot_id FROM differential_merge_snapshots('d',1,2,3,'merged',request_id=>'views')
+----
+4
+
+statement ok
+ATTACH 'differential:catalog_safety' AS m (BRANCH 'merged')
+
+query III
+SELECT a,b,CAST(ts AS DATE)=day FROM m.v
+----
+1	2	true
+
+statement error
+DROP TABLE m.x
+----
+depends on table
+
+statement ok
+DETACH m
+
+# Both branches are valid in New York; their combined state violates the CHECK.
+statement ok
+UPDATE o.x SET day=DATE '2020-01-02'
+
+statement ok
+UPDATE t.x SET allowed=false
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+CALL differential_create_snapshot('t')
+
+query TI
+SELECT validation_state,conflicts FROM differential_merge_snapshots_preview('d',1,5,6,validate=>true)
+----
+constraint_violation	0
+
+query IT
+SELECT ready,validation_state FROM differential_merge_branch_preflight('d','o','t','invalid')
+----
+false	constraint_violation
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,5,6,'invalid',request_id=>'invalid')
+----
+merge_constraint
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='invalid'
+----
+0
+
+# A custom type hidden inside a nested CAST cannot introduce an external catalog dependency.
+statement ok
+CREATE TYPE memory.external_status AS ENUM('ok','bad')
+
+statement ok
+USE t
+
+statement ok
+CREATE VIEW external_cast AS SELECT id,CAST(TRY_CAST(NULL AS STRUCT(n memory.external_status)) AS VARCHAR) AS status FROM x
+
+statement ok
+USE memory
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,5,7,schema_mode=>'catalog')
+----
+cast target must use unqualified built-in types
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,5,7,'external_result',schema_mode=>'catalog')
+----
+merge_unsupported
+
+query II
+SELECT current_setting('TimeZone')='America/New_York',current_setting('enable_view_dependencies')=false
+----
+true	true
+
+statement ok
+DETACH o
+
+statement ok
+DETACH t
+
+statement ok
+DETACH d
+
+statement ok
+DROP TYPE memory.external_status
+
+statement ok
+RESET TimeZone
+
+statement ok
+RESET enable_view_dependencies

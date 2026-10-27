@@ -159,8 +159,8 @@ ATTACH 'differential:sales_copy' AS sales_copy;
 SELECT count(*) FROM sales_copy.orders;            -- 2
 ```
 
-A clone survives deletion of its source's branches and snapshots. Merging branches is not
-supported.
+A clone survives deletion of its source's branches and snapshots. Branches of one database can be
+merged with `differential_merge_branch`; see [branch merging](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md).
 
 ## 7. Detach
 

@@ -33,8 +33,8 @@ other area, regression and fuzzer files, and slow tests. Tests outside the PR pr
 included in manual full runs.
 
 The Integration workflow runs the harness checks and PR profile on Linux amd64 and macOS
-arm64 for pushes, pull requests and manual workflow dispatches. Logs and JSON results are
-uploaded even on failure. The full suite and exclusion audit are outside CI: invoke them
+arm64 for pushes, pull requests and manual workflow dispatches. Logs and JSON results stay
+on the runner; they are not uploaded. The full suite and exclusion audit are outside CI: invoke them
 explicitly with `make test_upstream` and `make test_upstream_skips`. Run the exclusion audit
 when upgrading DuckDB, changing the adapter or reviewing the exclusion list. The runner's
 default/full profile also remains available for manual full runs.
@@ -108,7 +108,7 @@ concurrent checkpoint does not vacuum. Its audit accepts a pass or only that exa
 mismatch, and records which happened. A passing intermittent audit is not reported as a
 reproduced failure.
 
-Three workloads are excluded at the owner's request for excessive disk use: the distinct
+Three workloads are excluded by maintainer decision for excessive disk use: the distinct
 TPC-H grouping test explicitly requires 40 GB free; encrypted block offloading retains two
 500-million-row tables (about 8 GB of incompressible random values, plus row IDs, overhead
 and spill); plain block offloading creates one 500-million-row table plus 1 GB of spill

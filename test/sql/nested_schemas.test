@@ -1,0 +1,86 @@
+# name: test/sql/nested_schemas.test
+# description: nested schemas and triggers in snapshots and AT time travel (DuckDB 2.0)
+# group: [differential]
+
+require differential
+
+query T
+SELECT version()
+----
+v2.0.0
+
+statement ok
+SET differential_repository = '__TEST_DIR__/differential_nested_schemas'
+
+statement ok
+ATTACH 'differential:nested_schemas' AS d
+
+statement ok
+CREATE SCHEMA d.main.nested
+
+statement ok
+CREATE TABLE d.main.nested.x(i INTEGER PRIMARY KEY, v VARCHAR)
+
+statement ok
+INSERT INTO d.main.nested.x VALUES (1, 'before')
+
+statement ok
+CREATE TABLE d.events(i INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE d.audit(i INTEGER PRIMARY KEY)
+
+statement ok
+USE d
+
+statement ok
+CREATE TRIGGER audit_insert AFTER INSERT ON events FOR EACH ROW INSERT INTO d.audit VALUES(NEW.i)
+
+statement ok
+USE memory
+
+statement ok
+INSERT INTO d.events VALUES (1)
+
+statement ok
+CALL differential_create_snapshot('d')
+
+query I
+SELECT count(*) FROM d.SNAPSHOTS()
+----
+1
+
+statement ok
+UPDATE d.main.nested.x SET v = 'after'
+
+statement ok
+INSERT INTO d.events VALUES (2)
+
+query IT
+FROM d.main.nested.x AT (VERSION => 1)
+----
+1	before
+
+query I
+FROM d.audit AT (VERSION => 1)
+----
+1
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH 'differential:nested_schemas' AS d
+
+statement ok
+INSERT INTO d.events VALUES (3)
+
+query I rowsort
+FROM d.audit
+----
+1
+2
+3
+
+statement ok
+DETACH d

@@ -1,0 +1,140 @@
+# name: test/sql/merge_columns.test
+# description: catalog nullable column removal, typed conflict proof and native schema-only rebuild
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_columns'
+
+statement ok
+ATTACH 'differential:column_merge' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,gone DECIMAL(18,3),a INT DEFAULT 0 CHECK(a>=0),b VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,1.250,0,'base'),(2,NULL,0,'base')
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','ours',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','theirs',snapshot=>1)
+
+statement ok
+ATTACH 'differential:column_merge' AS o (BRANCH 'ours')
+
+statement ok
+CALL differential_create_snapshot('o')
+
+statement ok
+ATTACH 'differential:column_merge' AS t (BRANCH 'theirs')
+
+statement ok
+ALTER TABLE t.x DROP COLUMN gone
+
+statement ok
+ALTER TABLE t.x ADD COLUMN note VARCHAR
+
+statement ok
+CALL differential_create_snapshot('t')
+
+statement ok
+PREPARE column_merge AS SELECT * FROM differential_merge_snapshots('d',1,2,3,'merged',schema_mode=>'catalog',request_id=>'columns')
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind='merge'
+----
+0
+
+query TTTTTIII
+SELECT schema_changes[1].column_name,schema_changes[1].source,schema_changes[1].action,schema_changes[2].column_name,schema_changes[2].action,ours_updates,theirs_updates,schema_conflicts FROM differential_merge_snapshots_preview('d',1,2,3,schema_mode=>'catalog',validate=>true)
+----
+gone	theirs	drop	note	add	0	0	0
+
+query I
+SELECT count(*) FROM differential_operations() WHERE kind IN ('merge','merge_schema')
+----
+0
+
+statement error
+SELECT * FROM differential_merge_snapshots_preview('d',1,2,3,schema_mode=>'additive')
+----
+merge_unsupported
+
+statement ok
+EXECUTE column_merge
+
+statement ok
+DEALLOCATE column_merge
+
+query TT
+SELECT schema_mode,schema_algorithm FROM differential_merge_requests('d',request_id=>'columns')
+----
+catalog	catalog-v1
+
+statement ok
+ATTACH 'differential:column_merge' AS m (BRANCH 'merged')
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE database_name='m' AND table_name='x' ORDER BY column_index
+----
+id
+a
+b
+note
+
+query IITT
+SELECT * FROM m.x ORDER BY id
+----
+1	0	base	NULL
+2	0	base	NULL
+
+statement ok
+INSERT INTO m.x(id,b) VALUES(3,'default')
+
+query I
+SELECT a FROM m.x WHERE id=3
+----
+0
+
+statement error
+INSERT INTO m.x VALUES(4,-1,'bad',NULL)
+----
+Constraint Error
+
+statement ok
+UPDATE o.x SET gone=9 WHERE id=1
+
+statement ok
+CALL differential_create_snapshot('o')
+
+query TTTTII
+SELECT schema_conflict_details[1].column_name,schema_conflict_details[1].kind,schema_conflict_details[1].theirs_definition,validation_state,schema_conflicts,conflicts FROM differential_merge_snapshots_preview('d',1,5,3,schema_mode=>'catalog')
+----
+gone	column_delete_modify	NULL	schema_conflicts	1	NULL
+
+statement error
+SELECT * FROM differential_merge_snapshots('d',1,5,3,'bad',schema_mode=>'catalog',request_id=>'bad')
+----
+merge_schema_conflict
+
+query I
+SELECT count(*) FROM differential_branches('d') WHERE branch_name='bad'
+----
+0
+
+statement ok
+DETACH m
+
+statement ok
+DETACH t
+
+statement ok
+DETACH o
+
+statement ok
+DETACH d

@@ -165,9 +165,13 @@ foreign keys enforced. The extension refuses unrelated SQLite files and unknown 
 
 `differential_cleanup_metadata` deletes completed `operations` (with their `collection_results`
 and `compaction_details`) created before its cutoff, and `history` entries of retired snapshots
-without a pending export.
+without a pending export. It never deletes `snapshot_ancestry` records, and deletes a merge
+companion record (kinds `merge_schema`, `merge_expression_context`, `merge_expected_inputs`,
+`merge_resolutions`, `merge_attempt`, `merge_publication`, `merge_destination`, `merge_aborted`,
+`merge_target_result`) only together with its merge request, or once that request is gone.
 
-All timestamps are integer **microseconds since the Unix epoch** (UTC).
+All metadata timestamps are integer **microseconds since the Unix epoch** (UTC).
+User column values retain their native DuckDB types and precision.
 
 ## Identities and hashes
 
@@ -196,7 +200,8 @@ recomputed by `Verify`, for exports and for every pool-file or S3 read). A whole
 verified straight into DuckDB's buffer; partial reads go through the process-wide 64 MiB
 verified-chunk cache, which also holds log records and remote chunks.
 
-Databases, branches, operations and pins are identified by random UUIDv4s. A shared database
+Databases, branches, management operations and pins are identified by random UUIDv4s. Internal
+snapshot-ancestry records use deterministic UUIDv8s as specified below. A shared database
 (`WRITERS 'shared'`) instead has a UUID derived from its name, so every repository attaching it
 agrees on it: the first 16 bytes of `sha256("differential-shared-database-v1\n" + name)` with
 version 8 and the RFC 9562 variant bits set. Snapshot IDs are positive integers allocated per
@@ -824,14 +829,310 @@ SELECT metric, value FROM differential_storage_stats();
 > store. This is SQLite's documented "multiple copies of SQLite in one application" hazard. Inspect
 > the file from a separate process, or use the SQL functions above.
 
-The formats on this page were checked against real data:
-- **Local (2026-10-10):** page, root and chunk hashes recomputed from `engine.sqlite` matched the
-  stored identities.
-- **S3 (2026-10-10):** an independent decoder rebuilt each exported snapshot's native file from
-  descriptor → index → packs, byte-identical to the local root, starting with DuckDB's `DUCK`
-  magic, on the pinned MinIO fixture.
-- **Header alignment (2026-10-13):** format 1 isolates the 12 KiB header region. The extension
-  has not been published; only this layout is implemented, with no legacy reader or migration.
-  Boundary, truncation and native allocation-size coverage is in the unit and integration suites.
-  The independent decoder in `s3_layout.py` reconstructs both MinIO snapshots byte-for-byte,
-  verifies descriptor/index/pack/chunk hashes and checks zero padding.
+The test suites check these formats against real data: local page, root and chunk hashes are
+recomputed from `engine.sqlite`, and the independent decoder in
+`test/integration/s3_layout.py` rebuilds exported snapshots from descriptors, indexes and packs,
+byte-identical to their local roots, verifying every hash and the zero padding.
+
+## Logical merge records
+
+Merge uses existing control-format-1 extensible fields, without changing table layouts or native
+DuckDB storage. `operations.kind = 'merge'` has the usual length-prefixed payload containing
+`[database UUID, base ID, ours ID, theirs ID, destination name, logical-cell-v1]`.
+The first five fields define request identity. A completed request returns its stored result
+even when the sixth field names an older algorithm. Pending requests require an available
+algorithm; a different version is never silently substituted. Resource limits are not part
+of request identity. Progress, admission and staging-write budgets are process-local and add
+no persistent fields or format version.
+The result snapshot's `commit_extra_info` is JSON with `algorithm`, `operation_id`, and
+`base`, `ours`, `theirs` objects, each containing `snapshot` and `root`. These provenance
+references do not retain the inputs. The operation UUID links to its durable request ID.
+
+Branch-name requests use `operations.kind='merge_branch'` and an eleven-field payload:
+`[database UUID, ours name, theirs name, destination, selection version, logical-cell-v1,
+ours branch UUID, theirs branch UUID, base ID, ours ID, theirs ID]`. The first four fields
+are semantic request identity. The initial FULL transaction reads both published heads,
+resolves the best common ancestor and records the immutable selection. Pending retries
+reuse these IDs rather than resolving names again. This request record is not a retention root.
+The snapshot provenance additionally contains `base_selection` (`unique-base-v1`, or the
+`sibling-fork-v1` fork proof for history without parent records, such as 1.0.0 snapshots),
+`ours_branch_id` and `theirs_branch_id`. Existing branch/source fields alone are not ancestry:
+imports and merges also use them, and restore does not rewrite them. The resolver requires a
+parent graph; only the fork proof uses completed fork records and rejects restores and prior target merges.
+Both paths reject pending compound intents.
+There are no new metadata tables or format changes; selection and merge algorithms have explicit version tags.
+
+Guarded branch requests also reserve a completed `operations.kind='merge_expected_inputs'`
+companion in that same FULL transaction. Its UUIDv8 uses the SHA-256 encoding below with
+hash input `differential-s3-merge-v1\nexpected-inputs\n<merge operation UUID>` (local and single-writer S3).
+Its five length-prefixed fields are `[merge-expected-inputs-v1, merge operation UUID,
+expected base ID, expected ours ID, expected theirs ID]`; `request` is NULL, `database_id`
+is the input database, `branch_id` is NULL, and snapshot/preservation numbers are zero. Absence denotes an unguarded
+request. Presence and all three values are semantic request identity, including on completed
+replay. A fresh mismatch rolls back before reservation. Retries compare against the frozen
+request selection, never later heads. The completed companion freezes the guard and is not a
+completed merge result. It retains no roots and does not alter control-format-1 table layouts.
+Preflight reports are transient SQL values and add no operation or durable target intent.
+
+Latest-attempt diagnostics use one mutable completed `operations.kind='merge_attempt'`
+companion per merge operation. Its UUIDv8 uses hash input
+`differential-s3-merge-v1\nattempt\n<merge operation UUID>`. `request` and `branch_id` are NULL,
+snapshot/preservation numbers are zero, and `database_id` is the input database. The ten
+length-prefixed payload fields are `[merge-attempt-v1, merge operation UUID, attempt UUID,
+attempt count, started microseconds, updated microseconds, finished microseconds,
+attempt state, phase, error code]`. Numbers are canonical nonnegative decimal BIGINTs;
+count/start are positive, finished is zero when incomplete, and payloads are at most 1 KiB.
+State is `incomplete`, `failed`, or `succeeded`; phase and error category are allowlisted
+constants. Failed records have an error code; succeeded records have phase `completed`.
+Finished records have `finished == updated >= started`; empty errors denote no recorded error.
+The companion's `created_at` remains the first attempt's start. Its operation-level `complete`
+means a valid diagnostic record, **not** that its owning merge is complete.
+
+The request lock serializes attempts. Start increments the counter and replaces the payload
+in a FULL transaction; phase/failure updates check its attempt UUID before replacing it.
+Publication marks it successful in the same FULL transaction as the merge result, including
+S3 completion recovery. A completed replay does not write diagnostics. Missing companions
+are valid for requests not admitted to execution; inspection reports
+zero attempts and NULL details. This addition uses the existing extensible control-format-1 operations
+layout and introduces no new table, retention root or format version.
+
+For local and single-writer S3 branch requests, `destination == ours name` selects existing-target publication.
+No formerly valid new-destination request has this identity. The target is the frozen `ours
+branch UUID` and head, not a new branch or a later branch with the same name. Action is derived
+from frozen ancestry: `base == theirs` means `already_up_to_date`, else `base == ours` means
+`fast_forward`, otherwise `merged`. New destinations report `created_branch`.
+
+Existing-target ownership reuses `compound_intents`: `operation_id` is the merge request,
+`branch_id` is the target UUID, `expected_head` is frozen ours, `expected_epoch` fences its
+exclusive lease, and `target_root` is its original public root. The existing root-retention
+and release/GC rules apply. Reader pins retain inputs only for the attempt. Ordinary failure
+or abort deletes this intent before durable S3 preparation; a prepared S3 result keeps it until
+publication or safe abort. Death leaves it durable until retry/abort. No pending result
+branch is created. Request inspection exposes unprepared ownership as `target_locked`; prepared
+S3 output keeps its publication state and destination reservation flag.
+
+Publication uses one FULL transaction: unlink old main/empty-sidecar names, install the sealed
+result mapping, update the existing branch and ancestry/history as appropriate, remove the intent,
+and complete the request. Fast-forward moves root/head to the source snapshot and adds a target
+history event without allocating a new snapshot; no-op leaves root/head/history unchanged.
+Fast-forward refuses a source snapshot retired before publication. True merge allocates one
+snapshot with `merge` parents (ours, theirs). All modes increment the writer epoch to fence
+obsolete owners. An ordinary no-op attempt therefore still adds management/audit records.
+
+A completed `operations.kind='merge_target_result'` companion has a random UUID, NULL request,
+and the result database/branch/snapshot. Its four length-prefixed fields are
+`[local-merge-target-v1, merge operation UUID, action, provenance JSON]`, or
+`[s3-merge-target-v1, merge operation UUID, action, provenance JSON]` for S3 targets. The JSON has the same
+input IDs/roots, algorithm, selection and schema fields as a new merge snapshot. The companion
+and original completion commit together, so retries cannot duplicate it. It records fast-forward
+and no-op provenance without rewriting another snapshot's metadata. These text references are
+not retention roots. This uses the control-format-1 operations/intent layout unchanged;
+there is no native DuckDB format change or upstream patch.
+
+Schema policy uses a completed `operations.kind='merge_schema'` companion, reserved in the
+same FULL transaction as a new snapshot/branch merge request. Its UUIDv8 uses the SHA-256
+encoding specified for S3 publication below, with hash input
+`differential-s3-merge-v1\nschema\n<merge operation UUID>` (also for local merges). `request`
+is NULL and `database_id` is the input database. The four length-prefixed fields are
+`[merge-schema-policy-v1, merge operation UUID, schema mode, schema planner version]`.
+New requests use `strict`/`strict-v1`, `additive`/`additive-tables-v2`, or
+`catalog`/`catalog-v1`. Catalog version 1 includes table/plain nullable column removal proofs and whole-view
+definition/presence reconciliation, including native dependency registrations and bound output
+contracts. It includes the additive version-2 rules (supported new tables and combined namespace
+checks). Never rewrite a pending record to broaden its scope on retry. Fresh previews use the current version and expose it.
+This is a versioned companion payload in the existing control-format-1 operations table; the six-/eleven-field
+merge payloads and native/export formats are unchanged. Every request has this companion;
+absence is `corrupt_data`.
+The companion's completed state freezes policy, not a completed merge result; it contains
+no retention root. Retries cannot change mode. Pending recomputation requires the recorded
+planner; prepared S3 results and completed requests do not replan. Result `commit_extra_info`
+also includes `schema_mode` and `schema_algorithm`, including in the remote commit metadata.
+The `catalog-v1` planner includes column removal: no new catalog
+version or compatibility path is retained. Pending catalog requests use the current rules;
+prepared/completed results still replay without recomputation. The `schema_changes.action`
+preview field is transient SQL output and does not change a persisted payload or format version.
+
+Native temporal expression settings use a completed `operations.kind='merge_expression_context'`
+companion. Its UUIDv8 uses the S3 publication SHA-256 encoding with hash input
+`differential-s3-merge-v1\nexpression-context\n<merge operation UUID>`. `request` is NULL and
+`database_id` is the input database. Its four length-prefixed fields are
+`[native-expression-context-v1, merge operation UUID, TimeZone, Calendar]`. Each setting is
+at most 1,024 bytes; the encoded record is capped at 4,096 bytes before decoding. Empty means the native setting
+was unavailable; if it becomes available on retry, recomputation fails rather than inventing
+a replacement context. No other session settings, credentials or retention roots are stored.
+Under the request lock, the first data execution commits this companion in a FULL transaction
+before catalog comparison or staging. Its completed state freezes settings, not output.
+Recomputation restores these settings through native DuckDB SET operations. Unknown context
+versions fail closed; preview/preflight do not create records. A pending request that stopped
+before its first data execution has no companion yet and captures the settings on retry. Prepared S3 outputs and completed
+requests bypass context decoding and replay unchanged. Result `commit_extra_info` includes
+`expression_context: "native-expression-context-v1"`; actual settings live in the companion.
+This adds no table/layout change to control format 1.
+
+Resolution choices use a companion `operations.kind='merge_resolutions'` record. Its UUIDv8
+uses the same SHA-256 UUID encoding as ancestry below, with the hash input
+`differential-snapshot-ancestry-v1\nmerge-resolutions:<merge operation UUID>\n0`.
+`request` is NULL, `database_id` is the input database, and `branch_id` holds the parent merge
+operation UUID (not a branch). Payload fields are `[typed-resolutions-duckdb-2-v1, specification,
+data]`. The specification concatenates length-prefixed target/source strings in map-key order;
+the data is binary, length-delimited inside SQLite TEXT, not a NUL-terminated string.
+
+The reservation is `pending`, with empty data, committed atomically with the parent request.
+First capture changes it to `complete` in a FULL transaction. The data is a DuckDB 2.0
+BinarySerializer Value: a STRUCT keyed by table name, each containing `keys VARCHAR[]` and
+`rows LIST<STRUCT<exact table columns, _merge_action VARCHAR, _merge_columns MAP(VARCHAR,VARCHAR)>>`,
+and `base`, `ours`, `theirs` BIGINT input IDs.
+No choices use an empty byte string. The version tag pins this envelope to DuckDB 2.0;
+an unavailable resolution version fails explicitly. The mapping has a 64 KiB bound and data
+an 8 MiB bound, with an earlier conservative capture budget and 10,000-row limit.
+
+Exact column values may include supported UUID/binary/unsigned/floating-point/temporal
+types and recursively nested containers. They use the existing native DuckDB 2.0 Value
+serializer; no JSON/text conversion or new persisted envelope is introduced. Capture budgets
+count nested nodes and binary/string bytes before collecting rows into process memory.
+The `nested_value` trees exposed by preview/resolution-audit SQL are diagnostic output only;
+they are not stored in this envelope. Completed and prepared outputs retain their existing
+replay behavior. Older binaries may reject pending inputs using newly supported types.
+
+First committed capture wins concurrent retries; later calls read it rather than mutable source
+tables. Every request has this companion; absence is `corrupt_data`.
+`commit_extra_info.resolutions` records the resolution-envelope version; `operation_id` links
+the audit and immutable input provenance. A completed companion means choices were frozen,
+not that a merge succeeded. Companion records retain user values indefinitely with operation
+history, but never act as retention roots. No metadata layout or native storage format changes.
+
+Completed merge replay validates the reserved resolution mapping without decoding the choice
+envelope, so it survives an unavailable resolution encoding. Pending execution and audit
+retrieval still reject unavailable encodings explicitly.
+
+During execution, logical files `merge_stage/<pin UUID>[.wal[.checkpoint|.recovery]]`
+hold the native staging database. They have no branch or history record; only the owning
+process registers their URI. On normal pin release or stale-pin reconciliation their names
+are cleared in the authority transaction, making their maps/payload eligible for ordinary GC.
+Local results publish their branch, snapshot and completed operation atomically. S3 results
+use the private publication protocol below. Reconstructed S3 inputs use pin-owned files in
+the same disposable namespace, then `diff://merge_input/<pin UUID>` opens the verified root
+read-only. These reader URIs require a live process registration and cannot open mutable files.
+See [branch merge](branch-merge.md) for restart and idempotency semantics.
+
+### Private S3 merge publication (s3-merge-publication-v3)
+
+Single-writer S3 snapshot and branch merges add companion records to existing control-format-1 tables; table
+layouts, native storage and remote object formats are unchanged. A `merge_publication`
+operation has no user request ID. Its UUIDv8 is the first 16 SHA-256 bytes of
+`differential-s3-merge-v1\npublication\n<merge operation UUID>`, with UUID version/variant bits
+set. `database_id`, `branch_id`, and `snapshot_id` reserve the future result identities.
+Its length-prefixed payload is:
+
+`[s3-merge-publication-v3, merge operation UUID, destination name, root, logical size,
+publication timestamp, provenance JSON, provider UUID, descriptor or empty, head write ID,
+ours snapshot ID, theirs snapshot ID, head attempted (0 or 1), action, expected ETag]`.
+
+`action` is `created_branch`, `merged`, `fast_forward` or `already_up_to_date`. New destinations
+have an empty expected ETag (conditional creation); target actions freeze a nonempty ETag
+verified against the selected exported target and repository ownership (conditional update).
+Target records reuse the target branch UUID. Fast-forward/no-op reuse a public snapshot and
+its completed descriptor/timestamp, never alter its provenance or allocate another snapshot.
+Their provenance is retained in the companion and atomic target audit. A pending publication
+record prevents expiry of its result snapshot until completion or abort; other inputs may expire.
+No-op never sets head-attempted or writes a remote head.
+
+The payload version advances independently of unchanged control-format-1 table layouts; only the
+15-field `s3-merge-publication-v3` payload is read, and any other version is `corrupt_data`.
+The head-attempted flag begins at 0; a FULL transaction sets 1 before
+any destination-head PUT. This flag never resets, even if an attempt fails. An absent head
+after a possible PUT is insufficient evidence for safe abort: the provider may still be
+processing a request sent before process death.
+
+The 32-hex-digit random head write ID is committed before S3 I/O. The descriptor field is
+set only after export verification (or copied from the already-complete reused export). `export_roots[publication UUID]` holds the result as
+`pending` throughout upload and remote head publication. For new output no public `exports`/
+`snapshots`/`history` row exists yet; a new destination has no `branches` row. Existing targets
+keep their original public state plus `compound_intents`, and reused snapshots remain public. Ordinary/background/claim head publication skips a merge-fenced target, so it cannot roll
+back the remote result during the remote/local completion window. `databases.last_snapshot` advances at reservation, so gaps are permitted.
+
+Single-writer S3 ordinary snapshots record `snapshot-parents-v1` locally in their publication
+transaction, as local-storage snapshots do. Remote descriptors/commit records are unchanged;
+these local parent records are not reconstructed from remote history or inferred for old snapshots.
+
+A `merge_destination` companion reserves the branch name. Its UUIDv8 is derived with the
+same recipe, using `destination` and `<database UUID>/<branch name>` as domain/key. Its
+payload is the owning merge operation UUID, `database_id` identifies the database, and
+`request` is NULL. Branch creation checks this indexed reservation. Completion changes its
+state to `complete`; safe abort does the same only for a reservation still owned by that
+merge. Later reservations may replace that completed reservation's payload.
+
+`abort_merge` operations have ordinary optional user request IDs and a length-prefixed
+`[database UUID, merge operation UUID, merge-abort-v1]` payload. Successful abort of unpublished
+work creates a `merge_aborted` companion whose UUIDv8 uses the same derivation with domain
+`aborted` and key `<merge operation UUID>`. Its payload is the raw merge UUID, state is
+`complete`, and database_id identifies the database. The original merge row remains
+`pending` in the raw control-format-1 table because it has no successful output; the terminal marker
+prevents any retry. Both public operation inspection functions report it as `aborted`.
+The marker, `export_roots.state = abandoned`, reservation release, publication companion
+completion and abort-action completion share one FULL transaction. Completed companions
+alone never prove successful publication; only the original merge's completed result does.
+An abort action that recovers or observes a completed merge records its branch/snapshot;
+an aborted outcome records snapshot_id 0. No remote objects or audit rows are deleted.
+
+`locks/merge-<operation UUID>` serializes merge attempts and abort across repository-local
+processes. Lock acquisition order is request, then database head lock, then short metadata
+transactions. The persistent lock file is not a lease or retention root and is never unlinked
+while another process might use it. Kernel ownership disappears on process death.
+
+After uploading the ordinary packs/indexes/descriptor/commit record, publication creates
+the destination head only if absent. A head matching the precommitted write identity and
+result descriptor/branch/snapshot is accepted on retry. Existing foreign heads and tombstones
+are never replaced. The commit record's scalar parent is `ours`; both contributors and the
+explicit base remain in `extra_info`, not a general portable ancestry graph.
+
+After confirmed head publication, one FULL transaction inserts the reserved public branch,
+snapshot/history, ancestry and completed export, completes both merge/publication operations,
+and releases the pending export root to ordinary retention. Before that transaction commits,
+only the remote head may expose the valid result. Repeating the original request reconciles
+this window without another snapshot or head. Private records and retained result roots are
+kept on failure/cancellation until successful retry or explicit safe abort; no automatic expiry is implemented.
+
+
+### Local snapshot ancestry payload (snapshot-parents-v1)
+
+Local single-writer snapshot publication inserts a complete `operations.kind='snapshot_ancestry'`
+record in the **same FULL transaction** as the snapshot and head update. `request` is NULL;
+`database_id`, `branch_id` and `snapshot_id` identify the new snapshot, and `preservation` is zero.
+These internal records are visible through `differential_operations()`. Their length-prefixed
+payload is `[snapshot-parents-v1, kind, first parent ID, second parent ID]`:
+
+- `root`, `import`, `clone`: both parents zero, beginning a local history.
+- `linear`, `restore`: one parent (the previous published head), second zero.
+- `merge`: the two contributing snapshot IDs, with identical parents deduplicated into one edge.
+
+Parent IDs are in the same database. Zero means no edge. Every nonzero parent must already
+exist when the child is published, so normal publication cannot create cycles. Restore follows
+any newly published preservation; reusing an existing equal-root snapshot for preservation adds
+only its existing history event, not an ancestry edge to that snapshot. Restoring bytes from
+another snapshot does not make that target a parent. Imported/clone source fields remain provenance.
+
+The record's primary-key UUID is the first 16 bytes of SHA-256 over UTF-8
+`differential-snapshot-ancestry-v1\n<database UUID>\n<decimal snapshot ID>`, with UUID version 8 and
+RFC variant bits set. This reserved namespace gives indexed lookups in the existing operations
+table without a request-ID reservation or table migration. Parent payloads are at most 256 bytes,
+strictly decoded, versioned independently, and never read from user `commit_extra_info`.
+Store format 2, control format 1 and export v2 layouts are unchanged. Local and single-writer S3 publication emit
+these local records; shared-writer publication does not. Their operation state remains `complete`
+when the snapshot export is pending: ancestry completion records local metadata durability, not
+export ownership. Remote commit formats and shared renumbering are unchanged.
+
+Parent records contain no roots/files and do not participate in `ROOT_LIVE_SQL`, GC root sets,
+reader pins or export retention. Snapshot retirement and payload GC leave them intact. This keeps
+logical lineage available without keeping database images indefinitely. Metadata growth follows
+snapshot history; compaction is deferred. Missing old records are unknown; no migration backfills
+edges. The resolver only accepts such a boundary when it is already below a proven common base,
+or when the previous direct-sibling proof suffices. Unrelated or incomplete histories fail.
+
+`unique-base-v1` walks the reachable parent graph, marks reachability from each head and removes
+common ancestors dominated by another common descendant. Exactly one remaining candidate is
+required. A separate topological pass rejects cycles. Missing non-common ancestry fails proof;
+multiple candidates return `merge_base_ambiguous`. Retention/readability checks occur **after**
+selection and never change its answer. The walk is bounded by `max_ancestry_nodes` and checks
+cancellation/deadlines. Pending requests store the selected IDs once; new parent records or head
+changes cannot retarget them. The logical reconciliation algorithm remains `logical-cell-v1`.

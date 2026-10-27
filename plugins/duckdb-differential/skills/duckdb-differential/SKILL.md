@@ -1,11 +1,11 @@
 ---
 name: duckdb-differential
-description: Versioned DuckDB databases with the differential community extension (DuckDB 2.0) - snapshots, branches, clones, restore, AT time travel, and replication through S3 (exports, branch heads, followers, WAL shipping, failover, shared multi-writer databases). Use when the user mentions duckdb-differential, ATTACH 'differential:...' paths or differential_* functions, or wants to version, branch, roll back, time-travel, replicate, sync or fail over DuckDB databases, including leader/follower setups on S3.
+description: Versioned DuckDB databases with the differential community extension (DuckDB 2.0) - snapshots, branches, clones, restore, branch merging, AT time travel, and replication through S3 (exports, branch heads, followers, WAL shipping, failover, shared multi-writer databases). Use when the user mentions duckdb-differential, ATTACH 'differential:...' paths or differential_* functions, or wants to version, branch, roll back, time-travel, replicate, sync or fail over DuckDB databases, including leader/follower setups on S3.
 license: MIT
-compatibility: DuckDB 2.0 on Linux or macOS (amd64, arm64). S3 features need network access and an existing bucket.
+compatibility: DuckDB 2.0 on Linux (amd64, arm64) or macOS (arm64). S3 features need network access and an existing bucket.
 metadata:
   author: tobilg
-  version: "1.0.0"
+  version: "1.1.0"
   repository: https://github.com/tobilg/duckdb-differential
 ---
 
@@ -13,7 +13,7 @@ metadata:
 
 A DuckDB extension that stores ordinary DuckDB databases in a versioned repository. Everything inside
 a database is native DuckDB (tables, transactions, indexes, WAL, checkpoints); the extension adds
-immutable snapshots, branches, clones, restore and time travel, and can export every snapshot to S3
+immutable snapshots, branches, clones, restore, branch merging and time travel, and can export every snapshot to S3
 for other hosts to read, follow, recover or write.
 
 The SQL blocks below run as written in the extension's test suite. Each block is one DuckDB session;
@@ -89,6 +89,38 @@ CALL differential_expire_snapshots('shop', versions => [2]);
 SELECT deleted_objects FROM differential_cleanup_old_files(cleanup_all => true);
 SELECT database_name FROM differential_databases() ORDER BY 1;
 ```
+
+## Merging branches
+
+A merge combines two branches' published snapshots with a three-way, cell-level comparison against
+their common ancestor. The target (here `main`) must be detached; the source may stay attached.
+Every table needs a primary key, and only the documented schema changes are merged
+([branch merging](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md)).
+
+```sql
+-- main
+ATTACH 'differential:prices' AS prices;
+CREATE TABLE prices.items(id INT PRIMARY KEY, label VARCHAR, price DECIMAL(10,2));
+INSERT INTO prices.items VALUES (1, 'tea', 2.50), (2, 'coffee', 3.00);
+CALL differential_create_snapshot('prices');
+CALL differential_create_branch('prices', 'labels', snapshot => 1);
+ATTACH 'differential:prices' AS labels (BRANCH 'labels');
+UPDATE labels.items SET label = 'green tea' WHERE id = 1;
+CALL differential_create_snapshot('labels');
+UPDATE prices.items SET price = 3.20 WHERE id = 2;
+CALL differential_create_snapshot('prices');
+DETACH prices;
+SELECT ready, merge_action FROM differential_merge_branch_preflight('prices', 'main', 'labels', 'main');
+SELECT merge_action, snapshot_id FROM differential_merge_branch('prices', 'main', 'labels', 'main',
+    request_id => 'labels-into-main');
+ATTACH 'differential:prices' AS prices;
+SELECT label, price FROM prices.items WHERE id = 1;
+-- expect output: "label":"green tea"
+```
+
+Conflicting edits of the same cell fail with `merge_conflict`; inspect them with
+`differential_merge_branch_preview` and resolve them with `resolution_tables`. A destination other
+than `ours` creates a new branch instead. Shared databases cannot be merged.
 
 An existing, cleanly closed DuckDB file becomes a versioned database with
 `CALL differential_import_database('/absolute/file.duckdb', 'name');` (no `.wal` file may exist).
@@ -171,7 +203,7 @@ SELECT branch_name, remote_state FROM differential_branches('team');
 On `branch_conflict`, `DETACH` the branch and call
 `differential_resolve_conflict('team', keep => 'remote')` (take the S3 head; local work stays a
 snapshot) or `keep => 'branch'` (keep local work on a new branch). `ON_CONFLICT 'branch'` on ATTACH
-forks automatically instead. There is no merge.
+forks automatically instead. Branch merging does not apply to shared databases.
 
 ## Choosing a setup
 
@@ -189,8 +221,8 @@ forks automatically instead. There is no merge.
 - Management functions are table functions: `CALL f(…)` or `SELECT … FROM f(…)`. They run only in
   autocommit mode (not inside `BEGIN … COMMIT`). Named parameters use `=>`.
 - The first argument is a database name or an attached alias; a branch alias selects that branch.
-- `differential_restore`, `differential_drop_branch` and `differential_resolve_conflict` need the
-  branch detached everywhere (`active_attachment_or_transaction` otherwise).
+- `differential_restore`, `differential_drop_branch`, `differential_resolve_conflict` and a merge into an
+  existing branch need that branch detached everywhere (`active_attachment_or_transaction` otherwise).
 - One writer process per branch (`writer_busy`); open read-only attachments instead.
 - Snapshot and head attachments are fixed: DETACH and ATTACH again to see newer data, or use
   `FOLLOW true`. `AT` works on branch and snapshot attachments, not on S3 exports or followers.
@@ -200,7 +232,7 @@ forks automatically instead. There is no merge.
   original result and never applies twice.
 - Attachments pin snapshots against garbage collection; detach what is no longer needed. Exports in S3
   are only collected by `differential_cleanup_remote_files` (two phases, a grace period apart).
-- `temp_directory` must be local. Linux and macOS only.
+- `temp_directory` must be local. Linux and macOS (Apple silicon) only.
 - Errors carry stable prefixes such as `[differential:not_found]`, `[differential:writer_busy]`,
   `[differential:branch_conflict]`, `[differential:head_conflict]`, `[differential:retired]`.
 
@@ -231,6 +263,10 @@ bound to an attachment. `duckdb_functions()` lists every function with parameter
   `differential_resolve_conflict`
 - Import and recovery: `differential_import_database`, `differential_recover_export`,
   `differential_recover_branch`
+- Merging: `differential_merge_branch_preview`, `differential_merge_branch_preflight`,
+  `differential_merge_branch`, `differential_merge_snapshots_preview`, `differential_merge_snapshots`,
+  `differential_merge_ancestry`, `differential_merge_requests`, `differential_merge_resolutions`,
+  `differential_merge_status`, `differential_abort_merge`
 - Maintenance: `differential_cleanup_old_files`, `differential_delete_orphaned_files`,
   `differential_compact`, `differential_cleanup_remote_files`, `differential_cleanup_metadata`
 

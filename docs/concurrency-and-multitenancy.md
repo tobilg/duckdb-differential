@@ -138,7 +138,8 @@ another host from taking over a branch. There is no writer lease in S3.
 - **A repository on a network filesystem** (NFS, SMB) shared by several hosts: file locks are not
   reliable there, so the per-branch writer lock can fail. Use one repository per host.
 - **Several hosts writing the same database**, unless it is a shared database (above).
-- **Merging branches.**
+- **Merging into an attached target or into a shared database.** [Branch merging](branch-merge.md)
+  needs a detached target and a local or single-writer S3 database.
 
 ## Multitenancy
 

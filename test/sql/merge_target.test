@@ -1,0 +1,145 @@
+# name: test/sql/merge_target.test
+# description: local branch merge into a detached target with stock DuckDB
+# group: [differential]
+require differential
+
+statement ok
+SET differential_repository='__TEST_DIR__/merge_target'
+
+statement ok
+PREPARE deferred AS SELECT snapshot_id,merge_action FROM differential_merge_branch('target_merge','release','feature','release',request_id=>'merge-target')
+
+statement ok
+EXPLAIN SELECT * FROM differential_merge_branch('target_merge','release','feature','release')
+
+query T
+SELECT status FROM differential_status() WHERE capability='repository_open'
+----
+false
+
+statement ok
+ATTACH 'differential:target_merge' AS d
+
+statement ok
+CREATE TABLE d.x(id INT PRIMARY KEY,a INT,b VARCHAR)
+
+statement ok
+INSERT INTO d.x VALUES(1,0,'base')
+
+statement ok
+CALL differential_create_snapshot('d')
+
+statement ok
+CALL differential_create_branch('d','release',snapshot=>1)
+
+statement ok
+CALL differential_create_branch('d','feature',snapshot=>1)
+
+statement ok
+ATTACH 'differential:target_merge' AS target (BRANCH 'release')
+
+statement ok
+UPDATE target.x SET a=1
+
+statement ok
+CALL differential_create_snapshot('target')
+
+statement ok
+ATTACH 'differential:target_merge' AS source (BRANCH 'feature')
+
+statement ok
+UPDATE source.x SET b='feature'
+
+statement ok
+CALL differential_create_snapshot('source')
+
+statement error
+EXECUTE deferred
+----
+active_attachment_or_transaction
+
+statement ok
+DETACH target
+
+query IT
+EXECUTE deferred
+----
+4	merged
+
+statement ok
+ATTACH 'differential:target_merge' AS target (BRANCH 'release')
+
+query IIT
+SELECT * FROM target.x
+----
+1	1	feature
+
+query IIT
+SELECT * FROM source.x
+----
+1	0	feature
+
+# Replay succeeds while target is attached; it never installs its old result again.
+query IT
+EXECUTE deferred
+----
+4	merged
+
+statement ok
+DETACH target
+
+query IT
+SELECT snapshot_id,merge_action FROM differential_merge_branch('d','release','feature','release',request_id=>'noop')
+----
+4	already_up_to_date
+
+statement error
+SELECT * FROM differential_merge_branch('d','main','feature','main')
+----
+active_attachment_or_transaction
+
+statement ok
+DETACH d
+
+query IT
+SELECT snapshot_id,merge_action FROM differential_merge_branch('target_merge','main','feature','main',request_id=>'ff')
+----
+3	fast_forward
+
+query I
+SELECT count(*) FROM differential_snapshots('target_merge')
+----
+4
+
+query TT
+SELECT state,merge_action FROM differential_merge_requests('target_merge',request_id=>'ff')
+----
+complete	fast_forward
+
+statement ok
+ATTACH 'differential:target_merge' AS target (BRANCH 'release')
+
+statement ok
+INSERT INTO target.x VALUES(9,9,'unsnapshotted')
+
+statement ok
+DETACH target
+
+statement error
+SELECT * FROM differential_merge_branch('target_merge','release','feature','release')
+----
+merge_target_dirty
+
+statement ok
+ATTACH 'differential:target_merge' AS target (BRANCH 'release')
+
+query I
+SELECT count(*) FROM target.x WHERE id=9
+----
+1
+
+statement ok
+DETACH target
+
+statement ok
+DETACH source

@@ -31,6 +31,7 @@ with tempfile.TemporaryDirectory(prefix='differential-cancel-') as tmp:
         host.lib.duckdb_interrupt(c);thread.join(timeout=10);assert not thread.is_alive() and errors
         assert host.query(observer,'SELECT sum(value) FROM d.t;')==42
         assert host.query(observer,"SELECT count(*) FROM differential_operations() WHERE state='local_complete_export_pending';")==1
+        assert host.query(observer,"SELECT count(*) FROM differential_operations() WHERE kind='snapshot_ancestry' AND state='complete';")==1
         assert host.query(observer,"SELECT count(*) FROM differential_snapshots('sales') WHERE export_state='pending';")==1
         assert host.query(observer,"SELECT value FROM differential_storage_stats() WHERE metric='s3_put_calls';")==0
         with metadata_store.connect(root/'engine.sqlite') as db:
