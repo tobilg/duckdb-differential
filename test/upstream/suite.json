@@ -23,16 +23,16 @@
     },
     {
       "path": "test/extension/autoloading_encodings.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
+      "category": "upstream_baseline_failure",
+      "reason": "Line 30 autoloads the encodings extension from LOCAL_EXTENSION_REPO. The runner places only extensions a test declares with require in that repository, so the autoload finds nothing and read_csv rejects shift_jis. Reproduced identically on native and Differential attachments.",
       "expected": {
         "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
+          "status": "failed",
+          "message": "Invalid Input Error: The CSV Reader does not support the encoding: \"shift_jis\""
         },
         "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
+          "status": "failed",
+          "message": "Invalid Input Error: The CSV Reader does not support the encoding: \"shift_jis\""
         }
       }
     },
@@ -63,21 +63,6 @@
         "differential": {
           "status": "failed",
           "message": "Mismatch on row 1, column loaded(index 2)"
-        }
-      }
-    },
-    {
-      "path": "test/extension/test_loadable_optimizer.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 9. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -127,21 +112,6 @@
       }
     },
     {
-      "path": "test/fuzzer/pedro/another_binder_error.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/fuzzer/pedro/incomplete_checkpoint.test",
       "category": "attachment_error_contract",
       "reason": "Line 32 expects a primary-database FATAL checkpoint-abort error. Both native and Differential attachments instead report the native IO checkpoint failure and invalidate the attachment.",
@@ -157,54 +127,9 @@
       }
     },
     {
-      "path": "test/logging/warnings_as_errors.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/optimizer/joins/test_tpcds_pushdown.test",
       "category": "upstream_empty",
       "reason": "The pinned upstream file contains only name/group comments and no executable test commands.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
-      "path": "test/optimizer/pushdown/parquet_or_pushdown.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 8. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
-      "path": "test/parquet/encrypted_parquet.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 7. No test SQL executes; the runner must not count it as passed coverage.",
       "expected": {
         "native": {
           "status": "not_executed",
@@ -344,21 +269,6 @@
       }
     },
     {
-      "path": "test/sql/attach/attach_encryption_fallback_readonly.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/attach/attach_no_wal_writes_mode.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -404,21 +314,6 @@
       }
     },
     {
-      "path": "test/sql/catalog/dependencies/test_concurrent_index_creation.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/catalog/sequence/test_duckdb_sequences.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 4 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -430,21 +325,6 @@
         "differential": {
           "status": "not_executed",
           "message": "require noforcestorage: 1"
-        }
-      }
-    },
-    {
-      "path": "test/sql/copy/csv/14874.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -524,81 +404,6 @@
       }
     },
     {
-      "path": "test/sql/copy/csv/test_big_compressed.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this compressed-CSV test with mode skip at line 7.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
-      "path": "test/sql/copy/csv/test_lineitem_gz.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this lineitem gzip test with mode skip at line 6.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
-      "path": "test/sql/copy/parquet/afl.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables the AFL Parquet fixture test with mode skip at line 5.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
-      "path": "test/sql/copy/parquet/batched_write/batch_memory_usage.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
-      "path": "test/sql/copy/parquet/batched_write/batch_memory_usage_small.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/copy/parquet/encryption/arrow_compatibility.test",
       "category": "requires_memory_database",
       "reason": "Line 8 requires noforcestorage because Parquet encryption keys are not persisted across restarts. Both compared backends use durable storage.",
@@ -629,21 +434,6 @@
       }
     },
     {
-      "path": "test/sql/copy/parquet/parquet2strings.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this binary-string Parquet test with mode skip at line 20.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/copy/parquet/parquet_encryption.test",
       "category": "requires_memory_database",
       "reason": "Line 8 requires noforcestorage because Parquet encryption keys are not persisted across restarts. Both compared backends use durable storage.",
@@ -670,21 +460,6 @@
         "differential": {
           "status": "not_executed",
           "message": "require noforcestorage: 1"
-        }
-      }
-    },
-    {
-      "path": "test/sql/copy_database/copy_database_fk.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 6. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -729,21 +504,6 @@
         "differential": {
           "status": "failed",
           "message": "Mismatch on row 1, column memory_usage_bytes(index 1) 0 <> 262144"
-        }
-      }
-    },
-    {
-      "path": "test/sql/export/export_types.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this export-types test with mode skip at line 6.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -808,21 +568,6 @@
       }
     },
     {
-      "path": "test/sql/index/art/constraints/test_art_tx_same_row_id.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this ART row-ID transaction test with mode skip at line 6.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/index/art/memory/test_art_linear.test_slow",
       "category": "requires_memory_database",
       "reason": "Line 5 requires noforcestorage. The linear ART-memory growth assertions require an in-memory database.",
@@ -848,21 +593,6 @@
         "differential": {
           "status": "failed",
           "message": "Branch \"main\" has no snapshot to attach READ_ONLY"
-        }
-      }
-    },
-    {
-      "path": "test/sql/index/art/storage/test_upsert_reclaim_space.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this space-reclamation test with mode skip at line 5.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -1274,21 +1004,6 @@
       }
     },
     {
-      "path": "test/sql/parallelism/interquery/parallel_dependencies_catalog_operations.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 6, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/parser/parsed_data_statement_roundtrip.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires no_force_storage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -1328,21 +1043,6 @@
         "differential": {
           "status": "failed",
           "message": "No retained snapshot at or before timestamp on this branch"
-        }
-      }
-    },
-    {
-      "path": "test/sql/peg_parser/transformer/load_statement.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -1586,21 +1286,6 @@
       }
     },
     {
-      "path": "test/sql/sample/table_samples/test_table_sample_errors.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5; no source SQL executes. Retain the upstream guard and do not count it as passing coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/secrets/connection_secret_storage.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -1750,11 +1435,10 @@
     {
       "path": "test/sql/secrets/secret_compatibility_http.test",
       "category": "secret_manager_lifecycle",
-      "reason": "The source executes set secret_directory='./data/secrets/http' after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager. Under DuckDB 2.0 the native side fails too, at line 11: the v1.1.0 persistent secret fixture http_v_1_1_0.duckdb_secret no longer deserializes.",
+      "reason": "The source executes set secret_directory='./data/secrets/http' after initial attachment. Differential ATTACH must look up the default differential secret (ApplyDifferentialSecret), which initializes DuckDB secret storage. DuckDB SecretManager::ThrowOnSettingChangeIfInitialized then forbids these setting changes; the test assumes an unused secret manager.",
       "expected": {
         "native": {
-          "status": "failed",
-          "message": "Failed to deserialize the persistent secret file"
+          "status": "passed"
         },
         "differential": {
           "status": "failed",
@@ -2014,21 +1698,6 @@
       }
     },
     {
-      "path": "test/sql/storage/compression/roaring/roaring_bool_various_distributions.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 5. No test SQL executes; the runner must not count it as passed coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        }
-      }
-    },
-    {
       "path": "test/sql/storage/compression/skip_explicit_compression_analyze.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -2040,21 +1709,6 @@
         "differential": {
           "status": "not_executed",
           "message": "require noforcestorage: 1"
-        }
-      }
-    },
-    {
-      "path": "test/sql/storage/concurrent_table_insertion.test_slow",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 10, with no later unskip. The paired run executes no source SQL; do not report it as passing coverage.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "assertions: - none -"
         }
       }
     },
@@ -2247,16 +1901,16 @@
     },
     {
       "path": "test/sql/storage/temp_directory/max_swap_space_error.test",
-      "category": "upstream_disabled",
-      "reason": "Upstream disables this file with mode skip at line 8 (its FIXME notes a tiny-buffer eviction regression). No test SQL executes; the runner must not count it as passed coverage.",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The pinned unmodified test stops at this guard.",
       "expected": {
         "native": {
           "status": "not_executed",
-          "message": "assertions: - none -"
+          "message": "require noforcestorage: 1"
         },
         "differential": {
           "status": "not_executed",
-          "message": "assertions: - none -"
+          "message": "require noforcestorage: 1"
         }
       }
     },
