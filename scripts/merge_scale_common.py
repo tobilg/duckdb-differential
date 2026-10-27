@@ -61,18 +61,21 @@ def spill_files(directory):
 
 
 class Observation:
-    def __init__(self, directory, signum=None):
-        self.directory=directory; self.signum=signum
-        self.peak=0; self.sent=False; self.at_signal={}; self.samples=0
+    """Samples native spill for reports only; sampling can miss short-lived files.
+    A signal is sent once the merge waits at its phase gate. The merge stays there
+    until signalled, so delivery never depends on host speed."""
+    def __init__(self, directory, signum=None, gate=None):
+        self.directory=directory; self.signum=signum; self.gate=gate
+        self.peak=0; self.sent=False; self.samples=0
 
     def __call__(self, child):
-        found=spill_files(self.directory); size=sum(found.values()); self.samples+=1
+        size=sum(spill_files(self.directory).values()); self.samples+=1
         self.peak=max(self.peak,size)
-        if found and self.signum and not self.sent:
+        if self.gate and not self.sent and Path(str(self.gate)+'.entered').exists():
             # Popen.send_signal() polls/reaps; process() owns wait4 and rusage.
             try: os.kill(child.pid,self.signum)
             except ProcessLookupError: return
-            self.sent=True; self.at_signal=found
+            self.sent=True
 
 
 class ScaleFixture:
@@ -89,18 +92,21 @@ class ScaleFixture:
         self.identity=self.cli.identity()
         self.info=None; self.before=None; self.heads_before=None
 
-    def measure(self, sql, *, memory=None, temp=None, external=False, signum=None, cli=None):
+    def measure(self, sql, *, memory=None, temp=None, external=False, signum=None, phase=None, cli=None):
         cli=cli or self.cli
         spill=self.spill if cli is self.cli else cli.repository.parent/'spill'
-        observation=Observation(spill,signum)
+        # A signal needs the integration build's merge phase gate (test hooks).
+        require(not signum or phase,'signal_phase_required')
+        gate=self.root/('gate-'+uuid.uuid4().hex) if signum else None
+        env=dict(cli.env,DIFFERENTIAL_MERGE_PHASE_GATE=f'{phase}:{gate}') if signum else cli.env
+        observation=Observation(spill,signum,gate)
         settings=f'SET debug_force_external={str(external).lower()};'
         if memory: settings+=f'SET memory_limit={literal(memory)};'
         if temp: settings+=f'SET max_temp_directory_size={literal(temp)};'
         rc,out,err,usage=process([cli.duckdb,'-init','/dev/null','-unsigned','-no-agent','-batch','-bail','-json'],
-            input_text=cli.prefix+settings+sql,env=cli.env,seconds=cli.seconds,budget=self.budget,observer=observation)
+            input_text=cli.prefix+settings+sql,env=env,seconds=cli.seconds,budget=self.budget,observer=observation)
         usage.update(spill_peak_bytes=observation.peak,spill_samples=observation.samples,
-                     disk_peak_bytes=self.budget.peak_disk_bytes,signal_sent=observation.sent,
-                     spill_bytes_at_signal=sum(observation.at_signal.values()))
+                     disk_peak_bytes=self.budget.peak_disk_bytes,signal_sent=observation.sent)
         return {'returncode':rc,'error_code':error_code(err) if rc else None,
                 'temporary_disk_limit':'max_temp_directory_size' in err,
                 'data':decode(out) if not rc and out.strip() else [],'process':usage},observation

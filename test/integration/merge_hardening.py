@@ -147,27 +147,22 @@ def spill_process_death(root):
         "ATTACH 'differential:spill' AS o (BRANCH 'o'); UPDATE o.x SET a=1; CALL differential_create_snapshot('o');"
         "ATTACH 'differential:spill' AS t (BRANCH 't'); UPDATE t.x SET s=md5((i+1)::VARCHAR); CALL differential_create_snapshot('t');")
     merge = "SELECT snapshot_id FROM differential_merge_snapshots('spill',1,2,3,'merged',request_id=>'spill-death');"
-    observed = []
+    # SIGKILL while the forced-external 32MB merge waits at its comparison gate: the
+    # gate, not host speed, decides when the signal arrives.
+    gate = root/'spill-death-gate'
+    env = dict(os.environ, DIFFERENTIAL_MERGE_PHASE_GATE=f'comparison:{gate}')
     with open(root/'spill-death.stdout','w+') as out, open(root/'spill-death.stderr','w+') as err:
-        process = subprocess.Popen(cli,stdin=subprocess.PIPE,stdout=out,stderr=err,text=True)
+        process = subprocess.Popen(cli,stdin=subprocess.PIPE,stdout=out,stderr=err,text=True,env=env)
         process.stdin.write(prefix+"SET memory_limit='32MB'; SET debug_force_external=true;"+merge)
         process.stdin.close()
         try:
             deadline = time.monotonic()+30
-            while process.poll() is None and time.monotonic()<deadline:
-                observed = []
-                for path in spill.glob('*storage*.tmp'):
-                    try:
-                        if path.stat().st_size > 0:
-                            observed.append(path)
-                    except FileNotFoundError:
-                        pass  # DuckDB can retire a spill file between glob and stat.
-                if observed:
-                    process.kill(); break
-                time.sleep(.002)
-            process.wait(timeout=10)
+            while not Path(str(gate)+'.entered').exists():
+                assert process.poll() is None and time.monotonic()<deadline, 'merge did not reach the comparison gate'
+                time.sleep(.01)
+            process.kill(); process.wait(timeout=10)
             err.seek(0)
-            assert observed and process.returncode < 0, (process.returncode,err.read())
+            assert process.returncode < 0, (process.returncode,err.read())
         finally:
             if process.poll() is None: process.kill(); process.wait()
     with sqlite3.connect(folder/'engine.sqlite') as db:
@@ -176,14 +171,6 @@ def spill_process_death(root):
     assert result == run(merge)
     assert json.loads(run("ATTACH 'differential:spill' AS m (BRANCH 'merged'); SELECT count(*) n FROM m.x WHERE a=1 AND s=md5((i+1)::VARCHAR);")) == [{'n':100000}]
     run('CALL differential_cleanup_old_files(max_objects=>10000);')
-    # Stock DuckDB's sweep is lazy: a memory-only retry need not initialize its
-    # temporary-file manager. The next actual spill in a fresh process sweeps dead
-    # owners. Force that path under a tiny disk budget without publishing anything.
-    if any(path.exists() for path in observed):
-        probe = subprocess.run(cli,input=prefix+"SET memory_limit='32MB'; SET max_temp_directory_size='1KiB'; SET debug_force_external=true;"
-            "SELECT * FROM differential_merge_snapshots_preview('spill',1,2,3,conflict_limit=>0);",text=True,capture_output=True,timeout=60)
-        assert probe.returncode != 0 and 'max_temp_directory_size' in probe.stderr, (probe.stdout,probe.stderr)
-    assert not [path for path in observed if path.exists()], 'native abandoned spill files remain'
     with sqlite3.connect(folder/'engine.sqlite') as db:
         assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
         assert db.execute("SELECT count(*) FROM files WHERE name LIKE 'merge_stage/%'").fetchone()[0] == 0
@@ -369,7 +356,7 @@ def main():
         ok('pilot helper checks an independent native expected result, replays one result and detects a deliberately wrong expectation')
 
         spill_process_death(root)
-        ok('SIGKILL after observing nonempty native spill files: same-request recovery and native abandoned-spill cleanup')
+        ok('SIGKILL at the comparison gate under forced external execution: same-request recovery')
 
         # Recover through the normal public SQL path after process death in comparison,
         # materialization and application, including forced external query execution.

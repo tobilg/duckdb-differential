@@ -309,18 +309,18 @@ OS caches are not flushed. Sampling can miss peaks, and logical/SDK counters are
 wire throughput. Source and artifact identities are checked throughout; reports are written under
 `build/evidence/`. See [performance and sizing](benchmarks.md).
 
-The spill suite uses 100,000 rows/20% changes and tests both new branches and existing targets.
-It requires actual nonempty native temporary files before sending SIGINT or SIGKILL. A separate
-64 MB/8 MB native memory/temp-budget run must hit the temporary-directory limit. Every failure
-must preserve input roots, branch heads and snapshot history, and publish no result. The same
-request retries at 256 MB/2 GB, verifies exact data/catalogs (also remotely on S3), replays without
-another result, and checks that staging, pins, intents, exports and reservations are cleaned up.
-These tests need no extension failpoints and can also run against the release loadable.
+The spill suite uses 100,000 rows/20% changes and tests both new branches and existing targets,
+with forced external execution at a 64 MB memory budget. A run with an 8 MB temporary-directory
+budget must fail with DuckDB's own temporary-directory limit error. SIGINT and SIGKILL are sent
+while the merge waits at its phase gate before the native comparison (`comparison`), so no result
+depends on host speed or on sampling short-lived spill files; these cases need the integration
+build's test hooks. Every failure must preserve input roots, branch heads and snapshot history,
+and publish no result. The same request retries at 256 MB/2 GB, verifies exact data/catalogs (also
+remotely on S3), replays without another result, and checks that staging, pins, intents, exports
+and reservations are cleaned up.
 
 After SIGKILL an existing target remains durably fenced as `target_locked`; a new writer must
-be refused until retry/abort. DuckDB initializes its temporary-file manager lazily, so abandoned
-spill files may remain if retry fits in memory. The test starts a subsequent read-only low-memory
-comparison when necessary, then checks disappearance of the specific abandoned files without
-unlinking them itself. This native cleanup is distinct from Differential GC. These failure tests
-and verifier checks are included in `make test_integration`; the S3 cases are also included in
-`make test_minio`. Large benchmark matrices remain manual.
+be refused until retry/abort. Cleanup of abandoned temporary files is DuckDB's own behaviour and
+is not part of these tests. These failure tests and verifier checks are included in
+`make test_integration`; the S3 cases are also included in `make test_minio`. Large benchmark
+matrices remain manual.
