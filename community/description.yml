@@ -14,7 +14,7 @@ extension:
 
 repo:
   github: tobilg/duckdb-differential
-  ref: 1b38539572e995d267d255574bd150adb70356cb
+  ref: 43203569f46b3a7f0c3a88fa8b4c34a50052ceb0
 
 docs:
   hello_world: |
