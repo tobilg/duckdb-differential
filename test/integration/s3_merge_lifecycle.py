@@ -175,8 +175,8 @@ def main(endpoint, base):
         assert result(abort)['state'] == 'aborted'; no_retention(f); f.remote(error='not_found')
         ok('abort waits for uploader, then safely abandons after its death')
 
-        f = Fixture(base,'legacy',relay.endpoint); f.setup(); f.run(f.merge(),crash='uploaded')
-        # Simulate a pre-write-intent record from the previous implementation.
+        f = Fixture(base,'unknown-publication',relay.endpoint); f.setup(); f.run(f.merge(),crash='uploaded')
+        # Only the current publication payload (v3) is read; any other version is corruption.
         with closing(sqlite3.connect(f.repo/'engine.sqlite')) as db:
             payload = db.execute("SELECT payload FROM operations WHERE kind='merge_publication'").fetchone()[0]
             fields = []
@@ -185,10 +185,8 @@ def main(endpoint, base):
             fields[0] = 's3-merge-publication-v1'; fields = fields[:12]
             payload = ''.join(f'{len(x.encode())}:{x}' for x in fields)
             db.execute("UPDATE operations SET payload=? WHERE kind='merge_publication'",(payload,)); db.commit()
-        r = inspect(f); assert r['publication_attempted']
-        f.run(abort_sql(r['operation_id']),error='merge_publication_uncertain')
-        f.run(f.merge()); f.verify()
-        ok('legacy publication records conservatively retain uncertain state and still resume')
+        f.run(f.merge(),error='corrupt_data')
+        ok('publication records of an unknown payload version are rejected as corrupt, never resumed')
     finally: relay.close()
     evidence_path('s3-merge-lifecycle.json').write_text(json.dumps({'passed':passed,'scope':'disposable MinIO; no AWS'},indent=2)+'\n')
 

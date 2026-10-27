@@ -253,15 +253,15 @@ def main():
             f.run(f.additive()); verify(f)
         ok('cancellation during schema planning and after staged checkpoint cleans up and safely retries')
 
-        f=SchemaFixture(tmp,'legacy'); f.setup(); f.run(f.merge())
+        f=SchemaFixture(tmp,'missing-policy'); f.setup(); f.run(f.merge())
         with closing(sqlite3.connect(f.repo/'engine.sqlite')) as db:
             db.execute("DELETE FROM operations WHERE kind='merge_schema'"); db.commit()
-        f.run(f.merge()); f.run(f.additive(),error='different schema_mode')
+        f.run(f.merge(),error='corrupt_data'); f.run(f.additive(),error='corrupt_data')
         f=SchemaFixture(tmp,'future-complete'); f.setup(OURS,THEIRS); f.run(f.additive()); set_policy_version(f,'future-v99')
         f.run(f.additive()); f.run(f.merge(),error='different schema_mode')
         f=SchemaFixture(tmp,'future-pending'); f.setup(OURS,THEIRS); f.run(f.additive(),crash='schema_planned'); set_policy_version(f,'future-v99')
         f.run(f.additive(),error='schema merge algorithm is unavailable'); f.hidden()
-        ok('legacy strict requests and completed replay survive without reinterpreting pending schema algorithms')
+        ok('a missing policy record is corrupt; completed replay and pending requests never reinterpret schema algorithms')
     evidence_path('merge-schema.json').write_text(json.dumps({'passed':passed,'scope':'disposable local stores'},indent=2)+'\n')
 
 

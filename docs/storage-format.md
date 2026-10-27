@@ -861,11 +861,11 @@ ours branch UUID, theirs branch UUID, base ID, ours ID, theirs ID]`. The first f
 are semantic request identity. The initial FULL transaction reads both published heads,
 resolves the best common ancestor and records the immutable selection. Pending retries
 reuse these IDs rather than resolving names again. This request record is not a retention root.
-The snapshot provenance additionally contains `base_selection` (`unique-base-v1`, or the legacy
-`sibling-fork-v1` proof),
+The snapshot provenance additionally contains `base_selection` (`unique-base-v1`, or the
+`sibling-fork-v1` fork proof for history without parent records, such as 1.0.0 snapshots),
 `ours_branch_id` and `theirs_branch_id`. Existing branch/source fields alone are not ancestry:
 imports and merges also use them, and restore does not rewrite them. The resolver requires a
-parent graph; only the legacy sibling fallback uses completed fork records and rejects restores and prior target merges.
+parent graph; only the fork proof uses completed fork records and rejects restores and prior target merges.
 Both paths reject pending compound intents.
 There are no new metadata tables or format changes; selection and merge algorithms have explicit version tags.
 
@@ -899,7 +899,7 @@ The request lock serializes attempts. Start increments the counter and replaces 
 in a FULL transaction; phase/failure updates check its attempt UUID before replacing it.
 Publication marks it successful in the same FULL transaction as the merge result, including
 S3 completion recovery. A completed replay does not write diagnostics. Missing companions
-are valid for predecessor requests or requests not admitted to execution; inspection reports
+are valid for requests not admitted to execution; inspection reports
 zero attempts and NULL details. This addition uses the existing extensible control-format-1 operations
 layout and introduces no new table, retention root or format version.
 
@@ -945,13 +945,11 @@ is NULL and `database_id` is the input database. The four length-prefixed fields
 New requests use `strict`/`strict-v1`, `additive`/`additive-tables-v2`, or
 `catalog`/`catalog-v1`. Catalog version 1 includes table/plain nullable column removal proofs and whole-view
 definition/presence reconciliation, including native dependency registrations and bound output
-contracts. It includes the additive version-2 rules without broadening older strict/additive requests. Existing
-`additive`/`nullable-columns-v1` records remain readable and executable by their original
-column-only planner. Version 2 adds supported new tables and combined namespace checks;
-it does not change existing-column reconciliation. Never rewrite a pending version-1 record
-to broaden its scope on retry. Fresh previews use the current version and expose it.
+contracts. It includes the additive version-2 rules (supported new tables and combined namespace
+checks). Never rewrite a pending record to broaden its scope on retry. Fresh previews use the current version and expose it.
 This is a versioned companion payload in the existing control-format-1 operations table; the six-/eleven-field
-merge payloads and native/export formats are unchanged. Absence means legacy strict mode.
+merge payloads and native/export formats are unchanged. Every request has this companion;
+absence is `corrupt_data`.
 The companion's completed state freezes policy, not a completed merge result; it contains
 no retention root. Retries cannot change mode. Pending recomputation requires the recorded
 planner; prepared S3 results and completed requests do not replan. Result `commit_extra_info`
@@ -972,8 +970,8 @@ a replacement context. No other session settings, credentials or retention roots
 Under the request lock, the first data execution commits this companion in a FULL transaction
 before catalog comparison or staging. Its completed state freezes settings, not output.
 Recomputation restores these settings through native DuckDB SET operations. Unknown context
-versions fail closed; preview/preflight do not create records. Older pending requests without
-the companion capture settings on their next data execution. Prepared S3 outputs and completed
+versions fail closed; preview/preflight do not create records. A pending request that stopped
+before its first data execution has no companion yet and captures the settings on retry. Prepared S3 outputs and completed
 requests bypass context decoding and replay unchanged. Result `commit_extra_info` includes
 `expression_context: "native-expression-context-v1"`; actual settings live in the companion.
 This adds no table/layout change to control format 1.
@@ -1004,7 +1002,7 @@ they are not stored in this envelope. Completed and prepared outputs retain thei
 replay behavior. Older binaries may reject pending inputs using newly supported types.
 
 First committed capture wins concurrent retries; later calls read it rather than mutable source
-tables. Completed legacy merges without a companion accept only an empty specification.
+tables. Every request has this companion; absence is `corrupt_data`.
 `commit_extra_info.resolutions` records the resolution-envelope version; `operation_id` links
 the audit and immutable input provenance. A completed companion means choices were frozen,
 not that a merge succeeded. Companion records retain user values indefinitely with operation
@@ -1046,10 +1044,9 @@ Their provenance is retained in the companion and atomic target audit. A pending
 record prevents expiry of its result snapshot until completion or abort; other inputs may expire.
 No-op never sets head-attempted or writes a remote head.
 
-The payload version advances independently of unchanged control-format-1 table layouts. Existing
-12-field `s3-merge-publication-v1` and 13-field `s3-merge-publication-v2` records remain
-readable/resumable as new-destination operations. V1 conservatively means `head attempted = 1`;
-v2 preserves its explicit flag. Re-encoding writes v3. New records begin at 0; a FULL transaction sets 1 before
+The payload version advances independently of unchanged control-format-1 table layouts; only the
+15-field `s3-merge-publication-v3` payload is read, and any other version is `corrupt_data`.
+The head-attempted flag begins at 0; a FULL transaction sets 1 before
 any destination-head PUT. This flag never resets, even if an attempt fails. An absent head
 after a possible PUT is insufficient evidence for safe abort: the provider may still be
 processing a request sent before process death.

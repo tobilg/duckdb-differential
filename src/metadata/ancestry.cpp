@@ -260,10 +260,8 @@ void Control::ReserveMergeResolutions(const Operation &op, const std::string &sp
             throw std::runtime_error("[differential:merge_unsupported] Resolution record version is unavailable");
         return;
     }
-    if (op.state == "complete") {
-        if (!spec.empty()) throw std::runtime_error("Request ID reused with different resolution_tables");
-        return;
-    }
+    if (op.state == "complete")
+        throw std::runtime_error("[differential:corrupt_data] Resolution reservation missing");
     if (spec.size() > 65536) throw std::runtime_error("[differential:merge_limit] Resolution specification exceeds 64 KiB");
     auto fields = control::DecodePayload(op.payload);
     Query(store->db, "INSERT INTO operations(id,kind,payload,state,database_id,branch_id,created_at) "
@@ -279,12 +277,8 @@ std::optional<std::string> Control::MergeResolutions(const Operation &op, const 
     auto id = AncestryID("merge-resolutions:" + op.id, 0);
     Query existing(store->db, "SELECT kind,payload,state FROM operations WHERE id=?");
     existing.Text(1, id);
-    if (!existing.Step()) {
-        if (op.state != "complete" || !spec.empty())
-            throw std::runtime_error("[differential:corrupt_data] Resolution reservation missing");
-        tx.Commit();
-        return std::string(); // completed legacy request
-    }
+    if (!existing.Step())
+        throw std::runtime_error("[differential:corrupt_data] Resolution reservation missing");
     auto fields = control::DecodePayload(existing.Text(1));
     if (existing.Text(0) != "merge_resolutions" || fields.size() != 3 || fields[0] != "typed-resolutions-duckdb-2-v1")
         throw std::runtime_error("[differential:merge_unsupported] Resolution record version is unavailable");

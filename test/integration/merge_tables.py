@@ -4,8 +4,8 @@ import json
 import tempfile
 
 from evidence import evidence_path
-from merge_schema import SchemaFixture, EXTRA, OURS, THEIRS, set_policy_version, verify
-from merge_lifecycle import inspect, abort_sql, start, release
+from merge_schema import SchemaFixture, EXTRA, OURS, THEIRS, verify
+from merge_lifecycle import inspect, start, release
 
 
 def rows(f, table='new_rows', branch='merged'):
@@ -200,17 +200,6 @@ def main():
             f.run(f.additive()); assert rows(f)==[]
         ok('crashes during new-table creation/insertion/publication and cancellation clean up and retry exactly once')
 
-        f=SchemaFixture(tmp,'old-pending'); f.setup(OURS,THEIRS); f.run(f.additive(),crash='schema_planned')
-        set_policy_version(f,'nullable-columns-v1'); f.run(f.additive()); verify(f)
-        assert inspect(f)['schema_algorithm']=='nullable-columns-v1'
-        assert f.read("SELECT json_extract_string(commit_extra_info,'$.schema_algorithm') AS algorithm FROM differential_snapshots('m') WHERE snapshot_id=4")==[{'algorithm':'nullable-columns-v1'}]
-        f=SchemaFixture(tmp,'old-rejection'); f.setup(theirs=SIMPLE.format(c='t')); f.run(f.additive(),crash='pinned')
-        set_policy_version(f,'nullable-columns-v1')
-        f.run(f.additive(),error='table additions'); f.hidden()
-        f.run(f.merge(),error='different schema_mode')
-        f.run(abort_sql(inspect(f)['operation_id']))
-        f.run(f.additive(request='v2')); assert rows(f)==[]
-        ok('pending column-only v1 requests retain both successful semantics and table-addition rejection; new requests use v2')
     evidence_path('merge-tables.json').write_text(json.dumps({'passed':passed,'scope':'disposable local stores'},indent=2)+'\n')
 
 

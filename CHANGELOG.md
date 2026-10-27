@@ -34,8 +34,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `differential_merge_max_concurrent` setting. Every new snapshot records its parents for base
   selection; snapshots written by 1.0.0 have no parent records, so a repeated merge that reaches them
   needs an explicit base (the first merge of 1.0.0 sibling branches is proven by their fork records).
+  See `docs/branch-merge.md#upgrading-from-100`. **Downgrading a repository to 1.0.0 after this version
+  has written to it is not supported** (`docs/branch-merge.md#downgrading-is-not-supported`).
 - Merge qualification tooling (`docs/merge-qualification.md`, `make test_merge_qualification`) and an
   immutable compatibility fixture written by the published v1.0.0 release.
+
+### Fixed
+
+- `AT (VERSION => …)` and followers (`FOLLOW true`) resolve tables in nested schemas
+  (`catalog.main.nested.table`); they looked up only the last schema name and failed.
 
 ### Changed
 

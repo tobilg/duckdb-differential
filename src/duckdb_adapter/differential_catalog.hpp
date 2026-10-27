@@ -47,7 +47,7 @@ class DifferentialCatalog : public DuckCatalog {
 
   private:
     // The read-only schema of this (hidden snapshot) catalog, as seen from another catalog.
-    optional_ptr<SchemaCatalogEntry> SnapshotSchema(ClientContext &context, const Identifier &schema,
+    optional_ptr<SchemaCatalogEntry> SnapshotSchema(ClientContext &context, const EntryLookupInfo &schema_lookup,
                                                     OnEntryNotFound if_not_found);
 
     std::shared_ptr<differential::Repository> repository;

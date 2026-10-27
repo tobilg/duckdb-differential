@@ -90,8 +90,8 @@ std::string Control::SafeMergeErrorCode(const std::string &code) {
 }
 
 std::optional<MergeAttempt> Control::ReadMergeAttempt(const Operation &op) {
-    // Called under store->mutex and a transaction. Absence is valid for legacy
-    // requests and requests that never acquired the execution/request locks.
+    // Called under store->mutex and a transaction. Absence is valid for requests
+    // that never acquired the execution/request locks.
     Query q(store->db, "SELECT kind,payload,state,database_id FROM operations WHERE id=?");
     q.Text(1, Identity("attempt", op.id));
     if (!q.Step()) return std::nullopt;
@@ -209,7 +209,7 @@ std::pair<std::string, std::string> Control::MergeSchemaPolicy(const Operation &
     std::lock_guard<std::recursive_mutex> guard(store->mutex);
     Query q(store->db, "SELECT kind,payload,state FROM operations WHERE id=?");
     q.Text(1, Identity("schema", op.id));
-    if (!q.Step()) return {"strict", "strict-v1"}; // Legacy requests never accepted schema changes.
+    if (!q.Step()) throw std::runtime_error("[differential:corrupt_data] Merge schema policy missing");
     auto f = DecodePayload(q.Text(1));
     if (q.Text(0) != "merge_schema" || q.Text(2) != "complete" || f.size() != 4 ||
         f[0] != "merge-schema-policy-v1" || f[1] != op.id ||
@@ -264,8 +264,7 @@ void Control::ReserveMergeSchema(const Operation &op, const std::string &mode, b
     if (exists.Step() || !create) {
         auto prior = MergeSchemaPolicy(op);
         if (prior.first != mode) throw std::runtime_error("Request ID reused with different schema_mode");
-        const bool available = prior.second == version || (mode == "additive" && prior.second == "nullable-columns-v1");
-        if (op.state != "complete" && !available && !PendingMergePublication(op))
+        if (op.state != "complete" && prior.second != version && !PendingMergePublication(op))
             throw std::runtime_error("[differential:merge_unsupported] Pending schema merge algorithm is unavailable");
         return;
     }
@@ -467,26 +466,19 @@ std::optional<MergePublication> Control::PendingMergePublication(const Operation
     MergePublication p;
     p.record = ReadOperation(q);
     auto f = DecodePayload(p.record.payload);
-    bool legacy = f.size() == 12 && f[0] == "s3-merge-publication-v1";
-    bool v2 = f.size() == 13 && f[0] == "s3-merge-publication-v2";
-    bool v3 = f.size() == 15 && f[0] == "s3-merge-publication-v3";
-    if (p.record.kind != "merge_publication" || (!legacy && !v2 && !v3) ||
-        (!legacy && f[12] != "0" && f[12] != "1") || f[1] != op.id)
+    if (p.record.kind != "merge_publication" || f.size() != 15 || f[0] != "s3-merge-publication-v3" ||
+        (f[12] != "0" && f[12] != "1") || f[1] != op.id)
         throw std::runtime_error("[differential:corrupt_data] Invalid merge publication record");
     p.merge_id = f[1]; p.destination = f[2]; p.snapshot.root = f[3];
     p.snapshot.size = std::stoll(f[4]);
     p.snapshot.published_at = p.snapshot.captured_at = std::stoll(f[5]);
     p.snapshot.extra_info = f[6]; p.provider = f[7]; p.descriptor = f[8]; p.write_id = f[9];
     p.ours = std::stoll(f[10]); p.theirs = std::stoll(f[11]);
-    // Older pending records did not persist head-write intent: never infer absence
-    // of an in-flight request from a missing flag after upgrading.
-    p.head_attempted = legacy || f[12] == "1";
-    if (v3) {
-        p.action = f[13]; p.expected_etag = f[14];
-        if (p.action != MergeAction(op) || (p.action == "created_branch") != p.expected_etag.empty() ||
-            (p.action == "already_up_to_date" && p.head_attempted))
-            throw std::runtime_error("[differential:corrupt_data] Invalid S3 merge target publication");
-    }
+    p.head_attempted = f[12] == "1";
+    p.action = f[13]; p.expected_etag = f[14];
+    if (p.action != MergeAction(op) || (p.action == "created_branch") != p.expected_etag.empty() ||
+        (p.action == "already_up_to_date" && p.head_attempted))
+        throw std::runtime_error("[differential:corrupt_data] Invalid S3 merge target publication");
     p.snapshot.database = p.record.database; p.snapshot.branch = p.record.branch; p.snapshot.id = p.record.snapshot;
     p.snapshot.message = "logical merge";
     Query name(store->db, "SELECT name FROM databases WHERE id=?");

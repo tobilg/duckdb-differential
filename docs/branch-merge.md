@@ -233,8 +233,7 @@ For stable conflict pagination, use those IDs with
 The same request reuses its recorded snapshot IDs and branch UUIDs, even after head movement
 or source-name reuse. Completed requests replay after input expiry. Changed database, ordered
 branch names or destination fail. Resource limits may change. Unknown pending selection/merge
-algorithms fail; completed records remain replayable. Pending `sibling-fork-v1` requests from
-the previous selector retain their original inputs and remain retryable.
+algorithms fail; completed records remain replayable.
 
 ### Expiry and incomplete history
 
@@ -248,9 +247,11 @@ Older snapshots without parent records remain unknown. There is no history backf
 snapshot numbers, timestamps, user commit metadata, or equal roots. An unknown history boundary
 is safe when known edges already place it below the unique common base: older unknown ancestors
 cannot supersede that base. Otherwise selection fails with `merge_base_unavailable`, except for
-the previous direct-sibling proof (matching completed fork operations, same fork ID, no restores).
-That compatibility case keeps the `sibling-fork-v1` selection tag. Malformed/cyclic records and
-unsupported ancestry versions fail explicitly rather than using the legacy fallback.
+the fork proof used for history without parent records, such as snapshots written by 1.0.0:
+two branches whose completed fork operations name the same fork snapshot, with no restore or
+target merge since. Its selection tag is `sibling-fork-v1`. Malformed/cyclic records and
+unsupported ancestry versions fail explicitly rather than using the fork proof. See
+[upgrading from 1.0.0](#upgrading-from-100).
 
 The graph walk uses indexed point lookups and bounded C++ memory, with `max_ancestry_nodes`
 (default 100,000; range 1–1,000,000) on branch merge/preview. Exceeding it returns `merge_limit`
@@ -317,8 +318,8 @@ retries that recompute use those original settings even from a differently confi
 Use the same settings for preflight and first execution. Input guards cover snapshot identities,
 not session settings. CHECK validation is native to that context; a later reader using another
 zone/calendar can evaluate a temporal expression differently, just as with ordinary DuckDB.
-An older pending request without a frozen context captures it on its first data execution with
-this implementation. Prepared S3 output and completed requests replay without reevaluation.
+A pending request that stopped before its first data execution captures the context when it
+is retried. Prepared S3 output and completed requests replay without reevaluation.
 
 All four merge/preview functions execute only when scanned: binding, PREPARE and plain EXPLAIN create no
 repository, pins, branch or operation. Merge requires autocommit. Destinations are new names
@@ -420,13 +421,11 @@ explicit projections and unaffected wildcard views are supported. Views are neve
 Final constraint violations remain `merge_constraint`, separate from schema/data conflicts.
 
 Each mutation durably freezes the mode and planner version (`strict-v1` or, for new additive
-requests, `additive-tables-v2`) with its request, before comparison. Pending
-`nullable-columns-v1` requests still execute the column-only planner, including its rejection
-of new tables; retry never upgrades them silently. A fresh preview uses the current planner
-and reports its version. To use broader semantics for an old failed request, use a new request
-ID (safe abort can retire the old request). Changing the mode on retry fails,
+requests, `additive-tables-v2`) with its request, before comparison. A pending request whose
+recorded planner version is unavailable fails explicitly; retry never upgrades it silently.
+A fresh preview uses the current planner and reports its version. Changing the mode on retry fails,
 including after an unsuccessful attempt. Both fields appear in `differential_merge_requests`
-and result provenance. Legacy requests without a policy record mean strict mode. Pending
+and result provenance. A request without its policy record is corrupt. Pending
 recomputation requires the recorded planner; completed replay and prepared S3 publication
 reuse their frozen result without replanning. Preview writes no policy record. Policy records
 retain no input payloads, and existing cleanup/abort/publication rules apply unchanged.
@@ -483,8 +482,8 @@ The same local/S3 staging, checkpoint, publication, abort and recovery rules app
 All four APIs also accept `schema_mode => 'catalog'`. This explicitly includes additive table/
 column support, table and plain nullable column removals, and whole-view changes. `strict` remains the default and `additive`
 never removes tables/columns or changes views. Catalog requests freeze `catalog-v1` in the existing policy
-companion. Retrying cannot change modes; existing `strict-v1`, `nullable-columns-v1` and
-`additive-tables-v2` requests keep their original planners. Local branch/snapshot and registered
+companion. Retrying cannot change modes; `strict-v1`, `additive-tables-v2` and `catalog-v1`
+requests keep their recorded planners. Local branch/snapshot and registered
 single-writer S3 snapshot and branch calls share these rules.
 Pending `catalog-v1` recomputation uses the current rules, including column removal.
 Prepared and completed results replay their frozen output.
@@ -796,8 +795,7 @@ An attempt begins only after admission, acquiring the request lock, and checking
 request is still pending and active. `attempt_count` counts these durable starts. It excludes
 preflight/preview, binding/planning, rejected guards, admission failures, cancelled lock waiters
 and completed replay (including a waiter that finds the result already complete). A request
-can therefore exist with zero attempts. Legacy requests also have zero and NULL attempt fields;
-we do not invent historical diagnostics when reopening them.
+can therefore exist with zero attempts.
 
 Only the latest attempt is stored: UUID, count, state, phase, safe error code, and started,
 updated and finished timestamps. A retry replaces it and increments the count. The record is
@@ -871,8 +869,7 @@ For a prepared S3 merge, it first checks the remote destination under the public
   an unreadable object (including an unrecognized tombstone), or a failed remote check retains
   the output and reservation. `merge_publication_uncertain`
   instructs the caller to retry the original merge. Absence cannot disprove a delayed PUT
-  from a process that has died. Older publication records without write-intent tracking are
-  conservatively treated as potentially attempted.
+  from a process that has died.
 
 Safe abandonment FULL-commits the terminal marker, releases the owned name reservation and
 marks the output retention root abandoned atomically with completion of the abort action.
@@ -1070,7 +1067,7 @@ BIGINT list `parents`, `reachable_from` (`ours`, `theirs`, `both`), `candidate`,
 unique base can be shown but cannot be merged. `readable` describes retention/eviction
 metadata; inspection does not probe the payload files. Unknown parents are never guessed; an empty
 list with `parents_known=false` is not evidence of a root. This inspection does not apply the
-legacy sibling fallback. Unsupported ancestry versions and corrupt graphs still fail.
+fork proof. Unsupported ancestry versions and corrupt graphs still fail.
 
 Rows are sorted by ID for presentation only. Graph memory/output is bounded by
 `max_ancestry_nodes` (1–1,000,000). All work happens at execution, including cancellation and
@@ -1138,7 +1135,7 @@ an incomplete destination. No constraint is disabled.
 base/ours/theirs IDs, destination and `logical-cell-v1`. The published snapshot's
 `commit_extra_info` contains JSON with the algorithm, operation UUID and all three snapshot
 IDs and roots, plus `schema_mode` and `schema_algorithm`. The operation links the request identity. Branch requests use `operations.kind='merge_branch'`
-with `unique-base-v1` (or the legacy sibling proof), both source branch UUIDs and the frozen input IDs; their provenance
+with `unique-base-v1` (or the `sibling-fork-v1` fork proof), both source branch UUIDs and the frozen input IDs; their provenance
 also includes `base_selection`, `ours_branch_id` and `theirs_branch_id`. This adds no control schema or
 native storage format; `logical-cell-v1` versions the merge algorithm. Provenance is a record,
 not a retention root. Separate `snapshot_ancestry` records provide the local parent graph.
@@ -1178,6 +1175,47 @@ Use [merge qualification](merge-qualification.md) for a pilot with independently
 expected data, bounded scale measurements and interruption/recovery checks. Contributor test
 commands are in [CONTRIBUTING.md](../CONTRIBUTING.md). Tests and measured workloads do not
 replace validation of the intended platform, provider, filesystem and data.
+
+## Upgrading from 1.0.0
+
+Repositories written by 1.0.0 open unchanged (store format 2, control format 1). Nothing is
+migrated and no history is backfilled. From then on, every snapshot records its parents in
+the same transaction that publishes it; merges record both input heads.
+
+Snapshots written by 1.0.0 have no parent records, so automatic base selection works as follows:
+
+- **Branches forked in 1.0.0 from the same snapshot** merge through the fork proof
+  (`sibling-fork-v1`), as long as neither was restored or merged into since. This covers the
+  first merge of existing branches.
+- **A repeated merge that reaches 1.0.0 snapshots** fails with `merge_base_unavailable` when one
+  side reaches a 1.0.0 snapshot that is not below the common base. Its unknown history could hold
+  a better base, so the selector refuses instead of guessing. For example, after merging two 1.0.0
+  branches into `merged`, merging `merged` with one of them again needs
+  `differential_merge_snapshots` with the base you choose.
+- **Branches forked after the upgrade** select their base automatically, also when their history
+  reaches back into 1.0.0 below that base.
+
+The fork proof reads 1.0.0's completed branch-creation records. `differential_cleanup_metadata`,
+which 1.0.0 also provides, deletes completed operation records older than its cutoff, including
+these. Once they are gone, the first merge of those branches needs an explicit base as well.
+Cleanup deletes records by age, so it never removes a restore or merge record while keeping the
+older fork record it would contradict. The proof fails safe and never selects a wrong base.
+Cleanup by this version never deletes the parent records it writes.
+
+## Downgrading is not supported
+
+After this version has written to a repository, do not open the repository with 1.0.0 or any
+other release without branch merging. Keep a copy of the repository directory from before the
+upgrade if you may need to go back.
+
+- 1.0.0 does not recognize merge records. Its `differential_cleanup_metadata` deletes completed
+  snapshot parent records and merge companion records along with other old operations. Later
+  merges then lose their recorded ancestry, and pending or aborted merges lose the records that
+  define their retry or terminal state; an aborted request can become retryable again.
+- 1.0.0 does not honor merge fences or destination reservations. Its export retry, background
+  publication and head claims do not skip a target that a pending S3 merge holds, so they can
+  roll an already published S3 merge result back to the target's old head.
+- 1.0.0 knows none of the merge functions, so pending requests cannot be retried or aborted.
 
 ## Deferred work
 

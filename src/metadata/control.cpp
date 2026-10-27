@@ -2303,7 +2303,8 @@ BranchMergeInputs Control::ResolveMergeBranches(const std::string &database, con
             if (!birth.Step() || control::DecodePayload(birth.Text(0)) !=
                                     std::vector<std::string>{id, std::to_string(result.base), branch.name})
                 unavailable();
-            // Legacy sibling proof is valid only before any lifecycle operation
+            // The fork proof (history without parent records, as written by 1.0.0)
+            // is valid only before any lifecycle operation
             // that can give this branch additional or replaced ancestry. Never
             // reuse its original fork as a substitute for an unknown merge base.
             Query restored(store->db, "SELECT 1 FROM operations WHERE kind IN ('restore','merge_target_result') "

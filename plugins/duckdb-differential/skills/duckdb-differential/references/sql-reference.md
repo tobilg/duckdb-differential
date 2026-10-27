@@ -1474,8 +1474,8 @@ Resource options can change between retries; the database, input IDs, destinatio
 fail with `merge_schema_conflict`; final constraints fail separately with `merge_constraint`.
 The first data execution freezes the caller's native `TimeZone`/`Calendar` for retries that
 recompute. Preview/preflight use current settings; use the same settings for first execution.
-Prepared/completed outputs replay without reevaluation. Older pending requests capture settings
-on their first data execution with this implementation.
+Prepared/completed outputs replay without reevaluation. A pending request that stopped before its
+first data execution captures the settings when it is retried.
 Unexpected staged view binding/output/dependency failures use `merge_application`.
 See [branch merge](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md) for semantics, errors and recovery.
 
@@ -1760,8 +1760,8 @@ Returns `snapshot_id`, `branch_id`, `kind`, `parents_known`, `parents BIGINT[]`,
 (`ours`, `theirs`, `both`), `candidate`, `retired`, `readable`, `selection_state`, `selected_base`.
 Selection is `unique`, `ambiguous`, `unrelated` or `incomplete`; only `unique` has a selected base.
 Candidates in incomplete graphs are provisional. A unique expired base remains visible but
-cannot be merged. Unknown parents are not inferred, and the legacy sibling fallback is not
-applied by inspection. Corrupt/unknown-version records still error. Missing input IDs fail.
+cannot be merged. Unknown parents are not inferred, and the fork proof for history without
+parent records is not applied by inspection. Corrupt/unknown-version records still error. Missing input IDs fail.
 
 Rows sort by snapshot ID only for presentation. The node bound is 1–1,000,000; timeout is
 positive milliseconds. Cancellation is checked during traversal. No new snapshot, operation,
@@ -1796,15 +1796,15 @@ cursor for the next page. Each page has its own metadata view.
 | `retained_logical_bytes` | BIGINT | Private result's retained logical size, excluding input/staging pins and physical overhead. |
 | `destination_reserved` | BOOLEAN | Private result owns its local reservation, or a pending target merge owns its durable fence. |
 | `remote_descriptor` | VARCHAR | Nullable verified immutable export key. |
-| `publication_attempted` | BOOLEAN | Head write may have been sent; legacy records conservatively report true. |
+| `publication_attempted` | BOOLEAN | Head write may have been sent. |
 | `recovery_action` | VARCHAR | Guidance for retry or abort. |
 | `created_at` | TIMESTAMPTZ | Original request creation time. |
-| `schema_mode`, `schema_algorithm` | VARCHAR | Frozen mode and planner version; legacy requests without policy records use `strict`/`strict-v1`. |
+| `schema_mode`, `schema_algorithm` | VARCHAR | Frozen mode and planner version. |
 | `merge_action` | VARCHAR | `created_branch`, `merged`, `fast_forward`, or `already_up_to_date`, derived from the frozen selection; pending state is not a completed result. |
 | `ours_branch_name`, `theirs_branch_name` | VARCHAR | Original branch names, not current names; NULL for explicit-snapshot requests. |
 | `ours_branch_id`, `theirs_branch_id` | VARCHAR | Original branch UUIDs, preserved across name reuse; NULL for explicit-snapshot requests. |
 | `inputs_guarded` | BOOLEAN | Whether all three expected snapshot IDs were supplied. Frozen IDs above are the expected values. NULL for explicit-snapshot requests. |
-| `attempt_count` | BIGINT | Number of admitted executions that acquired the request lock and durably started an attempt. Zero when none is recorded, including legacy requests. Completed replay does not increment it. |
+| `attempt_count` | BIGINT | Number of admitted executions that acquired the request lock and durably started an attempt. Zero when none is recorded. Completed replay does not increment it. |
 | `last_attempt_id` | VARCHAR | Nullable execution UUID; changes on an admitted retry. Only the latest attempt is retained. |
 | `last_attempt_state` | VARCHAR | `incomplete`, `failed`, or `succeeded`; NULL without diagnostics. `incomplete` is not a liveness indicator. |
 | `last_attempt_phase` | VARCHAR | Last durable milestone for an incomplete attempt, actual failure phase for a recorded failure, or `completed` after publication. NULL without diagnostics. |
@@ -1818,8 +1818,8 @@ bounded independently of tables/rows; diagnostics do not retain snapshots. Ordin
 preserves the latest attempt. If abort recovers a published S3 result, completion and successful
 diagnostics are recorded atomically. See [attempt semantics](https://github.com/tobilg/duckdb-differential/blob/main/docs/branch-merge.md#durable-attempt-diagnostics).
 
-Pending `nullable-columns-v1` requests retain the column-only planner. New additive requests
-use `additive-tables-v2`; a fresh preview does not change an existing request's planner version.
+Additive requests use `additive-tables-v2`; a fresh preview does not change an existing request's
+planner version.
 
 ```sql
 -- merge prototype

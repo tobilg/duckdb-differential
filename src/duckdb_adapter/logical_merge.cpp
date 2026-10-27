@@ -1908,7 +1908,6 @@ LogicalMergeResult LogicalMerge(ClientContext &context, differential::Control &c
     }
     execution.Update([&](Progress &p) { p.input_bytes = input_bytes; });
     execution.Phase("pinned");
-    const bool additive = options.schema_mode == "additive";
     auto schema_policy = preview ? std::make_pair(options.schema_mode, differential::Control::CurrentMergeSchemaAlgorithm(options.schema_mode))
                                  : c.MergeSchemaPolicy(out.operation);
     const bool catalog_mode = schema_policy.second == "catalog-v1";
@@ -1950,7 +1949,7 @@ LogicalMergeResult LogicalMerge(ClientContext &context, differential::Control &c
     }
     if (!catalog_mode && !add_tables && view_mismatch) Unsupported("schema mismatch: view definitions/output/dependencies must be unchanged");
     auto schema = catalog_mode ? PlanCatalogTables(catalogs)
-                              : add_tables ? PlanTables(catalogs, input_views, name_conflicts) : PlanSchema(catalogs, additive);
+                              : add_tables ? PlanTables(catalogs, input_views, name_conflicts) : PlanSchema(catalogs, false);
     Views planned_views;
     if (catalog_mode) {
         planned_views = PlanViews(input_view_info);

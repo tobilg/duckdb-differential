@@ -822,9 +822,7 @@ published. Uncertain remote outcomes retain the result and reservation. Aborted 
 requests are terminal; a new merge needs a new request identity. Changing `schema_mode` with
 the same request fails; prepared/completed results replay without replanning. See
 [lifecycle and recovery](branch-merge.md#durable-requests-and-safe-abort) for exact guarantees.
-New additive requests use `additive-tables-v2`. Pending `nullable-columns-v1` requests keep
-their column-only semantics, including rejection of new tables; use a new request to opt into
-the broader current planner. See [new-table semantics](branch-merge.md#new-tables-in-additive-mode).
+Additive requests use `additive-tables-v2`. See [new-table semantics](branch-merge.md#new-tables-in-additive-mode).
 Catalog requests use `catalog-v1`; pending strict/additive requests retain their original scope.
 Pending catalog recomputation uses the current rules, including column removal.
 Prepared/completed outputs are replayed unchanged.

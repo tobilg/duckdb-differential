@@ -212,9 +212,8 @@ requires retained inputs and the same planner; afterward it resumes the frozen v
 result without replanning. Policy records retain no input payload. Changing mode with the
 same request fails, including after failure. Preview creates no policy operation.
 
-New additive requests record `additive-tables-v2`; pending `nullable-columns-v1` requests
-continue using the column-only planner. Retrying an older request does not broaden its schema
-semantics. Prepared S3 output and completed results remain replayable without recomputation.
+Additive requests record `additive-tables-v2`; a retry never changes a request's recorded
+planner. Prepared S3 output and completed results remain replayable without recomputation.
 These planner records add no ancestry or indefinite input-retention root.
 
 Opt-in `catalog` requests freeze `catalog-v1`. They also reconcile table/plain nullable column removals and whole

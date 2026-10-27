@@ -73,3 +73,9 @@ Schema policies are strict, additive, or catalog mode for the documented table/c
 changes. See [branch merging](branch-merge.md#supported-scope) for the complete type, key,
 constraint, catalog and input restrictions. General schema merging, foreign keys, live-target
 replacement and shared-writer S3 merging are outside that scope.
+
+Repositories written by 1.0.0 open without migration; their snapshots have no parent records,
+which limits automatic base selection as described in
+[upgrading from 1.0.0](branch-merge.md#upgrading-from-100). Downgrading a repository to 1.0.0
+after this version has written to it is not supported
+([details](branch-merge.md#downgrading-is-not-supported)).
