@@ -5,8 +5,8 @@ extension:
   language: C++
   build: cmake
   license: MIT
-  # POSIX file locking, fsync and mmap: no Windows or wasm builds.
-  excluded_platforms: "windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools;wasm_mvp;wasm_eh;wasm_threads"
+  # POSIX file locking, fsync and mmap: no Windows or wasm builds. Intel Macs are not supported.
+  excluded_platforms: "windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools;wasm_mvp;wasm_eh;wasm_threads;osx_amd64"
   # vcpkg commit providing AWS SDK 1.11.820, SQLite 3.53.2 and OpenSSL 3.6.3.
   vcpkg_commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
   maintainers:

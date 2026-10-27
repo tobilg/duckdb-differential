@@ -41,7 +41,7 @@ REQUIRED['pilot_rehearsal'].add('expected_collation_mismatch_rejected')
 OPEN_GATES = [
     'clean committed candidate and reproducible release build',
     'release artifact SQL tests and complete integration/upstream PR checks',
-    'Linux amd64/arm64 and macOS amd64/arm64 candidate results',
+    'Linux amd64/arm64 and macOS arm64 candidate results',
     'representative user-data pilot with independently prepared expected results',
     'manual full upstream suite and reviewed exclusion audit',
     'S3 candidate qualification including owner-run real AWS checks',
