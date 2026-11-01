@@ -4,6 +4,8 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -33,3 +35,53 @@ jobs:
       exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools;wasm_mvp;wasm_eh;wasm_threads;osx_amd64'
       # Same vcpkg commit as the community descriptor: AWS SDK 1.11.820, SQLite 3.53.2, OpenSSL 3.6.3.
       vcpkg_commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+
+  sign:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main')
+    needs: duckdb-stable-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      bundle-digest: ${{ steps.sign.outputs.bundle-digest }}
+      verify-runners: ${{ steps.sign.outputs.verify-runners }}
+    steps:
+      - id: sign
+        uses: tobilg/duckdb-extension-self-hosting@e8598b152b605b003b58caf45d8a2b0764eb1ca3 # v1.0.0
+        with:
+          mode: sign
+          extension-name: differential
+          signing-key: ${{ secrets.EXTENSION_SIGNING_KEY }}
+          upload-versioned: ${{ startsWith(github.ref, 'refs/tags/') }}
+
+  verify:
+    needs: sign
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.sign.outputs.verify-runners) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@e8598b152b605b003b58caf45d8a2b0764eb1ca3 # v1.0.0
+        with:
+          mode: verify
+
+  publish:
+    needs: [sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: publish-differential
+      cancel-in-progress: false
+    steps:
+      - uses: tobilg/duckdb-extension-self-hosting@e8598b152b605b003b58caf45d8a2b0764eb1ca3 # v1.0.0
+        with:
+          mode: publish
+          bundle-digest: ${{ needs.sign.outputs.bundle-digest }}
+          s3-endpoint: ${{ secrets.S3_ENDPOINT }}
+          s3-bucket: duckdb-extensions
+          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          s3-prefix: ${{ !startsWith(github.ref, 'refs/tags/') && 'development' || '' }}
+          repository-url: ${{ startsWith(github.ref, 'refs/tags/') && 'https://extensions.duckdb.tobilg.com' || 'https://extensions.duckdb.tobilg.com/development' }}
