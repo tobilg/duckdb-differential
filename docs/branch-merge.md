@@ -39,7 +39,7 @@ produces the same logical state under another new branch, unless replaying its r
 ## Merge into an existing target
 
 Use the target as both `ours` and `destination`; the source is `theirs`. Any valid branch
-names work. This is implemented entirely by the extension on unmodified DuckDB v2.0.0.
+names work. This is implemented entirely by the extension on unmodified DuckDB v2.0.1.
 
 ```sql
 -- Following the example above: snapshot target writes, then release its attachment.
@@ -277,7 +277,7 @@ when the logical engine starts; authority transactions serialize graph resolutio
 * BOOLEAN, TINYINT/SMALLINT/INTEGER/BIGINT/HUGEINT and their unsigned variants through
   UHUGEINT, FLOAT, DOUBLE, UUID, BLOB, VARCHAR with the default binary collation, DECIMAL up
   to precision 38, DATE, TIME, TIME_NS, TIME WITH TIME ZONE and INTERVAL. All timestamp
-  types implemented by the pinned DuckDB v2.0.0 are supported: TIMESTAMP_S, TIMESTAMP_MS,
+  types implemented by the pinned DuckDB v2.0.1 are supported: TIMESTAMP_S, TIMESTAMP_MS,
   TIMESTAMP, TIMESTAMP_NS, TIMESTAMPTZ and TIMESTAMPTZ_NS, including native infinities.
   There is no custom timestamp representation, precision conversion or time-zone parser.
 * Non-key STRUCT, TUPLE, LIST, ARRAY, MAP and UNION columns may recursively contain these

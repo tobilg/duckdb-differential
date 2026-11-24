@@ -7,7 +7,7 @@ version, update this repository as follows:
    `./extension-ci-tools` (for DuckDB v2.0.x that branch is `v2.0-cyanoptera`). Update the
    `branch` entries in `.gitmodules` accordingly.
 2. **Workflows.** In `.github/workflows/MainDistributionPipeline.yml`, set `duckdb_version` to
-   the new tag, and set `ci_tools_version` plus the reusable workflow ref
+   the new tag, update `DUCKDB_VERSION` in the `Makefile`, and set `ci_tools_version` plus the reusable workflow ref
    (`_extension_distribution.yml@…`) to the new ci-tools branch.
 3. **vcpkg.** Check which vcpkg commit the community repository uses for the new release
    (`COMMUNITY_EXTENSION_VCPKG_COMMIT` in its `.github/workflows/build.yml`). If it changes,
@@ -29,11 +29,10 @@ version, update this repository as follows:
    builds for the previous release line (1.5.6) come from a separate `variegata` field; this
    extension publishes for 2.0 only.
 
-**Pre-release pins.** When the community repository builds against an untagged DuckDB commit (as it
-did for DuckDB v2.0.0 before its tag, building commit `d54cbbe3df` as `v2.0.0`), pin the submodule to that commit, set
-`OVERRIDE_GIT_DESCRIBE` in the `Makefile` to the version name the community repository uses, and set
-both `duckdb_version` (that name) and `duckdb_commit` in the distribution workflow. Once the tag
-exists, re-pin to it, empty `OVERRIDE_GIT_DESCRIBE` and drop `duckdb_commit`.
+DuckDB v2.0.1 takes its release version from an explicit build setting. A tagged checkout
+without that setting builds with a development version and a commit-specific extension
+directory. For an untagged community build, pin its exact source commit and set
+`duckdb_commit` in the distribution workflow alongside its advertised `duckdb_version`.
 
 ## API changes
 
@@ -75,11 +74,11 @@ Repositories and S3 exports must stay readable across DuckDB updates:
 
 The storage adapter relies on these DuckDB source contracts; recheck them when updating:
 
-- [`SingleFileBlockManager::IsRemote` and `Prefetch`](https://github.com/duckdb/duckdb/blob/d54cbbe3df17e8e5ce68312f483b4155836112aa/src/storage/single_file_block_manager.cpp#L1130)
+- [`SingleFileBlockManager::IsRemote` and `Prefetch`](https://github.com/duckdb/duckdb/blob/8d78114e90a53823803660bf821f6073ac87da8c/src/storage/single_file_block_manager.cpp#L1137)
   use `FileHandle::OnDiskFile()` for `REMOTE_ONLY` prefetch.
-- [`GetBlockLocation`](https://github.com/duckdb/duckdb/blob/d54cbbe3df17e8e5ce68312f483b4155836112aa/src/storage/single_file_block_manager.cpp#L1166)
+- [`GetBlockLocation`](https://github.com/duckdb/duckdb/blob/8d78114e90a53823803660bf821f6073ac87da8c/src/storage/single_file_block_manager.cpp#L1173)
   places native blocks after three 4096-byte headers. The adapter has a compile-time assertion
   against the native header size; the native block-size matrix tests smaller allocations.
-- [`RequireTemporaryDirectory`](https://github.com/duckdb/duckdb/blob/d54cbbe3df17e8e5ce68312f483b4155836112aa/src/storage/standard_buffer_manager.cpp#L511)
+- [`RequireTemporaryDirectory`](https://github.com/duckdb/duckdb/blob/8d78114e90a53823803660bf821f6073ac87da8c/src/storage/standard_buffer_manager.cpp#L517)
   creates spill storage through the filesystem. Differential requires local spill storage
   and preserves the native buffer manager and cleanup behavior.

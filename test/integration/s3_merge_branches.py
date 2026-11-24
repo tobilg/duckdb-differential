@@ -321,7 +321,7 @@ def main(endpoint, base):
             assert f.scalar("SELECT count(*) FROM operations WHERE kind='merge_publication'") == 0
             f.clean(); ok(label+' failure leaves target/input state intact and releases the pre-preparation fence')
     finally: relay.close()
-    evidence_path('s3-merge-branches.json').write_text(json.dumps({'passed':passed,'scope':'disposable MinIO, single writer, stock DuckDB v2.0.0'},indent=2)+'\n')
+    evidence_path('s3-merge-branches.json').write_text(json.dumps({'passed':passed,'scope':'disposable MinIO, single writer, stock DuckDB v2.0.1'},indent=2)+'\n')
 
 
 if __name__ == '__main__': main(*sys.argv[1:])

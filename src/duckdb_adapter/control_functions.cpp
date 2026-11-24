@@ -1321,19 +1321,19 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
                     else
                         value = Value::BIGINT(row[i].number);
                 }
-                output.SetValue(i, count, value);
+                output.data[i].Append(value);
             }
             ++count;
         }
-        output.SetCardinality(count);
+        output.CheckCardinality(count);
         return;
     }
     auto n = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.rows.size() - state.offset);
     for (idx_t i = 0; i < n; i++)
         for (idx_t j = 0; j < state.rows[state.offset + i].size(); j++)
-            output.SetValue(j, i, state.rows[state.offset + i][j]);
+            output.data[j].Append(state.rows[state.offset + i][j]);
     state.offset += n;
-    output.SetCardinality(n);
+    output.CheckCardinality(n);
 }
 } // namespace
 

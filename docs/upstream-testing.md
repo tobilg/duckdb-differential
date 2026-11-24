@@ -78,8 +78,9 @@ concurrent test pairs; DuckDB 2.0's SF1 workloads and some CSV/Parquet tests exc
 start a local quack server (`quack_serve`) share its default endpoint and run one at a time; all
 other tests stay concurrent. Individual configurations enable the upstream 16 KiB block-size variants,
 500000-row vacuum-rebuild threshold, latest storage for VARIANT/geometry, and larger memory
-allowances for ART, very wide joins, large CSV/Parquet buffers, giant strings and TPC-H generator
-comparisons where required. These configurations apply equally to both backends. Tests can
+allowances for ART, wide joins, grouping sets, reservoir sampling, large CSV/Parquet buffers,
+giant strings and TPC-H generator comparisons where required. The operator memory limit and
+eviction queue tests use DuckDB’s default thread count for their allocation checks. These configurations apply equally to both backends. Tests can
 also set their own SQL settings. SQL extension autoload and autoinstall
 are disabled; extension installation tests may explicitly attempt downloads. The runner
 installs required official HTTP, INET, SQLite, Quack and Encodings extensions into `build/upstream_extensions`,
@@ -108,11 +109,12 @@ concurrent checkpoint does not vacuum. Its audit accepts a pass or only that exa
 mismatch, and records which happened. A passing intermittent audit is not reported as a
 reproduced failure.
 
-Three workloads are excluded by maintainer decision for excessive disk use: the distinct
+Four workloads are excluded by maintainer decision for excessive disk use: the distinct
 TPC-H grouping test explicitly requires 40 GB free; encrypted block offloading retains two
 500-million-row tables (about 8 GB of incompressible random values, plus row IDs, overhead
 and spill); plain block offloading creates one 500-million-row table plus 1 GB of spill
-and its incomplete Differential probe already occupied 4.3 GiB. Their audit checks the pinned source hash and
+and its incomplete Differential probe already occupied 4.3 GiB. In the concurrent eviction
+queue workload, the native WAL alone grew past 11.5 GB. The audit checks each pinned source hash and
 reviewed reason without executing the workload, reporting `confirmed_policy_exclusion`.
 They do not run under `--survey` either. Other encrypted spill, TPC-H and DISTINCT tests
 remain in coverage. Runtime alone is never an exclusion reason.

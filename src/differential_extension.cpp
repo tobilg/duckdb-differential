@@ -574,9 +574,9 @@ void ExecuteProbe(ClientContext &context, TableFunctionInput &input, DataChunk &
         }
     }
     ProbeTrace("control.completed", path);
-    output.SetValue(0, 0, Value::BOOLEAN(true));
-    output.SetValue(1, 0, captured.empty() ? Value() : Value(captured));
-    output.SetCardinality(1);
+    output.data[0].Append(Value::BOOLEAN(true));
+    output.data[1].Append(captured.empty() ? Value() : Value(captured));
+    output.CheckCardinality(1);
 }
 struct StatusInfo : TableFunctionInfo {
     std::shared_ptr<differential::Repository> repository;
@@ -667,10 +667,10 @@ void ExecuteStatus(ClientContext &, TableFunctionInput &input, DataChunk &output
                    "(default 16) parallel S3 requests per process; no "
                    "authority disk quota"}};
     for (idx_t i = 0; i < rows.size(); i++) {
-        output.SetValue(0, i, Value(rows[i].first));
-        output.SetValue(1, i, Value(rows[i].second));
+        output.data[0].Append(Value(rows[i].first));
+        output.data[1].Append(Value(rows[i].second));
     }
-    output.SetCardinality(rows.size());
+    output.CheckCardinality(rows.size());
 }
 } // namespace duckdb
 namespace duckdb {

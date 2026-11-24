@@ -11,7 +11,7 @@
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 
 namespace duckdb {
 struct BridgePlan : ObjectCacheEntry {
@@ -47,7 +47,7 @@ static string Setup(ClientContext &context, const FunctionParameters &params) {
     auto &manager = DatabaseManager::Get(context);
     auto host = manager.GetDatabase(context, DatabaseManager::GetDefaultDatabase(context));
     auto alias = host->GetName().GetIdentifierName();
-    auto quoted_alias = KeywordHelper::WriteOptionallyQuoted(alias);
+    auto quoted_alias = SQLIdentifier::ToString(alias);
     const string prefix = "__upstream_identity_";
     string identity;
     bool fixture = false;
@@ -74,8 +74,8 @@ static string Setup(ClientContext &context, const FunctionParameters &params) {
             source = fs.JoinPath(FileSystem::GetWorkingDirectory(), source);
         }
         auto name = "upstream-fixture-" + UUID::ToString(UUID::GenerateRandomUUID());
-        auto quoted_source = KeywordHelper::WriteQuoted(source, '\'');
-        auto quoted_name = KeywordHelper::WriteQuoted(name, '\'');
+        auto quoted_source = SQLString::ToString(source);
+        auto quoted_name = SQLString::ToString(name);
         // Import runs only after DETACH closes the source. Its byte-for-byte
         // copy and initial snapshot preserve the fixture's original format.
         // No import or snapshot work happens in this pragma expansion.
@@ -84,7 +84,7 @@ static string Setup(ClientContext &context, const FunctionParameters &params) {
             "USE __upstream_switch;",
             "DETACH " + quoted_alias + ";",
             "CALL differential_import_database(" + quoted_source + ", " + quoted_name + ");",
-            "ATTACH " + KeywordHelper::WriteQuoted("differential:" + name, '\'') + " AS " + quoted_alias + " (READ_ONLY);",
+            "ATTACH " + SQLString::ToString("differential:" + name) + " AS " + quoted_alias + " (READ_ONLY);",
             "USE " + quoted_alias + ";",
             "DETACH __upstream_switch;",
             "RESET search_path;"
@@ -98,7 +98,7 @@ static string Setup(ClientContext &context, const FunctionParameters &params) {
         }
         identity = UUID::ToString(UUID::GenerateRandomUUID());
         // Returned SQL executes normally; the pragma only inspects catalog metadata.
-        marker_sql = "CREATE TABLE " + KeywordHelper::WriteOptionallyQuoted(prefix + identity) + "(unused BOOLEAN);";
+        marker_sql = "CREATE TABLE " + SQLIdentifier::ToString(prefix + identity) + "(unused BOOLEAN);";
     }
     auto path = mode == "native" ? directory + "/native-" + identity + ".duckdb" : "differential:upstream-" + identity;
     auto options = host->IsReadOnly() ? " (READ_ONLY)" : "";
@@ -110,7 +110,7 @@ static string Setup(ClientContext &context, const FunctionParameters &params) {
         "ATTACH ':memory:' AS __upstream_switch (READ_WRITE);",
         "USE __upstream_switch;",
         "DETACH " + quoted_alias + ";",
-        "ATTACH " + KeywordHelper::WriteQuoted(path, '\'') + " AS " + quoted_alias + options + ";",
+        "ATTACH " + SQLString::ToString(path) + " AS " + quoted_alias + options + ";",
         "USE " + quoted_alias + ";",
         "DETACH __upstream_switch;",
         "RESET search_path;"

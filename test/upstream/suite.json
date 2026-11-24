@@ -1,5 +1,5 @@
 {
-  "duckdb_commit": "d54cbbe3df17e8e5ce68312f483b4155836112aa",
+  "duckdb_commit": "8d78114e90a53823803660bf821f6073ac87da8c",
   "include": [
     "test/**/*.test",
     "test/**/*.test_slow",
@@ -48,6 +48,21 @@
         "differential": {
           "status": "not_executed",
           "message": "require iceberg: 1"
+        }
+      }
+    },
+    {
+      "path": "test/extension/duckdb_extensions_user_repository.test",
+      "category": "upstream_baseline_failure",
+      "reason": "Line 5 requires a dynamically loaded json extension. The comparison runner statically links json, so the flat row remains loaded after LOAD json FROM my_repo. Both backends fail the loaded-column assertion at line 51.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column loaded(index 2)"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Mismatch on row 1, column loaded(index 2)"
         }
       }
     },
@@ -138,6 +153,21 @@
         "differential": {
           "status": "not_executed",
           "message": "assertions: - none -"
+        }
+      }
+    },
+    {
+      "path": "test/parquet/corrupt/encrypted_module_size.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 7 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
         }
       }
     },
@@ -329,6 +359,66 @@
       }
     },
     {
+      "path": "test/sql/catalog/system_functions/system_catalog_entry_pushdown.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 6 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/catalog/system_functions/system_catalog_scanner.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 6 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/catalog/system_functions/system_catalog_scanner_fallible_filters.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 6 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/copy/copy_to_attached_database_path.test",
+      "category": "native_path_inspection",
+      "reason": "Line 44 expects the file passed to load to be the attached main database. The bridge detaches that host and attaches each backend at a separate path. COPY therefore succeeds for the detached host path on both backends.",
+      "expected": {
+        "native": {
+          "status": "failed",
+          "message": "Query unexpectedly succeeded! (test/sql/copy/copy_to_attached_database_path.test:44)"
+        },
+        "differential": {
+          "status": "failed",
+          "message": "Query unexpectedly succeeded! (test/sql/copy/copy_to_attached_database_path.test:44)"
+        }
+      }
+    },
+    {
       "path": "test/sql/copy/csv/compressed_read_size.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 10 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -389,17 +479,17 @@
       }
     },
     {
-      "path": "test/sql/copy/csv/parallel_csv_stress_test.test_slow",
-      "category": "upstream_baseline_failure",
-      "reason": "Line 82 reads gzip CSV files with small buffer sizes. On the pinned DuckDB 2.0 build it fails with a 1 GB, 3 GB or 4 GB memory limit (INTERNAL Error: Trying to seek a compressed CSV File, or an optional-pointer error at 1 GB) and passes only with the default limit (80% of RAM), reproduced with the stock unittest runner and no extension. Identical on both backends.",
+      "path": "test/sql/copy/parquet/bloom_filter_pruned_row_groups.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 7 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
       "expected": {
         "native": {
-          "status": "failed",
-          "message": "INTERNAL Error: Trying to seek a compressed CSV File"
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
         },
         "differential": {
-          "status": "failed",
-          "message": "INTERNAL Error: Trying to seek a compressed CSV File"
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
         }
       }
     },
@@ -1418,9 +1508,69 @@
       }
     },
     {
+      "path": "test/sql/secrets/http_secret_scope_authority.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
       "path": "test/sql/secrets/persistent_secret_map_value.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/persistent_secret_name_collision.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/persistent_secret_name_path_traversal.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/refresh_info_redaction.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
       "expected": {
         "native": {
           "status": "not_executed",
@@ -1443,6 +1593,21 @@
         "differential": {
           "status": "failed",
           "message": "Changing Secret Manager settings after the secret manager is used is not allowed!"
+        }
+      }
+    },
+    {
+      "path": "test/sql/secrets/secrets_without_external_access.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
         }
       }
     },
@@ -2181,6 +2346,21 @@
       }
     },
     {
+      "path": "test/sql/transactions/test_commit_oom_ghost_keys.test",
+      "category": "requires_memory_database",
+      "reason": "Line 9 requires no_force_storage. Both comparison backends use durable file storage and stop at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require no_force_storage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require no_force_storage: 1"
+        }
+      }
+    },
+    {
       "path": "test/sql/trigger/create_trigger_catalog.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
@@ -2229,6 +2409,21 @@
       "path": "test/sql/trigger/drop_trigger_parse.test",
       "category": "requires_memory_database",
       "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
+      "expected": {
+        "native": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        },
+        "differential": {
+          "status": "not_executed",
+          "message": "require noforcestorage: 1"
+        }
+      }
+    },
+    {
+      "path": "test/sql/trigger/row_trigger_into_table_with_statement_trigger.test",
+      "category": "requires_memory_database",
+      "reason": "Upstream line 5 requires noforcestorage. Both comparison backends use durable file storage and stop at this guard.",
       "expected": {
         "native": {
           "status": "not_executed",
@@ -2571,21 +2766,6 @@
       }
     },
     {
-      "path": "test/sql/trigger/trigger_update_from_multi_match.test",
-      "category": "requires_memory_database",
-      "reason": "Upstream line 5 explicitly requires noforcestorage; both comparison backends use durable file storage. The test stops at this guard.",
-      "expected": {
-        "native": {
-          "status": "not_executed",
-          "message": "require noforcestorage: 1"
-        },
-        "differential": {
-          "status": "not_executed",
-          "message": "require noforcestorage: 1"
-        }
-      }
-    },
-    {
       "path": "test/sql/types/enum/test_enum_constraints.test",
       "category": "upstream_disabled",
       "reason": "Upstream disables this file with mode skip at line 6. No test SQL executes; the runner must not count it as passed coverage.",
@@ -2842,9 +3022,9 @@
     },
     "test/sql/copy/csv/test_copy_gzip_large_block.test_slow": {
       "settings": {
-        "memory_limit": "8GB"
+        "memory_limit": "16GB"
       },
-      "reason": "The >4 GiB gzip round-trip uses 20 MB CSV lines and multiple 305 MiB reader buffers; both native and Differential exhaust 1 GB, while 2 GB causes the CSV buffer manager to attempt an unsupported compressed-file seek. Keep the workload unchanged with an 8 GB allowance."
+      "reason": "The >4 GiB gzip round trip exhausts the previous 8 GB limit on both backends in v2.0.1 when the writer grows its output buffer. Allow 16 GB for this workload."
     },
     "test/sql/join/test_hash_join_many_columns.test_slow": {
       "settings": {
@@ -2958,6 +3138,42 @@
       "reason": "Use the 500000-row threshold from DuckDB test/configs/vacuum_rebuild_indexes_force_storage.json, only for this test requiring index rebuilding.",
       "settings": {
         "vacuum_rebuild_indexes": "500000"
+      }
+    },
+    "test/sql/copy/csv/parallel_csv_stress_test.test_slow": {
+      "reason": "The small-buffer gzip CSV scan at line 83 can fail inside the native CSV reader at the default 3 GB comparison limit. Both backends complete all assertions at 6 GB on v2.0.1.",
+      "settings": {
+        "memory_limit": "6GB"
+      }
+    },
+    "test/sql/aggregate/aggregates/test_string_agg_overflow.test_slow": {
+      "reason": "Upstream requires a 16 GB host and aggregates a 3 GB string. Both backends exceed the ordinary limit and the 12 GB trial during allocation, and pass at 16 GB.",
+      "settings": {
+        "memory_limit": "16GB"
+      }
+    },
+    "test/sql/aggregate/grouping_sets/many_duplicate_grouping_sets.test": {
+      "reason": "The 5000 grouping sets exceed the ordinary 3 GB comparison limit on both backends. Both complete with a 12 GB allowance.",
+      "settings": {
+        "memory_limit": "12GB"
+      }
+    },
+    "test/sql/sample/test_sample_too_big.test": {
+      "reason": "On hosts meeting the upstream 16 GB requirement the final reservoir sample allocates a 3.7 GiB buffer, exceeding the default 3 GB limit.",
+      "settings": {
+        "memory_limit": "8GB"
+      }
+    },
+    "test/sql/settings/operator_memory_limit.test": {
+      "reason": "Use the native thread count for the per-operator allocation checks. With the two-thread harness default the GROUP BY at line 68 fits and unexpectedly succeeds on both backends.",
+      "options": {
+        "max_threads": null
+      }
+    },
+    "test/sql/storage/test_eviction_queue_dead_nodes_underflow.test": {
+      "reason": "The per-operator memory checks use the same GROUP BY as operator_memory_limit.test. With the default two harness threads both backends unexpectedly fit the aggregation. Use the native thread count.",
+      "options": {
+        "max_threads": null
       }
     }
   }

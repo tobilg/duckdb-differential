@@ -185,7 +185,7 @@ def main():
             finally: f.host.close()
             ok(f'process death at {phase}: outcome and target publication are atomic; retry increments only when executed')
     evidence_path('merge-diagnostics.json').write_text(json.dumps({'passed':passed,
-        'scope':'Stock DuckDB v2.0.0 local synthetic repositories; injected faults/process death, not physical power loss'},indent=2)+'\n')
+        'scope':'Stock DuckDB v2.0.1 local synthetic repositories; injected faults/process death, not physical power loss'},indent=2)+'\n')
 
 
 if __name__ == '__main__': main()

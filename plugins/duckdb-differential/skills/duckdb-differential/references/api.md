@@ -10,7 +10,7 @@ For a task-oriented walkthrough, see the [usage lifecycle guide](lifecycle.md) a
 writers, [shared databases](shared-databases.md). The [SQL reference](sql-reference.md) lists
 every statement, option, setting and function with an example.
 
-Install the community extension once, load it in each session (DuckDB 2.0), then ATTACH:
+Install the community extension once, load it in each session (DuckDB 2.0.1), then ATTACH:
 
 ```sql
 INSTALL differential FROM community;
@@ -834,7 +834,7 @@ for explicit typed conflict choices. Preview reports remaining `conflicts` and `
 mutation freezes choices with its request before reconciliation and still validates native constraints.
 `differential_merge_resolutions(database, request)` reads their durable typed audit.
 Supported values include UUID, BLOB, all integer widths, FLOAT/DOUBLE, DECIMAL, native dates,
-times/intervals, all six pinned DuckDB v2.0.0 timestamp types, and nested STRUCT/TUPLE/LIST/ARRAY/MAP/UNION
+times/intervals, all six pinned DuckDB v2.0.1 timestamp types, and nested STRUCT/TUPLE/LIST/ARRAY/MAP/UNION
 columns containing supported types. Equality is DuckDB's native null-safe equality, including
 NaN, signed zero and container ordering; nested columns merge as whole values, with no field
 or element merging. Typed conflict/audit details preserve precision and expose nested values

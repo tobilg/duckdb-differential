@@ -25,10 +25,7 @@ jobs:
     needs: publication-check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      # The untagged DuckDB commit the community repository builds as v2.0.0; drop duckdb_commit
-      # once the v2.0.0 tag exists.
-      duckdb_version: v2.0.0
-      duckdb_commit: d54cbbe3df17e8e5ce68312f483b4155836112aa
+      duckdb_version: v2.0.1
       ci_tools_version: v2.0-cyanoptera
       extension_name: differential
       # POSIX file locking, fsync and mmap: no Windows or wasm builds. Intel Macs are not supported.

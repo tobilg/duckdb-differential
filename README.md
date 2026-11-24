@@ -1,6 +1,6 @@
 # duckdb-differential
 
-An experimental C++ extension for **stock DuckDB 2.0** that adds versioning to ordinary
+An experimental C++ extension for **stock DuckDB 2.0.1** that adds versioning to ordinary
 DuckDB databases: snapshots, time travel, branches, clones, restore and S3 export. Native
 catalogs, SQL, transactions, indexes and compression run unchanged over a durable
 differential filesystem that shares unchanged data between all versions. The SQL surface
@@ -56,7 +56,7 @@ other platforms are untested.
 
 ## Installation
 
-`differential` targets DuckDB 2.0 and is prepared for community publication. Until it is
+`differential` targets DuckDB 2.0.1 and is prepared for community publication. Until it is
 published, [build and load it locally](#build). The planned community installation is:
 
 ```sql
@@ -362,7 +362,7 @@ and pi package installations use the manifests already included in this reposito
 The sections below cover building, loading and verifying the extension before publication.
 
 The repository follows DuckDB's C++ [extension template](https://github.com/duckdb/extension-template):
-DuckDB (`duckdb/`, v2.0.0) and `extension-ci-tools/` are submodules, and CI uses the same
+DuckDB (`duckdb/`, v2.0.1) and `extension-ci-tools/` are submodules, and CI uses the same
 `extension-ci-tools` distribution pipeline as the community repository. Dependencies come from
 vcpkg at a pinned commit (`VCPKG_COMMIT` in the `Makefile`): AWS SDK for C++ 1.11.820 (S3
 only), SQLite 3.53.2 and OpenSSL 3.6.3, statically linked into the extension; their licenses
@@ -381,7 +381,7 @@ make test                        # SQL logic tests in test/sql (what community C
 ```
 
 The release loadable is `build/release/extension/differential/differential.duckdb_extension`.
-A locally built extension is unsigned: start DuckDB 2.0 with `-unsigned` and load it by path
+A locally built extension is unsigned: start DuckDB 2.0.1 with `-unsigned` and load it by path
 instead of `LOAD differential;`.
 
 See [upstream testing](docs/upstream-testing.md) for the full upstream SQLLogicTest inventory,

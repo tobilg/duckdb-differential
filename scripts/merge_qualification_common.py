@@ -13,7 +13,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-DUCKDB_COMMIT = 'd54cbbe3df17e8e5ce68312f483b4155836112aa'
+DUCKDB_COMMIT = '8d78114e90a53823803660bf821f6073ac87da8c'
 REPORT_VERSION = 1
 MAX_OUTPUT = 16 * 1024 * 1024
 
@@ -216,9 +216,9 @@ class CLI:
         version, hooks, extension = self.run("SELECT library_version,source_id FROM pragma_version();"
             "SELECT status FROM differential_status() WHERE capability='test_hooks';"
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name='differential';")[-3:]
-        require(version[0]['library_version'] == 'v2.0.0' and version[0]['source_id'] == DUCKDB_COMMIT[:10], 'wrong_duckdb')
+        require(version[0]['library_version'] == 'v2.0.1' and version[0]['source_id'] == DUCKDB_COMMIT[:10], 'wrong_duckdb')
         require(info['duckdb_commit'] == DUCKDB_COMMIT and not info['duckdb_dirty'], 'duckdb_source_changed')
-        info.update(platform=platform.system(), machine=platform.machine(), duckdb_version='v2.0.0',
+        info.update(platform=platform.system(), machine=platform.machine(), duckdb_version='v2.0.1',
                     extension_version=extension[0]['extension_version'], test_hooks=hooks[0]['status'].startswith('compiled'),
                     extension_sha256=sha(self.extension), duckdb_sha256=sha(self.duckdb))
         return info

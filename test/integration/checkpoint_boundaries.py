@@ -28,12 +28,14 @@ with tempfile.TemporaryDirectory(prefix='differential-checkpoint-') as tmp:
         r=run(folder,f"SET checkpoint_threshold='1KB'; SET auto_checkpoint_skip_wal_threshold={skip}; INSERT INTO d.t SELECT range FROM range(10000); SELECT count(*) FROM d.t;")
         assert '10000' in r.stdout
         trace=(folder/'trace.tsv').read_text()
-        assert 'checkpoint.start' in trace
-        wal_writes=any(line.startswith('open\tdiff://probe.wal\t') and int(line.split('\t')[2])&2 for line in trace.splitlines())
+        # The checkpoint writes its own WAL marker even when the transaction skipped its WAL.
+        before_checkpoint, started, _ = trace.partition('checkpoint.start\t')
+        assert started, trace
+        wal_writes=any(line.startswith('pwrite\tdiff://probe.wal\t') for line in before_checkpoint.splitlines())
         assert wal_writes==expected_wal,(skip,trace)
         assert '10000' in run(folder,'SELECT count(*) FROM d.t;').stdout
-        results.append({'probe':'automatic-checkpoint','skip_wal_threshold':skip,'wal_written':wal_writes,'status':'passed'})
-        print('PASS automatic checkpoint, WAL written:',wal_writes)
+        results.append({'probe':'automatic-checkpoint','skip_wal_threshold':skip,'transaction_wal_written':wal_writes,'status':'passed'})
+        print('PASS automatic checkpoint, transaction WAL written:',wal_writes)
     folder=base/'failure';folder.mkdir()
     run(folder,'CREATE TABLE d.t AS SELECT 42 AS i; CHECKPOINT d;')
     (folder/'trace.tsv').write_text('')

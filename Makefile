@@ -7,10 +7,9 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Dependencies come from vcpkg at this commit (also set in CI and the community descriptor).
 VCPKG_COMMIT ?= cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
-# The duckdb submodule is pinned to the untagged commit the community repository builds and deploys as
-# v2.0.0 (d54cbbe3df): name its version explicitly instead of `git describe`.
-# Empty once the submodule is pinned to a release tag.
-OVERRIDE_GIT_DESCRIBE ?= v2.0.0
+# DuckDB 2.0.1 defaults to a development version unless its release version is supplied.
+DUCKDB_VERSION ?= v2.0.1
+EXTENSION_FLAGS += -DDUCKDB_EXPLICIT_VERSION=$(DUCKDB_VERSION)
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile

@@ -1,8 +1,8 @@
 ---
 name: duckdb-differential
-description: Versioned DuckDB databases with the differential community extension (DuckDB 2.0) - snapshots, branches, clones, restore, branch merging, AT time travel, and replication through S3 (exports, branch heads, followers, WAL shipping, failover, shared multi-writer databases). Use when the user mentions duckdb-differential, ATTACH 'differential:...' paths or differential_* functions, or wants to version, branch, roll back, time-travel, replicate, sync or fail over DuckDB databases, including leader/follower setups on S3.
+description: Versioned DuckDB databases with the differential community extension (DuckDB 2.0.1) - snapshots, branches, clones, restore, branch merging, AT time travel, and replication through S3 (exports, branch heads, followers, WAL shipping, failover, shared multi-writer databases). Use when the user mentions duckdb-differential, ATTACH 'differential:...' paths or differential_* functions, or wants to version, branch, roll back, time-travel, replicate, sync or fail over DuckDB databases, including leader/follower setups on S3.
 license: MIT
-compatibility: DuckDB 2.0 on Linux (amd64, arm64) or macOS (arm64). S3 features need network access and an existing bucket.
+compatibility: DuckDB 2.0.1 on Linux (amd64, arm64) or macOS (arm64). S3 features need network access and an existing bucket.
 metadata:
   author: tobilg
   version: "1.1.0"
@@ -43,7 +43,7 @@ LOAD differential;                     -- every session
 SET differential_repository = '/absolute/path/repository';   -- optional; default $DIFFERENTIAL_STORE_ROOT or ~/.duckdb/differential
 ```
 
-Check the DuckDB version first (`SELECT version();` must be 2.0). The repository setting creates
+Check the DuckDB version first (`SELECT version();` must be v2.0.1). The repository setting creates
 nothing and cannot change after first use in a DuckDB instance.
 
 ## Local lifecycle

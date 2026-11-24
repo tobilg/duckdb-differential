@@ -1,7 +1,6 @@
 # Project instructions
 
-- Target DuckDB v2.0.0 (the community repository's current stable; pinned to commit d54cbbe3df,
-  which the community repository builds as v2.0.0, until the tag exists). One C++ extension on
+- Target DuckDB v2.0.1 (release tag at commit 8d78114e90). One C++ extension on
   DuckDB's C++ extension template, native storage semantics. Linux and macOS (Apple silicon) only.
 - All S3 operations must use the AWS SDK for C++ pinned through vcpkg (`VCPKG_COMMIT`).
 - Preserve native sync/namespace ordering, durable mappings, and all retention roots.

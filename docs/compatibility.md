@@ -2,7 +2,7 @@
 
 | Component | Supported configuration |
 | --- | --- |
-| DuckDB | v2.0.0 (commit `d54cbbe3df`, as the community extension repository builds it), from the `duckdb/` submodule. Other DuckDB releases are not built; see [UPDATING.md](UPDATING.md) |
+| DuckDB | v2.0.1 (commit `8d78114e90`), from the `duckdb/` submodule. Other DuckDB releases are not built; see [UPDATING.md](UPDATING.md) |
 | Build | DuckDB C++ extension template with `extension-ci-tools` (`v2.0-cyanoptera`), `EXTENSION_STATIC_BUILD=1` |
 | Dependencies | vcpkg `cd61e1e26a03`: AWS SDK for C++ 1.11.820 (`s3`), SQLite 3.53.2, OpenSSL 3.6.3, statically linked; the artifact exports only `differential_duckdb_cpp_init` |
 | Platforms | Linux amd64 and arm64, macOS arm64 (Apple silicon) |

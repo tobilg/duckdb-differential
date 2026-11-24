@@ -58,10 +58,7 @@ def notice(port, version):
 
 
 duckdb_license = (ROOT / 'duckdb/LICENSE').read_text().strip()
-# An untagged DuckDB pin is named by the Makefile's OVERRIDE_GIT_DESCRIBE, as in the build.
-override = re.search(r'^OVERRIDE_GIT_DESCRIBE \?= (\S+)', (ROOT / 'Makefile').read_text(), re.MULTILINE)
-duckdb_version = override.group(1) if override else subprocess.run(
-    ['git', '-C', str(ROOT / 'duckdb'), 'describe', '--tags'], capture_output=True, text=True).stdout.strip()
+duckdb_version = re.search(r'^DUCKDB_VERSION \?= (\S+)$', (ROOT / 'Makefile').read_text(), re.MULTILINE)[1]
 texts, users = {}, {}
 for port in sorted(ports):
     text = (triplet / 'share' / port / 'copyright').read_text().strip()

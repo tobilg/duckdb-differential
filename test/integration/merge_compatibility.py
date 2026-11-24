@@ -258,7 +258,7 @@ def main():
             verify(manifest, Path(tmp), ok)
     assert all(hashlib.sha256(p.read_bytes()).hexdigest() == digest for p,digest in originals.items())
     evidence_path('merge-compatibility.json').write_text(json.dumps({'passed':passed,'fixtures':[p.name for p in manifests],
-        'scope':'Immutable local fixtures, including data written by the published v1.0.0 release, on stock DuckDB v2.0.0; not a claim of S3 or downgrade compatibility'},indent=2)+'\n')
+        'scope':'Immutable local fixtures, including data written by the published v1.0.0 release, on stock DuckDB v2.0.1; not a claim of S3 or downgrade compatibility'},indent=2)+'\n')
 
 
 if __name__ == '__main__': main()

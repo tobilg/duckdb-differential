@@ -4,7 +4,7 @@ This repository's source license is in LICENSE. Dependencies are not re-licensed
 
 | Dependency | Version/revision | License |
 | --- | --- | --- |
-| DuckDB (submodule, built from source) | v2.0.0 (untagged) / d54cbbe3df17e8e5ce68312f483b4155836112aa | MIT |
+| DuckDB (submodule, built from source) | v2.0.1 / 8d78114e90a53823803660bf821f6073ac87da8c | MIT |
 | DuckDB extension-ci-tools (submodule, build tooling) | `v2.0-cyanoptera` branch | MIT |
 | AWS SDK for C++ (`s3` component) with its AWS CRT and curl dependencies | 1.11.820 (vcpkg) | Apache-2.0 (curl: curl license) |
 | SQLite | 3.53.2 (vcpkg) | Public domain / blessing |

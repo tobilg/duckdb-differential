@@ -30,7 +30,7 @@ LOAD differential;                     -- every session
 SET differential_repository = '/absolute/path/repository';
 ```
 
-The extension targets DuckDB 2.0.
+The extension targets DuckDB 2.0.1.
 
 The repository is a local directory holding the extension's metadata store and, by default,
 the data. The metadata store is an embedded SQLite database, the setup DuckLake recommends when

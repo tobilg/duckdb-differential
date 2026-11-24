@@ -7,7 +7,7 @@ require differential
 query T
 SELECT version()
 ----
-v2.0.0
+v2.0.1
 
 statement ok
 SET differential_repository = '__TEST_DIR__/differential_nested_schemas'

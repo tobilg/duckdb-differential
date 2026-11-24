@@ -35,15 +35,6 @@ jobs:
         with:
           submodules: true
 
-      - name: Fetch the DuckDB version tag
-        run: |
-          set -euo pipefail
-          head=$(git -C duckdb rev-parse HEAD)
-          tag=$(git -C duckdb ls-remote --tags origin | awk -v h="$head" '$1==h {sub("refs/tags/","",$2); sub(/\^\{\}$/,"",$2); print $2; exit}')
-          test -n "$tag" || { echo "The duckdb submodule commit $head carries no release tag" >&2; exit 1; }
-          git -C duckdb fetch --depth=1 --force origin "refs/tags/${tag}:refs/tags/${tag}"
-          git -C duckdb config core.abbrev 10
-
       # Hosted runners have about 14 GB free; the benchmark needs native, differential and MinIO copies.
       - name: Free disk space
         run: |

@@ -1250,7 +1250,7 @@ Selection timing/node counts are zero for explicit snapshot calls.
 `conflict_limit` is 0–1000 across the whole preview; offset pages details in table-name
 order, then primary-key order.
 Details preserve native scalar types and distinguish missing rows from NULL cells. Supported
-values include UUID, BLOB, UHUGEINT, FLOAT/DOUBLE, all six native DuckDB v2.0.0 timestamp types,
+values include UUID, BLOB, UHUGEINT, FLOAT/DOUBLE, all six native DuckDB v2.0.1 timestamp types,
 native times/intervals, and nested STRUCT/TUPLE/LIST/ARRAY/MAP/UNION columns with supported
 leaves. Comparisons use native null-safe equality; nested columns merge as whole values.
 Independent changes to two fields of the same STRUCT therefore conflict on that column.

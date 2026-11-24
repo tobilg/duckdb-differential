@@ -1,6 +1,6 @@
 # Contributing
 
-Target stock DuckDB **v2.0.0** using the pinned submodules and vcpkg dependencies. Linux on
+Target stock DuckDB **v2.0.1** using the pinned submodules and vcpkg dependencies. Linux on
 amd64/arm64 and macOS on arm64 (Apple silicon) are supported build targets. See [compatibility](docs/compatibility.md),
 [architecture](docs/architecture.md) and [storage formats](docs/storage-format.md).
 

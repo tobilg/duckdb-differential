@@ -257,7 +257,7 @@ def main():
         finally: f.host.close()
         recovery(root)
         ok('native nested resolution recovery after freezing, checkpoint, publication transaction and publication; source removed, one result')
-    evidence_path('merge-types.json').write_text(json.dumps({'passed':passed,'scope':'stock DuckDB v2.0.0, disposable local repositories'},indent=2)+'\n')
+    evidence_path('merge-types.json').write_text(json.dumps({'passed':passed,'scope':'stock DuckDB v2.0.1, disposable local repositories'},indent=2)+'\n')
 
 
 if __name__ == '__main__': main()
