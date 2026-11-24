@@ -52,7 +52,7 @@ jobs:
             triplet: x64-linux-release
             minio: true
           - name: osx_arm64
-            runner: macos-14
+            runner: macos-15
             triplet: arm64-osx-release
             minio: false
           - name: linux_arm64
